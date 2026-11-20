@@ -994,6 +994,18 @@ class Config:
         self.seed_race_enabled = os.getenv(
             "SEED_RACE_ENABLED", "true").strip().lower() in (
             "1", "true", "yes", "on")
+        # === [ALERTS-v4.4.20] كتم إنذارات أسطول الانضمام — طلب المُشغّل ===
+        # (2026-11-20): «هذة الرسائل مزعجة قاعدة تتكرر كل شوي» — بعد إيقاف
+        # سحب الروابط نهائيًا (LINK_TASK_ENABLED=false بأمر المُشغّل نفسه)
+        # لم يعد لأسطول الانضمام أي دور تشغيلي: إنذاراته (JOINER FLEET
+        # DOWN + Joiner Fleet Alert لحسابات joiner + إنذارات مصادر
+        # الروابط الصامتة) ضجيج خالص يتكرر بعد كل نشر/إعادة تشغيل. الافتراضي:
+        # متوقفة عندما مهمة الروابط متوقفة، وتعود تلقائيًا لو أُعيد تفعيل
+        # الروابط مستقبلاً. تجاوز صريح: JOINER_FLEET_ALERTS_ENABLED=true.
+        self.joiner_fleet_alerts_enabled = os.getenv(
+            "JOINER_FLEET_ALERTS_ENABLED",
+            "true" if self.link_task_enabled else "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
 
         # === Request Filter v2 controls — Kill Switch + Rate Limit + Circuit Breaker ===
         # [BOT-FILTER-v2] conservative defaults: disabled until operator confirms.
@@ -4479,6 +4491,11 @@ class Monitor:
         # so the operator can fix the DB session_string and have it picked
         # up without a process restart.
         self._alerted_terminal_phones: Set[str] = set()
+        # [ALERTS-v4.4.20] حسابات وصلت READY فعليًا منذ الإقلاع — إنذار
+        # الفشل الطرفي لا يُرسل DM إلا لمن كان حيًا يلتقط ثم مات (انتقال
+        # حقيقي يستحق العلم الفوري). الحسابات الميتة منذ الإقلاع (معروفة
+        # للمالك) = سجل فقط — هذا هو مصدر التكرار المزعج بعد كل نشر.
+        self._connected_once_phones: Set[str] = set()
         # Live fleet health snapshot — updated by _joiner_fleet_health_loop
         # (60s cycle) and read by /ready, /api/joined_groups, and the
         # _joiner_worker fleet backoff gate. Keys:
@@ -6506,6 +6523,16 @@ class Monitor:
             f"Action: check sessions + clear FloodWait via /clear_floodwait"
         )
         logging.error(f"[FLEET-HEALTH] {msg.replace(chr(10), ' | ')}")
+        # [ALERTS-v4.4.20] أسطول الانضمام بلا دور تشغيلي (مهمة الروابط
+        # موقوفة نهائيًا بأمر المُشغّل) → لا DM للمالك إطلاقًا — طلب المُشغّل
+        # (2026-11-20): «هذة الرسائل مزعجة قاعدة تتكرر كل شوي». السجل +
+        # /ready fleet_health + /api/joiners_status تبقى قنوات التشخيص
+        # الكاملة. تعود تلقائيًا لو أُعيد تفعيل الروابط.
+        if not getattr(self.config, 'joiner_fleet_alerts_enabled', False):
+            logging.info(
+                "[FLEET-HEALTH] fleet-down owner DM SKIPPED — joiner "
+                "fleet alerts off (link task permanently disabled)")
+            return
         if oid is None:
             return
         try:
@@ -6546,6 +6573,20 @@ class Monitor:
         first_cycle = True
         while self._running:
             try:
+                # [ALERTS-v4.4.20] مهمة الروابط موقوفة نهائيًا → مصادر
+                # الروابط بلا معنى تشغيلي؛ إنذاراتها («المصدر سكت يومين»)
+                # ضجيج قادم لا محالة بعد يومين من الإيقاف. الحلقة تبقى
+                # حية (المشرف يراقبها) لكنها خاملة — سطر واحد ثم صمت.
+                if not getattr(getattr(self, 'config', None),
+                               'link_task_enabled', False):
+                    if first_cycle:
+                        logging.info(
+                            "[QUIET-SOURCE] idle — link task permanently "
+                            "disabled (operator order 2026-11-20); quiet-"
+                            "source alerts suspended")
+                        first_cycle = False
+                    await asyncio.sleep(_QUIET_SOURCE_CHECK_INTERVAL)
+                    continue
                 groups = await _fetch_window_group_activity(
                     self.db, _QUIET_SOURCE_WINDOW_DAYS)
                 if groups:
@@ -13614,17 +13655,23 @@ class Monitor:
             except (ValueError, RuntimeError):
                 pass
 
-    async def _alert_terminal_failure(self, phone: str, reason: str, detail: str = ""):
+    async def _alert_terminal_failure(self, phone: str, reason: str,
+                                      detail: str = "",
+                                      role: str = "monitor"):
         """[REQAUDIT-3] Send a ONE-TIME Telegram alert to the owner when a
-        joiner/monitor phone hits a terminal session failure
-        (not_authorized / invalid_session_string / invalid_session /
-        client_creation_error). Subsequent hits for the same phone are
-        suppressed by self._alerted_terminal_phones so we don't spam the
-        owner every 1h while they're fixing the session in the DB.
+        phone hits a terminal session failure (not_authorized /
+        invalid_session_string / invalid_session / client_creation_error).
 
-        The alert goes to OWNER_ID via the bot_client. If bot_client is
-        None / not connected / OWNER_ID unset, we still log (always) and
-        just skip the Telegram send.
+        [ALERTS-v4.4.20] قاعدتا كتم الإزعاج — طلب المُشغّل (2026-11-20):
+        «هذة الرسائل مزعجة قاعدة تتكرر كل شوي» (كانت تتكرر بعد كل نشر/
+        إعادة تشغيل لأن الخصم كان بالذاكرة فقط):
+          (1) حساب joiner + أسطول الانضمام بلا دور (الروابط موقوفة
+              نهائيًا) → سجل فقط، لا DM إطلاقًا.
+          (2) حساب ميت منذ الإقلاع (لم يصل READY هذه الجلسة) → سجل فقط:
+              لا انتقال حقيقي — نفس الحالة المعروفة للمالك. الـDM فقط
+              عند موت حساب كان حيًا يلتقط فعلاً (انتقال حي→ميت حقيقي
+              يستحق العلم الفوري — فقدان تغطية التقاط حقيقية).
+        DM يبقى مرة واحدة لكل هاتف لكل جلسة (خصم _alerted_terminal_phones).
         """
         logging.error(
             f"[ACCOUNT] {phone} STATUS=FAILED\n"
@@ -13632,6 +13679,19 @@ class Monitor:
             f"[ACCOUNT] action=re-login or session_string update required"
             + (f"\n[ACCOUNT] detail={detail}" if detail else "")
         )
+        # (1) حساب joiner وأسطوله موقوف → لا DM
+        if str(role or 'monitor') == 'joiner' and not getattr(
+                self.config, 'joiner_fleet_alerts_enabled', False):
+            logging.info(
+                f"[ACCOUNT] {phone} terminal DM SKIPPED — joiner + "
+                f"fleet alerts off (link task permanently disabled)")
+            return
+        # (2) ميت منذ الإقلاع — لا انتقال حقيقي → لا DM
+        if phone not in self._connected_once_phones:
+            logging.info(
+                f"[ACCOUNT] {phone} terminal DM SKIPPED — dead-at-boot "
+                f"(no live transition; known state, log-only)")
+            return
         if phone in self._alerted_terminal_phones:
             return  # already alerted — avoid 1h-cadence spam
         self._alerted_terminal_phones.add(phone)
@@ -13640,8 +13700,10 @@ class Monitor:
             return  # OWNER_ID unset — log is the only channel
         try:
             if self.bot_client and self.bot_client.is_connected():
+                _role_label = ('Monitor' if str(role or 'monitor') == 'monitor'
+                               else 'Joiner')
                 msg = (
-                    f"⚠️ *Joiner Fleet Alert*\n"
+                    f"⚠️ *{_role_label} Account DOWN*\n"
                     f"Phone: `{phone}`\n"
                     f"Reason: `{reason}`\n"
                     f"Action: re-login or update session_string in watchers DB\n"
@@ -13706,19 +13768,22 @@ class Monitor:
                 if client is None:
                     # حماية من الجلسات التالفة
                     if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
-                        await self._alert_terminal_failure(phone, 'invalid_session_string')
+                        await self._alert_terminal_failure(
+                            phone, 'invalid_session_string', role=role)
                         self._cleanup_user_client(phone)
                         await asyncio.sleep(3600)  # 1h cooldown — operator fix window
                         continue
                     try:
                         client = self._create_user_client(session_string, phone)
                     except ValueError as ve:
-                        await self._alert_terminal_failure(phone, 'invalid_session', str(ve))
+                        await self._alert_terminal_failure(
+                            phone, 'invalid_session', str(ve), role=role)
                         self._cleanup_user_client(phone)
                         await asyncio.sleep(3600)
                         continue
                     except Exception as ce:
-                        await self._alert_terminal_failure(phone, 'client_creation_error', str(ce))
+                        await self._alert_terminal_failure(
+                            phone, 'client_creation_error', str(ce), role=role)
                         await asyncio.sleep(3600)
                         continue
                     self.user_clients[phone] = client
@@ -13731,7 +13796,9 @@ class Monitor:
 
                     # === VERIFY AUTHORIZATION ===
                     if not await client.is_user_authorized():
-                        await self._alert_terminal_failure(phone, 'not_authorized', 're-login required')
+                        await self._alert_terminal_failure(
+                            phone, 'not_authorized', 're-login required',
+                            role=role)
                         self._cleanup_user_client(phone)
                         await asyncio.sleep(3600)
                         continue
@@ -13745,6 +13812,13 @@ class Monitor:
                     # حين يستلم حسابان نفس الرسالة في نفس المجموعة. dedup الروابط عبر
                     # `message_claim` (SQLite atomic) يمنع تكرار معالجة الروابط.
                     self._register_user_handlers(phone)
+                    # [ALERTS-v4.4.20] وصل READY فعليًا — يُسجَّل لكي يستحق
+                    # إنذارًا فوريًا لو مات لاحقًا (انتقال حي→ميت حقيقي فقط
+                    # هو ما يستحق إزعاج المالك).
+                    try:
+                        self._connected_once_phones.add(phone)
+                    except Exception:
+                        pass
                     if role == 'monitor':
                         logging.info(
                             f"[ACCOUNT] {phone} STATUS=READY\n"
@@ -19194,6 +19268,16 @@ async def main():
            not in ("true", "1", "yes")
            else "pre_filter_gated=on (AI mode)")
         + " (rule-engine: بذرة بعد القبول فقط — صفر توجيل دردشة لخاص البوت)"
+    )
+    # [ALERTS-v4.4.20] لقطة كتم الإنذارات — طلب المُشغّل 2026-11-20
+    # («هذة الرسائل مزعجة قاعدة تتكرر كل شوي»): إنذارات أسطول الانضمام
+    # + الفشل الطرفي للميت منذ الإقلاع + مصادر الروابط الصامتة كلها
+    # صامتة عندما مهمة الروابط موقوفة (تعود تلقائيًا مع تفعيلها).
+    logging.info(
+        "ALERTS_NOISE="
+        f"joiner_fleet={'on' if getattr(config,'joiner_fleet_alerts_enabled',False) else 'off'}"
+        f" (follows link_task={getattr(config,'link_task_enabled',False)} —"
+        " JOINER FLEET DOWN + terminal DMs + quiet-source silenced)"
     )
     logging.info(f"REQUEST_FILTER_MODE={REQUEST_FILTER_MODE}")
     _rf_en = getattr(config, 'request_filter_enabled', False)
