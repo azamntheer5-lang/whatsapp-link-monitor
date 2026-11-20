@@ -910,6 +910,24 @@ class Config:
         else:
             self.requests_target_channel = 0
 
+        # === [CHANNEL-GATE] بوابة قناة الطلبات — طلب المُشغّل (2026-11-20) ===
+        # «لايستطيع الانضمام الى القناه الى اذا تم الاشتراك في البوت كحساب
+        #  مراقب حتى لو انا بضيفه» — العضوية للمشتركين فقط:
+        #   CHANNEL_GATE_ENABLED (default true) — مفتاح البوابة.
+        #   CHANNEL_GATE_ACCEPT_ROLES (default "monitor") — أدوار /login التي
+        #     تمنح وصول القناة (مفصولة بفواصل؛ مثال: monitor,joiner).
+        #   CHANNEL_GATE_SWEEP_S (default 600) — دورة مسح العضوية (ثانية).
+        self.channel_gate_enabled = os.getenv(
+            "CHANNEL_GATE_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+        _gate_roles = os.getenv("CHANNEL_GATE_ACCEPT_ROLES", "monitor").strip()
+        self.channel_gate_accept_roles = [
+            r.strip() for r in _gate_roles.split(",") if r.strip()] or ["monitor"]
+        try:
+            self.channel_gate_sweep_s = int(os.getenv("CHANNEL_GATE_SWEEP_S", "600"))
+        except ValueError:
+            self.channel_gate_sweep_s = 600
+
         # === [LINK-TASK-KILL + SEED-RACE-KILL] — طلب المُشغّل (2026-09-06) ===
         # «اشوف البوت يعيد توجيه رسائل كثيره جداً مع نفسه وهي أصلاً مو طلبات»
         # + «ابيك توقف مهمة سحب الروابط والانضمام»:
@@ -3226,6 +3244,677 @@ class HistoryScanner:
             self.chats_scanned, period, dur, self.source_phone)
         try: await self.bot_client.send_message(self.channel_id, f)
         except Exception as e: logging.error(f"[SCAN] summary: {e}")
+
+
+# -------------------------------------------------------------------
+# [CHANNEL-GATE v1.0] بوابة قناة الطلبات — عضوية للمشتركين فقط
+# -------------------------------------------------------------------
+
+
+class ChannelGate:
+    """بوابة قناة الطلبات (REQUESTS_TARGET_CHANNEL): لا يبقى في القناة
+    إلا المشتركون — طرد المُشغّل (2026-11-20): «لايستطيع الانضمام الى
+    القناه الى اذا تم الاشتراك في البوت كحساب مراقب حتى لو انا بضيفه».
+
+    المصرّح لهم: OWNER_ID + البوت نفسه + من أكمل /login بدور مقبول
+    (افتراضيًا monitor) — يُخزَّن في جدول watchers كصف
+    phone='tg:<user_id>' is_active=false role='gate_subscriber'
+    (is_active=false ⇒ موصّل الحسابات لا يلمسه إطلاقًا؛ سجل وصول فقط)
+    أو أُضيف يدويًا عبر /gate_allow.
+
+    طبقات الفرض (كلها غير قاتلة؛ تُراجع في /gate_status):
+      L1 طلبات الانضمام (UpdateBotChatInviteRequester): موافقة للمصرّح،
+         رفض+حظر لغيره — ويُفعّل وضع «موافقة المشرفين» على القناة.
+      L2 تغيّرات العضوية (UpdateChannelParticipant): طرد فوري لغير
+         المصرّح حتى لو أضافه المالك بيده («حتى لو انا بضيفه»).
+      L3 سجل الإدارة (channels.getAdminLog): يلتقط ما فات L2 أثناء
+         الانقطاع/إعادة التشغيل — انضمامات + إضافات يدوية (تاريخي).
+      L4 مسح المستخدمين المعروفين (getChatMember): شبكة أمان أخيرة.
+      L5 مشرفون غير مصرّحين (getChatAdministrators): تنبيه المالك —
+         البوت بلا حق Promote فلا يستطيع عزل مشرف عيّنه المالك يدويًا.
+
+    كل عمليات الحظر/الموافقة/الروابط عبر Bot API HTTP — تعمل بأي
+    user_id بلا entity cache. طلبات mtproto (toggle/getAdminLog)
+    تسبقها تهيئة entity عبر checkChatInvite (بوت جديد على قرص Render
+    المؤقت = ذاكرة كيانات نظيفة بعد كل نشر).
+    """
+
+    GATE_PREFIX = "tg:"           # صفوف مشتركي البوابة في جدول watchers
+    LINK_ROW_PHONE = "gate:link"  # صف تخزين رابط الدعوة المحمي
+
+    def __init__(self, monitor):
+        self.monitor = monitor
+        _cfg = getattr(monitor, 'config', None)
+        self.enabled = bool(getattr(_cfg, 'channel_gate_enabled', False))
+        self.accept_roles = list(
+            getattr(_cfg, 'channel_gate_accept_roles', None) or ['monitor'])
+        try:
+            self.sweep_s = max(120, int(
+                getattr(_cfg, 'channel_gate_sweep_s', 600) or 600))
+        except (TypeError, ValueError):
+            self.sweep_s = 600
+        self.bot_token = os.getenv("BOT_TOKEN", "").strip()
+        self.supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip('/')
+        self.supabase_key = os.getenv("SUPABASE_KEY", "").strip()
+        self.owner_id = getattr(_cfg, 'owner_id', None)
+        self.channel = getattr(_cfg, 'requests_target_channel', 0)
+        self.channel_marked = 0    # -100xxxxxxxxxx
+        self.channel_bare = 0      # xxxxxxxxxx
+        self.bot_id = 0
+        self.whitelist: Dict[int, str] = {}
+        self.seen_users: Dict[int, float] = {}
+        self.seen_users_cap = 2000
+        self.actions: List[str] = []
+        self.invite_link = ""
+        self._http = None
+        self._task = None
+        self._entity_ok = False
+        self._banned_by_us: Dict[int, float] = {}
+        self._admin_alerts: Dict[int, float] = {}
+        self._layer_last_warn: Dict[str, float] = {}
+        self.layer_health: Dict[str, str] = {
+            "toggle_join_request": "pending",
+            "invite_link": "pending",
+            "participant": "armed",
+            "join_request": "armed",
+            "admin_log": "pending",
+            "probe": "idle",
+            "admins_probe": "pending",
+        }
+
+    # ---------- helpers ----------
+
+    def log(self, msg: str):
+        logging.info(f"[CHANNEL-GATE] {msg}")
+
+    def warn(self, msg: str):
+        logging.warning(f"[CHANNEL-GATE] {msg}")
+
+    def _layer_warn(self, layer: str, msg: str):
+        """تحذير لكل طبقة مرة كل ساعة كحد أقصى (منع إغراق السجل)."""
+        now = time.time()
+        if now - self._layer_last_warn.get(layer, 0) > 3600:
+            self._layer_last_warn[layer] = now
+            self.warn(f"[{layer}] {msg}")
+
+    def _record(self, text: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.actions.append(f"{stamp} {text}")
+        if len(self.actions) > 60:
+            del self.actions[:len(self.actions) - 60]
+
+    @staticmethod
+    def _to_bare(ref) -> int:
+        """-100xxxxxxxxxx أو رقم عارٍ → الرقم العاري (0 لو غير رقمي)."""
+        s = str(ref or '')
+        if s.startswith('-100') and len(s) > 4 and s[4:].isdigit():
+            return int(s[4:])
+        if s.isdigit():
+            return int(s)
+        return 0
+
+    def _supa_headers(self) -> Dict[str, str]:
+        return {
+            "apikey": self.supabase_key,
+            "Authorization": f"Bearer {self.supabase_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def _tg_api(self, method: str, **params) -> Dict[str, Any]:
+        """نداء Bot API HTTP — لا يحتاج entity cache (يعمل بأي user_id)."""
+        if not self._http:
+            return {}
+        url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
+        try:
+            async with self._http.post(url, json=params) as r:
+                try:
+                    return await r.json()
+                except Exception:
+                    return {}
+        except Exception as e:
+            self._layer_warn("tg_api", f"{method} failed: {type(e).__name__} {e}")
+            return {}
+
+    # ---------- lifecycle ----------
+
+    async def start(self):
+        if not self.enabled:
+            self.warn("disabled (CHANNEL_GATE_ENABLED != true) — membership NOT enforced")
+            return
+        if not self.channel:
+            self.warn("REQUESTS_TARGET_CHANNEL unset — nothing to guard")
+            return
+        if not self.bot_token:
+            self.warn("BOT_TOKEN missing — gate cannot operate")
+            return
+        # حل معرف القناة (رقمي مباشرة أو @username عبر entity)
+        if isinstance(self.channel, int):
+            self.channel_marked = int(self.channel)
+            self.channel_bare = self._to_bare(self.channel)
+        else:
+            try:
+                _ent = await self.monitor.bot_client.get_entity(self.channel)
+                self.channel_bare = int(_ent.id)
+                self.channel_marked = int(f"-100{int(_ent.id)}")
+            except Exception as e:
+                self.warn(f"cannot resolve channel {self.channel!r}: {e}")
+                return
+        if not self.channel_bare:
+            self.warn(f"bad channel id: {self.channel!r}")
+            return
+        self._http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20))
+        try:
+            _me = await self.monitor.bot_client.get_me()
+            self.bot_id = int(_me.id)
+        except Exception as e:
+            self.warn(f"get_me failed: {e}")
+        await self.load_whitelist()
+        if self.owner_id:
+            self.whitelist[int(self.owner_id)] = "المالك (OWNER_ID)"
+        # L1 + L2 — مستمعا الأحداث الحية على bot_client
+        try:
+            from telethon.tl.types import (UpdateChannelParticipant,
+                                           UpdateBotChatInviteRequester)
+            self.monitor.bot_client.add_event_handler(
+                self._on_raw,
+                events.Raw(types=(UpdateChannelParticipant,
+                                  UpdateBotChatInviteRequester)))
+            self.log("raw listeners armed (participant + join_request)")
+        except Exception as e:
+            self.layer_health["participant"] = f"failed: {type(e).__name__}"
+            self.layer_health["join_request"] = f"failed: {type(e).__name__}"
+            self.warn(f"raw listener registration failed: {e}")
+        await self._prime_entity()
+        await self._try_toggle_join_requests()
+        await self._ensure_invite_link()
+        await self._admin_sweep_once()
+        self._task = asyncio.create_task(self._sweep_loop())
+        _subs = len(self.whitelist) - (1 if self.owner_id else 0)
+        self.log(
+            f"ACTIVE — channel={self.channel_marked} whitelist={len(self.whitelist)} "
+            f"(owner={self.owner_id} bot={self.bot_id} subscribers={_subs}) "
+            f"sweep={self.sweep_s}s roles={self.accept_roles}")
+
+    async def _prime_entity(self):
+        """تهيئة entity cache للقناة — بعد كل نشر على Render تبدأ الذاكرة
+        نظيفة؛ mtproto (toggle/adminlog) يحتاج الكيان. checkChatInvite
+        برابط الدعوة يخزّنه في الجلسة (يعمل للأعضاء)."""
+        if self._entity_ok:
+            return True
+        try:
+            await self.monitor.bot_client.get_entity(self.channel_marked)
+            self._entity_ok = True
+            return True
+        except Exception:
+            pass
+        try:
+            r = await self._tg_api("getChat", chat_id=self.channel_marked)
+            link = ((r.get("result") or {}).get("invite_link") or "")
+            if link:
+                _h = link.split("+")[-1].split("/")[-1]
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                await self.monitor.bot_client(CheckChatInviteRequest(hash=_h))
+                await self.monitor.bot_client.get_entity(self.channel_marked)
+                self._entity_ok = True
+                self.log("channel entity primed (checkChatInvite)")
+                return True
+        except Exception as e:
+            self._layer_warn("entity", f"prime failed: {type(e).__name__} {e}")
+        return False
+
+    async def _try_toggle_join_requests(self):
+        """L1 تمكين — تحويل القناة لوضع «الانضمام يتطلب موافقة» فيمرّ كل
+        داخل عبر رابط من البوابة. best-effort: بعض الطبقات ترفضها للبوتات
+        وتبقى الطبقات L2-L5 كافية."""
+        if not await self._prime_entity():
+            self.layer_health["toggle_join_request"] = "skipped (no entity)"
+            return
+        try:
+            from telethon.tl.functions.channels import ToggleJoinRequestRequest
+            await self.monitor.bot_client(ToggleJoinRequestRequest(
+                channel=self.channel_marked, enabled=True,
+                apply_to_invites=True))
+            self.layer_health["toggle_join_request"] = "on"
+            self.log("join-request mode ENABLED — every link join now requires gate approval")
+        except Exception as e:
+            self.layer_health["toggle_join_request"] = f"failed: {type(e).__name__}"
+            self._layer_warn(
+                "toggle",
+                f"toggleJoinRequest failed ({type(e).__name__}: {e}) — operator may "
+                f"enable 'join requests' in channel settings; L2-L5 still enforce")
+
+    async def _ensure_invite_link(self):
+        """رابط دعوة بوضع موافقة — مخزَّن في watchers (phone=gate:link)
+        فلا يُنشأ رابط جديد مع كل إقلاع."""
+        if self.invite_link:
+            self.layer_health["invite_link"] = "loaded"
+            return
+        try:
+            r = await self._tg_api(
+                "createChatInviteLink", chat_id=self.channel_marked,
+                creates_join_request=True, name="بوابة الطلبات")
+            link = ((r.get("result") or {}).get("invite_link") or "")
+            if link:
+                self.invite_link = link
+                self.layer_health["invite_link"] = "created"
+                self.log(f"gated invite link created: {link}")
+                await self._store_link_row(link)
+                await self.notify_owner(
+                    f"🔗 بوابة القناة مفعّلة — رابط الدخول المحمي "
+                    f"(الموافقة تلقائية للمشتركين فقط):\n{link}")
+        except Exception as e:
+            self.layer_health["invite_link"] = f"failed: {type(e).__name__}"
+            self.warn(f"createChatInviteLink failed: {e}")
+
+    async def _store_link_row(self, link: str):
+        if not (self.supabase_url and self.supabase_key):
+            return
+        try:
+            row = {"phone": self.LINK_ROW_PHONE, "display_name": link,
+                   "session_string": "", "is_active": False,
+                   "role": "gate_link"}
+            async with self._http.post(
+                    f"{self.supabase_url}/rest/v1/watchers",
+                    json=row, headers=self._supa_headers()) as r:
+                if r.status in (200, 201):
+                    return
+            q = url_quote(self.LINK_ROW_PHONE, safe='')
+            async with self._http.patch(
+                    f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}",
+                    json={"display_name": link},
+                    headers=self._supa_headers()):
+                pass
+        except Exception as e:
+            self.warn(f"link row store failed: {e}")
+
+    # ---------- whitelist (Supabase durable) ----------
+
+    async def load_whitelist(self):
+        if not (self.supabase_url and self.supabase_key):
+            self.warn("no Supabase creds — whitelist in-memory only (lost on restart)")
+            return
+        try:
+            async with self._http.get(
+                f"{self.supabase_url}/rest/v1/watchers"
+                f"?phone=like.{self.GATE_PREFIX}*&select=phone,display_name&limit=500",
+                headers=self._supa_headers()) as r:
+                if r.status == 200:
+                    rows = await r.json()
+                    for row in rows:
+                        p = str(row.get("phone", ""))
+                        uid = p[len(self.GATE_PREFIX):]
+                        if p.startswith(self.GATE_PREFIX) and uid.isdigit():
+                            self.whitelist[int(uid)] = row.get("display_name") or ""
+                    self.log(f"whitelist loaded: {len(self.whitelist)} subscriber(s)")
+                else:
+                    self.warn(f"whitelist load failed: HTTP {r.status}")
+        except Exception as e:
+            self.warn(f"whitelist load error: {e}")
+        # رابط الدعوة المخزّن
+        try:
+            q = url_quote(self.LINK_ROW_PHONE, safe='')
+            async with self._http.get(
+                f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}"
+                f"&select=display_name&limit=1",
+                headers=self._supa_headers()) as r:
+                if r.status == 200:
+                    rows = await r.json()
+                    if rows and rows[0].get("display_name"):
+                        self.invite_link = rows[0]["display_name"]
+                        self.log("stored gated invite link loaded")
+        except Exception:
+            pass
+
+    async def whitelist_add(self, uid: int, name: str, phone: str = "") -> bool:
+        """إضافة/تحديث مشترك — يُكتب في Supabase (دائم) + الذاكرة."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        _label = f"{name or 'مشترك'}{' (' + phone + ')' if phone else ''}"
+        self.whitelist[uid] = _label
+        if not (self.supabase_url and self.supabase_key and self._http):
+            self.warn("whitelist_add: no Supabase — in-memory only")
+            return False
+        row = {"phone": f"{self.GATE_PREFIX}{uid}", "display_name": _label,
+               "session_string": "", "is_active": False,
+               "role": "gate_subscriber"}
+        try:
+            async with self._http.post(
+                    f"{self.supabase_url}/rest/v1/watchers",
+                    json=row, headers=self._supa_headers()) as r:
+                if r.status in (200, 201):
+                    self._record(f"➕ مشترك: {uid} {_label}")
+                    return True
+                text = await r.text()
+                if "duplicate" in text.lower() or r.status == 409:
+                    q = url_quote(f"{self.GATE_PREFIX}{uid}", safe='')
+                    async with self._http.patch(
+                            f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}",
+                            json={"display_name": _label},
+                            headers=self._supa_headers()):
+                        pass
+                    self._record(f"➕ مشترك (تحديث): {uid} {_label}")
+                    return True
+                self.warn(f"whitelist insert failed HTTP {r.status}: {text[:120]}")
+        except Exception as e:
+            self.warn(f"whitelist_add error: {e}")
+        return False
+
+    async def whitelist_remove(self, uid: int) -> bool:
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        self.whitelist.pop(uid, None)
+        self.seen_users[uid] = time.time()  # ليمسكه المسح الدوري لاحقًا
+        if not (self.supabase_url and self.supabase_key and self._http):
+            return False
+        try:
+            q = url_quote(f"{self.GATE_PREFIX}{uid}", safe='')
+            async with self._http.delete(
+                    f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}",
+                    headers=self._supa_headers()) as r:
+                ok = r.status in (200, 204)
+                if ok:
+                    self._record(f"➖ إلغاء وصول: {uid}")
+                return ok
+        except Exception as e:
+            self.warn(f"whitelist_remove error: {e}")
+            return False
+
+    # ---------- authorization core ----------
+
+    def is_authorized(self, uid) -> bool:
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        if self.bot_id and uid == self.bot_id:
+            return True
+        if self.owner_id and uid == int(self.owner_id):
+            return True
+        return uid in self.whitelist
+
+    async def probe(self, uid: int):
+        """حالة العضوية عبر getChatMember (None = ليس عضوًا)."""
+        r = await self._tg_api("getChatMember",
+                               chat_id=self.channel_marked, user_id=uid)
+        if r.get("ok"):
+            return (r.get("result") or {}).get("status")
+        return None
+
+    async def enforce(self, uid, why: str) -> str:
+        """قلب البوابة: عضو غير مصرّح → حظر دائم + إشعار المالك.
+        idempotent — المصرّح/المحظور سلفًا لا يُعالج مجددًا."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return "invalid_uid"
+        if not uid:
+            return "skip"
+        if self.bot_id and uid == self.bot_id:
+            return "skip_bot"
+        if self.owner_id and uid == int(self.owner_id):
+            return "skip_owner"
+        if self.is_authorized(uid):
+            return "authorized"
+        st = await self.probe(uid)
+        if st is None or st in ("left", "kicked"):
+            return f"gone({st})"
+        if st not in ("member", "administrator", "restricted"):
+            return f"no_action({st})"
+        r = await self._tg_api("banChatMember", chat_id=self.channel_marked,
+                               user_id=uid, until_date=0)
+        ok = bool(r.get("ok"))
+        self._record(
+            f"{'🚫 حظر' if ok else '⚠️ فشل حظر'}: {uid} ({st}) — {why}")
+        now = time.time()
+        if ok:
+            if now - self._banned_by_us.get(uid, 0) > 1800:
+                self._banned_by_us[uid] = now
+                await self.notify_owner(
+                    f"🚫 بوابة القناة: طرد عضو غير مشترك\n"
+                    f"👤 المستخدم: {uid}\nالحالة: {st}\nالسبب: {why}\n"
+                    f"📌 العضوية لمشتركي /login (حساب مراقب) فقط")
+            return "banned"
+        # فشل الحظر — غالبًا مشرف عيّنه المالك يدويًا
+        if now - self._admin_alerts.get(uid, 0) > 6 * 3600:
+            self._admin_alerts[uid] = now
+            await self.notify_owner(
+                f"⚠️ بوابة القناة: مستخدم غير مشترك ({uid}) لا يستطيع البوت عزله "
+                f"(غالبًا مشرف عُيّن يدويًا). أزِله يدويًا أو /gate_allow {uid}")
+        return "ban_failed"
+
+    async def notify_owner(self, text: str):
+        if not self.owner_id:
+            self.warn(f"owner alert skipped (OWNER_ID unset): {text[:80]}")
+            return
+        r = await self._tg_api("sendMessage", chat_id=int(self.owner_id),
+                               text=text)
+        if not r.get("ok"):
+            self.warn(f"owner DM failed: {str(r)[:120]}")
+
+    # ---------- live events (L1 + L2) ----------
+
+    async def _on_raw(self, ev):
+        if not self.enabled:
+            return
+        try:
+            from telethon.tl.types import (
+                UpdateChannelParticipant, UpdateBotChatInviteRequester,
+                ChannelParticipant, ChannelParticipantAdmin,
+                ChannelParticipantCreator, ChannelParticipantBanned,
+                ChannelParticipantLeft)
+            if isinstance(ev, UpdateBotChatInviteRequester):
+                _bare = getattr(getattr(ev, "peer", None), "channel_id", None)
+                if not _bare or _bare != self.channel_bare:
+                    return
+                uid = getattr(ev, "user_id", None)
+                if not uid:
+                    return
+                self.on_seen(uid)
+                if self.is_authorized(uid):
+                    r = await self._tg_api(
+                        "approveChatJoinRequest", chat_id=self.channel_marked,
+                        user_id=uid)
+                    self.layer_health["join_request"] = "live"
+                    self._record(f"✅ موافقة انضمام: {uid}")
+                    self.log(f"join request APPROVED uid={uid}")
+                else:
+                    await self._tg_api(
+                        "declineChatJoinRequest", chat_id=self.channel_marked,
+                        user_id=uid)
+                    await self._tg_api(
+                        "banChatMember", chat_id=self.channel_marked,
+                        user_id=uid, until_date=0)
+                    self.layer_health["join_request"] = "live"
+                    self._record(f"⛔ رفض انضمام + حظر: {uid}")
+                    self.log(f"join request DECLINED+banned uid={uid}")
+                return
+            if isinstance(ev, UpdateChannelParticipant):
+                if not getattr(ev, "channel_id", None) or \
+                        int(ev.channel_id) != self.channel_bare:
+                    return
+                uid = getattr(ev, "user_id", None)
+                if not uid:
+                    return
+                self.on_seen(uid)
+                new_p = getattr(ev, "new_participant", None)
+                if new_p is None or isinstance(
+                        new_p, (ChannelParticipantBanned, ChannelParticipantLeft)):
+                    return  # خروج/حظر — لا شيء لنفعله
+                self.layer_health["participant"] = "live"
+                _actor = getattr(ev, "actor_id", None)
+                _why = f"participant:{type(new_p).__name__}" \
+                       + (f" by_actor={_actor}" if _actor else "")
+                verdict = await self.enforce(uid, _why)
+                if verdict == "authorized":
+                    self.log(f"member change OK uid={uid} ({_why})")
+                else:
+                    self.log(f"member change → {verdict} uid={uid} ({_why})")
+        except Exception as e:
+            self.warn(f"raw handler error: {type(e).__name__} {e}")
+
+    def on_seen(self, uid):
+        """تسجيل مستخدم معروف (لمسح L4) — رخيص ومتزامن."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return
+        self.seen_users[uid] = time.time()
+        if len(self.seen_users) > self.seen_users_cap:
+            _oldest = sorted(self.seen_users.items(), key=lambda kv: kv[1])
+            for k, _ in _oldest[:len(self.seen_users) - self.seen_users_cap]:
+                self.seen_users.pop(k, None)
+
+    def on_private_seen(self, uid):
+        self.on_seen(uid)
+
+    # ---------- sweeps (L3 + L4 + L5) ----------
+
+    async def _sweep_loop(self):
+        await asyncio.sleep(90)  # دع الإقلاع يستقر
+        self.log(f"sweep loop started — every {self.sweep_s}s "
+                 f"(adminlog + probe + admins)")
+        while True:
+            try:
+                await self._prime_entity()
+                await self._admin_log_sweep()
+                await self._probe_sweep()
+                await self._admin_sweep_once()
+            except Exception as e:
+                self.warn(f"sweep cycle error: {type(e).__name__} {e}")
+            await asyncio.sleep(self.sweep_s)
+
+    async def _admin_log_sweep(self):
+        """L3 — سجل إدارة القناة: يلتقط الانضمامات والإضافات اليدوية
+        التي فاتت L2 (انقطاع/إعادة تشغيل) — شامل التاريخ السابق للإقلاع."""
+        if not self._entity_ok:
+            self._layer_warn("admin_log", "skipped — entity not primed")
+            return
+        try:
+            from telethon.tl.functions.channels import GetAdminLogRequest
+            from telethon.tl.types import ChannelAdminLogEventsFilter
+            res = await self.monitor.bot_client(GetAdminLogRequest(
+                channel=self.channel_marked, q="", max_id=0, min_id=0,
+                limit=100,
+                events_filter=ChannelAdminLogEventsFilter(join=True, invite=True)))
+            events = getattr(res, "events", None) or []
+            self.layer_health["admin_log"] = f"ok ({len(events)} events)"
+            for ev in events:
+                uid = getattr(ev, "user_id", None)
+                if uid:
+                    self.on_seen(uid)
+                    await self.enforce(
+                        uid, f"adminlog:{type(ev.action).__name__}")
+        except Exception as e:
+            self.layer_health["admin_log"] = f"failed: {type(e).__name__}"
+            self._layer_warn("admin_log", f"sweep failed: {type(e).__name__} {e}")
+
+    async def _probe_sweep(self):
+        """L4 — فحص عضوية كل مستخدم معروف غير مصرّح له."""
+        if not self.seen_users:
+            self.layer_health["probe"] = "idle (no known users)"
+            return
+        checked = 0
+        for uid in list(self.seen_users.keys()):
+            if self.is_authorized(uid):
+                continue
+            st = await self.probe(uid)
+            checked += 1
+            if st in ("member", "restricted", "administrator"):
+                await self.enforce(uid, "probe_sweep")
+        self.layer_health["probe"] = f"ok ({checked} checked)"
+
+    async def _admin_sweep_once(self):
+        """L5 — مشرفون غير مصرّحين: تنبيه المالك (لا يستطيع البوت عزلهم)."""
+        r = await self._tg_api("getChatAdministrators",
+                               chat_id=self.channel_marked)
+        if not r.get("ok"):
+            self.layer_health["admins_probe"] = "failed"
+            return
+        self.layer_health["admins_probe"] = "ok"
+        for m in (r.get("result") or []):
+            uid = (m.get("user") or {}).get("id")
+            if not uid or m.get("status") == "creator":
+                continue
+            if self.is_authorized(uid):
+                continue
+            self.on_seen(uid)
+            await self.enforce(uid, "admin_sweep")  # يجرب الحظر أولًا
+            now = time.time()
+            if now - self._admin_alerts.get(uid, 0) > 6 * 3600:
+                self._admin_alerts[uid] = now
+                await self.notify_owner(
+                    f"⚠️ بوابة القناة: مشرف غير مشترك ({uid}) — البوت لا يملك "
+                    f"حق Promote فعزله يدويًا أو /gate_allow {uid}")
+
+    # ---------- login integration ----------
+
+    async def on_login_success(self, sender_id, phone: str, role: str,
+                               display_name: str):
+        """يُستدعى بعد /login ناجح — يمنح وصول القناة للأدوار المقبولة."""
+        if not self.enabled:
+            return
+        try:
+            uid = int(sender_id)
+        except (TypeError, ValueError):
+            return
+        if role not in self.accept_roles:
+            try:
+                await self.monitor.bot_client.send_message(uid,
+                    f"✅ تم تسجيل حسابك بنجاح.\n"
+                    f"📌 قناة الطلبات متاحة لمشتركي «حساب مراقب» فقط — "
+                    f"سجّل حسابًا بدور المراقب (👁️) عبر /login للوصول.")
+            except Exception:
+                pass
+            return
+        await self.whitelist_add(uid, display_name or "مشترك", phone)
+        # فك الحظر إن سبق حظره ثم إرسال الرابط
+        await self._tg_api("unbanChatMember", chat_id=self.channel_marked,
+                           user_id=uid, only_if_banned=True)
+        _link_part = (f"\n🔗 رابط القناة (موافقة تلقائية خلال ثوانٍ):\n"
+                      f"{self.invite_link}") if self.invite_link else ""
+        try:
+            await self.monitor.bot_client.send_message(uid,
+                f"🎉 تم تفعيل وصولك إلى قناة الطلبات!\n"
+                f"✅ اشتراكك كحساب مراقب يمنحك عضوية القناة."
+                f"{_link_part}")
+        except Exception as e:
+            self.warn(f"welcome DM failed uid={uid}: {e}")
+
+    # ---------- owner commands ----------
+
+    async def refresh_link(self) -> str:
+        self.invite_link = ""
+        await self._ensure_invite_link()
+        return self.invite_link or "(فشل الإنشاء — راجع السجل)"
+
+    def status_text(self) -> str:
+        subs = {u: n for u, n in self.whitelist.items()
+                if not ((self.owner_id and u == int(self.owner_id))
+                        or (self.bot_id and u == self.bot_id))}
+        lines = [
+            "🔐 بوابة قناة الطلبات",
+            f"الحالة: {'✅ مسلّحة' if (self.enabled and self.channel_marked) else '❌ معطلة'}",
+            f"القناة: {self.channel_marked}",
+            f"الأدوار المقبولة: {', '.join(self.accept_roles)}",
+            f"المصرّحون: {len(self.whitelist)} (مالك + بوت + {len(subs)} مشترك)",
+        ]
+        for u, n in list(subs.items())[:15]:
+            lines.append(f"  • {u} — {n}")
+        if len(subs) > 15:
+            lines.append(f"  … و{len(subs) - 15} آخر")
+        if self.invite_link:
+            lines.append(f"🔗 الرابط المحمي: {self.invite_link}")
+        lines.append("الطبقات: " + " | ".join(
+            f"{k}={v}" for k, v in self.layer_health.items()))
+        if self.actions:
+            lines.append("آخر الإجراءات:")
+            lines.extend(f"  {a}" for a in self.actions[-8:])
+        return "\n".join(lines)
 
 
 # -------------------------------------------------------------------
@@ -9310,6 +9999,14 @@ class Monitor:
             if not sender_id:
                 return
 
+            # [CHANNEL-GATE] سجّل مستخدمي الخاص — فحص عضويتهم الدوري بالبوابة
+            _gate_obj = getattr(self, 'channel_gate', None)
+            if _gate_obj is not None:
+                try:
+                    _gate_obj.on_private_seen(sender_id)
+                except Exception:
+                    pass
+
             # Cleanup expired login sessions on every private message
             # (cheap O(N) scan, N is small due to concurrent limit)
             self._cleanup_expired_login_sessions()
@@ -9375,6 +10072,8 @@ class Monitor:
                     '/live_audit', '/status', '/watchers', '/help',
                     '/joined_groups', '/queue', '/debug_pipeline',
                     '/pending_approvals',
+                    '/gate_status', '/gate_allow', '/gate_remove',
+                    '/gate_refresh_link',
                 ]
 
                 if cmd in admin_commands:
@@ -9673,6 +10372,14 @@ class Monitor:
 
                 logging.info(f"[LOGIN] New {role} registered: {phone} ({display_name})")
 
+                # [CHANNEL-GATE] منح وصول القناة بعد /login ناجح (غير قاتل)
+                try:
+                    _g = getattr(self, 'channel_gate', None)
+                    if _g is not None:
+                        await _g.on_login_success(sender_id, phone, role, display_name)
+                except Exception as _gate_e:
+                    logging.warning(f"[CHANNEL-GATE] on_login_success error: {_gate_e}")
+
             except Exception as e:
                 logging.error(f"Login code error: {e}")
                 await event.reply(f"❌ خطأ: {e}\n\nأعد المحاولة بـ /login")
@@ -9719,6 +10426,14 @@ class Monitor:
                 )
                 logging.info(f"[LOGIN] New {role} (2FA): {phone}")
 
+                # [CHANNEL-GATE] منح وصول القناة بعد /login ناجح (غير قاتل)
+                try:
+                    _g = getattr(self, 'channel_gate', None)
+                    if _g is not None:
+                        await _g.on_login_success(sender_id, phone, role, display_name)
+                except Exception as _gate_e:
+                    logging.warning(f"[CHANNEL-GATE] on_login_success error: {_gate_e}")
+
             except Exception as e:
                 logging.error(f"Login password error: {e}")
                 err = str(e)
@@ -9764,6 +10479,51 @@ class Monitor:
                     logging.error(f"[CMD] reply failed: {type(e).__name__}: {e}")
 
             if cmd == "/help": await reply(MessageFormatter.format_help())
+
+            elif cmd == "/gate_status":
+                # [CHANNEL-GATE] تقرير البوابة للمالك
+                _g = getattr(self, 'channel_gate', None)
+                if _g is None:
+                    await reply("⚠️ البوابة غير مهيأة.")
+                else:
+                    await reply(_g.status_text())
+
+            elif cmd == "/gate_allow":
+                # [CHANNEL-GATE] إضافة وصول يدوي — المالك فقط (فحص _on_command)
+                _g = getattr(self, 'channel_gate', None)
+                if _g is None or not _g.enabled:
+                    await reply("⚠️ البوابة غير مفعّلة.")
+                elif len(parts) < 2 or not parts[1].isdigit():
+                    await reply("ℹ️ الاستخدام: /gate_allow <user_id> [اسم]")
+                else:
+                    _uid = int(parts[1])
+                    _name = " ".join(parts[2:]) or "يدوي (المالك)"
+                    _ok = await _g.whitelist_add(_uid, _name, "")
+                    await _g._tg_api("unbanChatMember",
+                                     chat_id=_g.channel_marked,
+                                     user_id=_uid, only_if_banned=True)
+                    await reply(("✅ أُضيف للوصول: " if _ok else "⚠️ حُفظ مؤقتًا: ")
+                                + f"{_uid} ({_name})")
+
+            elif cmd == "/gate_remove":
+                _g = getattr(self, 'channel_gate', None)
+                if _g is None or not _g.enabled:
+                    await reply("⚠️ البوابة غير مفعّلة.")
+                elif len(parts) < 2 or not parts[1].isdigit():
+                    await reply("ℹ️ الاستخدام: /gate_remove <user_id>")
+                else:
+                    _uid = int(parts[1])
+                    _ok = await _g.whitelist_remove(_uid)
+                    await reply(("✅ أُلغي وصول " if _ok else "⚠️ أُلغي محليًا ")
+                                + f"{_uid} — سيُطرد في أول مسح.")
+
+            elif cmd == "/gate_refresh_link":
+                _g = getattr(self, 'channel_gate', None)
+                if _g is None or not _g.enabled:
+                    await reply("⚠️ البوابة غير مفعّلة.")
+                else:
+                    _link = await _g.refresh_link()
+                    await reply(f"🔗 الرابط المحمي الجديد:\n{_link}")
 
             elif cmd == "/status":
                 # === تقرير حالة شامل ===
@@ -13550,6 +14310,16 @@ class Monitor:
             self._quiet_source_task = asyncio.create_task(self._quiet_source_watch_loop())
             logging.info("📴 Quiet-source watch started (30-min cycle — alerts OWNER_ID when a top source goes quiet)")
 
+        # === [CHANNEL-GATE] بوابة قناة الطلبات — عضوية للمشتركين فقط ===
+        # طلب المُشغّل (2026-11-20): «لايستطيع الانضمام الى القناه الى اذا تم
+        # الاشتراك في البوت كحساب مراقب حتى لو انا بضيفه». غير قاتل: أي فشل
+        # يُسجّل ولا يوقف بقية الأنظمة.
+        try:
+            self.channel_gate = ChannelGate(self)
+            await self.channel_gate.start()
+        except Exception as _gate_e:
+            logging.error(f"[CHANNEL-GATE] start failed (non-fatal): {_gate_e}")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -15892,6 +16662,23 @@ async def api_deploy_check_handler(request):
         report["issues"].append(
             "🚨 REQUESTS_TARGET_CHANNEL == CHANNEL_ID — request path and link path "
             "are sending to the SAME channel! This breaks channel separation."
+        )
+
+    # 7.5 [CHANNEL-GATE] بوابة قناة الطلبات — الحماية يجب أن تكون مسلّحة
+    _gate = getattr(monitor, 'channel_gate', None)
+    _gate_armed = bool(_gate and _gate.enabled and _gate.channel_marked)
+    report["channel_gate"] = {
+        "enabled": bool(_gate and _gate.enabled),
+        "guarded_channel": int(getattr(_gate, 'channel_marked', 0) or 0),
+        "whitelist_size": len(getattr(_gate, 'whitelist', {}) or {}),
+        "accepted_roles": list(getattr(_gate, 'accept_roles', []) or []),
+        "layers": dict(getattr(_gate, 'layer_health', {}) or {}),
+        "invite_link": bool(getattr(_gate, 'invite_link', "")),
+    }
+    if not _gate_armed:
+        report["issues"].append(
+            "🚨 CHANNEL_GATE not armed — requests channel membership is NOT "
+            "restricted to /login subscribers (operator order 2026-11-20)."
         )
 
     # 8. Final verdict

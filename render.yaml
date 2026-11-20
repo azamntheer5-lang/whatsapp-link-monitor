@@ -32,8 +32,21 @@ services:
       # قناة الطلبات — مسار مستقل لاكتشاف طلبات العملاء وإرسالها.
       # يقبل: معرف رقمي (-100xxx) أو @username. فارغ/0 = معطّل.
       # لا يُغيّر القناة الرئيسية (CHANNEL_ID) — المساران مستقلان.
+      # [REQ-CHANNEL-SWITCH-20261120] الرقمي الحالي (قناة /%%%%/ الخاصة).
       - key: REQUESTS_TARGET_CHANNEL
-        value: "@dhkskwksjskwk"
+        value: "-1003616135800"
+      # === [CHANNEL-GATE] بوابة قناة الطلبات — طلب المُشغّل (2026-11-20):
+      # «لايستطيع الانضمام الى القناه الى اذا تم الاشتراك في البوت كحساب
+      # مراقب حتى لو انا بضيفه». الافتراضي في الكود مفعّل (true).
+      - key: CHANNEL_GATE_ENABLED
+        value: "true"
+      # الأدوار التي تمنح وصول القناة عبر /login (افتراضيًا المراقب فقط؛
+      # أضف joiner بـ "monitor,joiner" لو رغبت).
+      - key: CHANNEL_GATE_ACCEPT_ROLES
+        value: "monitor"
+      # دورة مسح العضوية بالثواني (افتراضي 600).
+      - key: CHANNEL_GATE_SWEEP_S
+        value: "600"
       # === Request Filter v2 — Kill Switch + Rate Limit + Circuit Breaker ===
       # [BOT-FILTER-v2] الفلتر المحافظ الجديد: Intent + Academic Service.
       # يحلّ مشكلة الـ15,000 رسالة الكاذبة (الفلتر القديم بـ300 كلمة +
