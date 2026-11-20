@@ -35,6 +35,7 @@ AutoReplyEngine v1.0 — حسابات الرد التلقائي (الرد الأ
 """
 
 import asyncio
+import html as _htmlmod
 import logging
 import os
 import random
@@ -296,6 +297,19 @@ class AutoReplyEngine:
                     return False
                 phone, client = acc['phone'], acc['client']
                 tried.append(phone)
+                # [FLOOD-SAFE v4.5] احترام سجل التقييد المشترك (DB) من كل
+                # المسارات (انضمام/رد/زر أحمر) — حساب مقيّد لا يُجرَّب أصلًا:
+                try:
+                    _fwm = getattr(self._m, 'floodwait_mgr', None)
+                    if _fwm is not None:
+                        _bl, _rem = await _fwm.is_blocked(phone)
+                        if _bl:
+                            logger.info(
+                                f"[AUTOREPLY] phone={phone} floodwait-blocked "
+                                f"({_rem}s left) — skipped, no attempt")
+                            continue
+                except Exception:
+                    pass
                 try:
                     ent = await self._resolve_entity(client, sid, source_phone)
                     if ent is None:
@@ -327,13 +341,43 @@ class AutoReplyEngine:
                             wait_s = int(getattr(e, 'seconds', 0) or 60)
                         except Exception:
                             wait_s = 60
-                        # نحترم مدة تيليجرام كاملة لهذا الحساب
+                        # [FLOOD-SAFE v4.5] احترام المدة كاملة +30ث هامش —
+                        # لا تقصير أبدًا. التسجيل في floodwait_mgr (DB)
+                        # يجعل كل المسارات (انضمام/رد/زر أحمر) ترفض الحساب
+                        # فورًا حتى انتهاء المدة — البوت لا «يضل يحاول».
                         self._next_allowed[phone] = (
-                            datetime.now() + timedelta(seconds=wait_s + 5))
+                            datetime.now() + timedelta(seconds=wait_s + 30))
+                        try:
+                            _fwm = getattr(self._m, 'floodwait_mgr', None)
+                            if _fwm is not None:
+                                await _fwm.block(phone, wait_s + 30)
+                        except Exception:
+                            pass
                         self.stats['flood_events'] += 1
                         logger.warning(
                             f"[AUTOREPLY] FloodWait {wait_s}s on {phone} — "
-                            f"account paused, trying next")
+                            f"full duration registered in DB, account paused "
+                            f"(no retry on this account)")
+                        await self._notify_team_flood(
+                            phone, wait_s + 30, f"FloodWait {wait_s} ثانية")
+                        continue
+                    if 'PeerFlood' in ename or 'PEER_FLOOD' in estr.upper():
+                        # [FLOOD-SAFE v4.5] إجهاد حقيقي من تلغرام — الحساب
+                        # يرتاح 24 ساعة كاملة + تسجيل DB لكل المسارات.
+                        self._next_allowed[phone] = (
+                            datetime.now() + timedelta(hours=24))
+                        try:
+                            _fwm = getattr(self._m, 'floodwait_mgr', None)
+                            if _fwm is not None:
+                                await _fwm.block(phone, 86400)
+                        except Exception:
+                            pass
+                        self.stats['flood_events'] += 1
+                        logger.warning(
+                            f"[AUTOREPLY] PeerFlood on {phone} — paused 24h "
+                            f"(حد تلغرام — الحساب يرتاح، لا إعادة محاولة)")
+                        await self._notify_team_flood(
+                            phone, 86400, "PeerFlood — 24 ساعة كاملة")
                         continue
                     if 'UserPrivacyRestricted' in ename or 'privacy' in estr.lower():
                         self.stats['skip_privacy'] += 1
@@ -349,6 +393,30 @@ class AutoReplyEngine:
         except Exception as e:
             logger.warning(f"[AUTOREPLY] greet error (non-fatal): {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # [FLOOD-SAFE v4.5] تنبيه فوري للفريق في قناة الطلبات عند تقييد حساب
+    # ------------------------------------------------------------------
+    async def _notify_team_flood(self, phone: str, wait_s: int, kind: str):
+        try:
+            _m = self._m
+            _bc = getattr(_m, 'bot_client', None)
+            target = getattr(_m, 'requests_target_channel', 0)
+            if (not _bc or not _bc.is_connected() or not target):
+                return
+            _until = datetime.now() + timedelta(seconds=wait_s)
+            await _bc.send_message(
+                target,
+                "⚠️ <b>حساب رد تلقائي مقيّد مؤقتًا</b>\n"
+                f"📱 الرقم: <code>{_htmlmod.escape(str(phone))}</code>\n"
+                f"⏳ السبب: <b>{_htmlmod.escape(kind)}</b>\n"
+                f"🕒 متاح مجددًا تلقائيًا ~ {_until.strftime('%H:%M')}\n\n"
+                "🛡️ أُوقف الحساب كليًا حتى نهاية المدة — لن تُرسل منه أي "
+                "رسائل ولن تُعاد المحاولة. طلبات جديدة ستُرَدّ من حساب "
+                "رد آخر متاح، وزر 🔴 المحادثة يبقى للفريق.",
+                parse_mode='html', link_preview=False)
+        except Exception as e:
+            logger.debug(f"[AUTOREPLY] flood notify failed: {e}")
 
     # ------------------------------------------------------------------
     # تقرير الحالة — /autoreply_status

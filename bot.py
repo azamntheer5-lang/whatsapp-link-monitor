@@ -39,7 +39,8 @@ import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError, RPCError, UserPrivacyRestrictedError
+from telethon.errors import (FloodWaitError, RPCError, UserPrivacyRestrictedError,
+                             PeerFloodError)
 from telethon.sessions import StringSession
 from aiohttp import web
 import json as json_module
@@ -5104,6 +5105,9 @@ class Monitor:
         self._msg_cache: Dict[Tuple[int, int], dict] = {}
         self._msg_cache_lock = asyncio.Lock()
         self._msg_cache_ttl = 120  # ثانية — نبقي الرسائل لمدة دقيقتين
+        # [RED-CONTACT-v4.5] مسودات محادثة الزر الأحمر (اقتراح → تعديل → إرسال)
+        # Key: presser_id (مشرف) → {uid, phone, chat_id, text, sug_idx, ts}
+        self._red_contact_drafts: Dict[int, dict] = {}
         # === LINK RING BUFFER (LRB) — LINK-ONLY FAST CAPTURE ===
         # [PR-1] مسار مستقل فائق السرعة: يخزّن الروابط المُستخرَجة (normalized
         # فقط) بأسرع نقطة بعد وصول الرسالة — قبل أي metadata/sender/title/cache.
@@ -5358,15 +5362,74 @@ class Monitor:
             f"[CONFIG] requests channel target: {_raw} → {marked}")
         return marked
 
+    # [RED-CONTACT-v4.5] اقتراحات جاهزة للمحادثة — الأولى هي نص المُشغّل
+    # الحرفي السابق «السلام عليكم» (بلا إضافات) والبقية صياغات خدمية
+    # محايدة بلا أسماء أشخاص — المشرف يعدّل كما يشاء قبل الإرسال.
+    RED_CONTACT_SUGGESTIONS = (
+        "السلام عليكم",
+        "السلام عليكم، شفنا طلبك — نقدر نخدمك فيه الآن، وش تحتاج بالضبط؟",
+        "وعليكم السلام، معك فريق الخدمة — تفضل كتابة طلبك ونرد عليك فورًا",
+        "مرحباً بك، طلبك وصلنا — اكتب التفاصيل والسعر نتكلم فيه معك",
+    )
+    RED_CONTACT_DRAFT_TTL = 600  # ثانية — المسودة تنتهي بعد 10 دقائق
+    RED_CONTACT_MAX_LEN = 3500   # حد أمان لطول النص المعدّل
+
+    def _red_contact_cleanup(self):
+        """إزالة مسودات الزر الأحمر المنتهية (TTL)"""
+        try:
+            now = time.time()
+            drafts = getattr(self, '_red_contact_drafts', None)
+            if not isinstance(drafts, dict):
+                return
+            for k in [k for k, d in drafts.items()
+                      if now - d.get('ts', 0) > self.RED_CONTACT_DRAFT_TTL]:
+                drafts.pop(k, None)
+        except Exception:
+            pass
+
+    def _fmt_wait(self, secs) -> str:
+        """تنسيق مدة انتظار بالعربي"""
+        try:
+            s = max(int(secs), 0)
+        except Exception:
+            s = 0
+        if s >= 3600:
+            return f"{s // 3600} س {int(s % 3600) // 60} د"
+        if s >= 60:
+            return f"{s // 60} د {s % 60} ث"
+        return f"{s} ث"
+
+    def _red_contact_preview(self, draft: dict) -> tuple:
+        """نص معاينة المسودة + أزرارها (إرسال / اقتراح جاهز / إلغاء)"""
+        _esc = html_module.escape
+        sug_idx = draft.get('sug_idx', 0) % len(self.RED_CONTACT_SUGGESTIONS)
+        text = (
+            "🔴 <b>محادثة مع صاحب الطلب</b>\n\n"
+            f"👤 العميل: <code>{draft.get('uid')}</code>\n"
+            f"📡 عبر الرقم الملتقط: <code>{_esc(str(draft.get('phone', '')))}</code>\n\n"
+            "📝 <b>نص الاقتراح الحالي:</b>\n"
+            f"<blockquote>{_esc(draft.get('text', ''))}</blockquote>\n"
+            "✏️ لتعديل النص: اكتب الرسالة الجديدة هنا مباشرة، ثم اضغط «إرسال الآن»"
+        )
+        buttons = [
+            [Button.inline("✅ إرسال الآن", b"rcsend")],
+            [Button.inline("📝 اقتراح جاهز آخر", f"rcsug:{sug_idx}".encode()),
+             Button.inline("❌ إلغاء", b"rccancel")],
+        ]
+        return text, buttons
+
     async def _handle_red_contact(self, event, data, presser_id):
-        """[RED-CONTACT-v4.4.16] أمر المُشغّل 2026-09-12:
+        """[RED-CONTACT-v4.5.0] أمر المُشغّل — تطوير 2026-11-21:
         زر «🔴 تواصل مع المرسل» أعلى تنبيه الطلب — المشرفون فقط.
-        الضغط يُرسل «السلام عليكم» حرفيًا إلى خاص صاحب الطلب من الرقم
-        المراقب الذي التقط الطلب (source_phone — مشترك بنفس مجموعة
-        المرسل بحكم الالتقاط، فكيانه معروف لدى المرسل).
-        بوابة المشرفين عبر Bot API getChatMember (تعمل قبل وبعد جعل
-        القناة خاص — numeric chat_id من سياق الحدث نفسه).
-        فشل التحقق من الصلاحية = رفض آمن (fail-closed)."""
+        **السلوك الجديد (طلب المُشغّل): زر محادثة/اقتراح — الضغط لا
+        يُرسل شيئًا مباشرة؛ يفتح في خاص المشرف مسودة نص مقترح، يعدّلها
+        (كتابة حرة أو زر اقتراح جاهز) ثم يضغط «إرسال الآن» فقط.**
+        - الإرسال يبقى من الرقم المراقب الملتقط (source_phone — كيانه
+          معروف لدى المرسل بحكم الاشتراك المشترك في نفس المجموعة).
+        - بوابة المشرفين عبر Bot API getChatMember (fail-closed).
+        - [FLOOD-SAFE] قبل فتح المسودة وقبل الإرسال: احترام سجل
+          FloodWait للحساب — لو مقيّد مؤقتًا يُرفض فورًا مع المتبقي،
+          والبوت لا «يضل يحاول» أبدًا أثناء التقييد (أكبر خطر)."""
         try:
             # --- بوابة المشرفين فقط (طلب المُشغّل الحرفي) ---
             _allowed = False
@@ -5405,31 +5468,229 @@ class Monitor:
                 await event.answer("❌ الرقم المراقب غير متصل حاليًا", alert=True)
                 return
 
-            # --- إرسال «السلام عليكم» حرفيًا (نص المُشغّل بلا إضافات) ---
+            # --- [FLOOD-SAFE] احترام سجل التقييد المؤقت قبل أي شيء ---
             try:
-                await _client.send_message(_sender_uid, "السلام عليكم")
+                _fw_mgr = getattr(self, 'floodwait_mgr', None)
+                if _fw_mgr is not None:
+                    _is_bl, _rem = await _fw_mgr.is_blocked(_phone)
+                    if _is_bl:
+                        logging.warning(
+                            f"[RED-CONTACT] blocked phone={_phone} "
+                            f"remaining={_rem}s — refused, no retry")
+                        await event.answer(
+                            f"⏳ الرقم الملتقط مقيّد مؤقتًا لدى تلغرام "
+                            f"(متبقٍ {self._fmt_wait(_rem)}) — لن يحاول البوت "
+                            f"حتى تنتهي المدة تلقائيًا",
+                            alert=True)
+                        return
+            except Exception:
+                pass
+
+            # --- فتح مسودة الاقتراح في خاص المشرف (لا إرسال مباشر) ---
+            self._red_contact_cleanup()
+            try:
+                drafts = self._red_contact_drafts
+            except AttributeError:
+                drafts = self._red_contact_drafts = {}
+            drafts[presser_id] = {
+                'uid': _sender_uid,
+                'phone': _phone,
+                'chat_id': _src_chat,
+                'text': self.RED_CONTACT_SUGGESTIONS[0],
+                'sug_idx': 0,
+                'ts': time.time(),
+            }
+            text, buttons = self._red_contact_preview(drafts[presser_id])
+            try:
+                await self.bot_client.send_message(
+                    presser_id, text, parse_mode='html',
+                    buttons=buttons, link_preview=False)
+                await event.answer(
+                    "🔴 فتحنا مسودة المحادثة في خاص البوت — عدّل الاقتراح "
+                    "ثم اضغط إرسال الآن", alert=True)
                 logging.info(
-                    f"[RED-CONTACT] ✅ السلام عليكم sent uid={_sender_uid} "
+                    f"[RED-CONTACT] draft opened uid={_sender_uid} "
                     f"via={_phone} admin={presser_id} src_chat={_src_chat}")
-                await event.answer("✅ أُرسل «السلام عليكم» لخاص المرسل",
+            except Exception as _e:
+                # خاص البوت مغلق/غير مفتوح — نظف المسودة وأخبر المشرف
+                drafts.pop(presser_id, None)
+                logging.warning(f"[RED-CONTACT] draft send failed: {_e!r}")
+                await event.answer(
+                    "⚠️ افتح محادثة خاصة مع البوت أولًا (اضغط Start) ثم "
+                    "اعد ضغط الزر لتعديل الاقتراح قبل الإرسال",
+                    alert=True)
+        except Exception as _e:
+            logging.warning(f"[RED-CONTACT] callback failed: {_e!r}")
+            try:
+                await event.answer("❌ خطأ غير متوقع", alert=True)
+            except Exception:
+                pass
+
+    async def _handle_red_contact_text(self, event, presser_id, text):
+        """[RED-CONTACT-v4.5] تحديث نص المسودة برسالة المشرف الحرة"""
+        try:
+            self._red_contact_cleanup()
+            drafts = getattr(self, '_red_contact_drafts', {})
+            draft = drafts.get(presser_id)
+            if draft is None:
+                await event.reply(
+                    "⚠️ لا توجد مسودة محادثة نشطة — اضغط زر 🔴 من تنبيه الطلب")
+                return
+            clean = (text or "").strip()[:self.RED_CONTACT_MAX_LEN]
+            if not clean:
+                await event.reply("⚠️ النص فارغ — اكتب نصًا صالحًا")
+                return
+            draft['text'] = clean
+            draft['ts'] = time.time()
+            ptext, buttons = self._red_contact_preview(draft)
+            await event.reply(ptext, parse_mode='html',
+                              buttons=buttons, link_preview=False)
+            logging.info(
+                f"[RED-CONTACT] draft edited admin={presser_id} "
+                f"len={len(clean)}")
+        except Exception as _e:
+            logging.warning(f"[RED-CONTACT] text update failed: {_e!r}")
+
+    async def _handle_red_contact_suggest(self, event, presser_id, data):
+        """[RED-CONTACT-v4.5] تدوير الاقتراحات الجاهزة داخل المسودة"""
+        try:
+            self._red_contact_cleanup()
+            drafts = getattr(self, '_red_contact_drafts', {})
+            draft = drafts.get(presser_id)
+            if draft is None:
+                await event.answer("⚠️ انتهت صلاحية المسودة — اضغط 🔴 من جديد",
                                    alert=True)
-            except UserPrivacyRestrictedError:
+                return
+            try:
+                cur = int(str(data).split(":")[1])
+            except Exception:
+                cur = draft.get('sug_idx', 0)
+            nxt = (cur + 1) % len(self.RED_CONTACT_SUGGESTIONS)
+            draft['sug_idx'] = nxt
+            draft['text'] = self.RED_CONTACT_SUGGESTIONS[nxt]
+            draft['ts'] = time.time()
+            ptext, buttons = self._red_contact_preview(draft)
+            await event.edit(ptext, parse_mode='html',
+                             buttons=buttons, link_preview=False)
+            await event.answer("📝 تم تحميل اقتراح جاهز — عدّله أو أرسله")
+        except Exception as _e:
+            logging.warning(f"[RED-CONTACT] suggest failed: {_e!r}")
+
+    async def _handle_red_contact_cancel(self, event, presser_id):
+        """[RED-CONTACT-v4.5] إلغاء مسودة المحادثة"""
+        try:
+            removed = getattr(self, '_red_contact_drafts', {}).pop(
+                presser_id, None)
+            try:
+                await event.edit("❌ <b>أُلغيت مسودة المحادثة</b> — لم يُرسل "
+                                 "أي شيء.", parse_mode='html')
+            except Exception:
+                await event.answer("❌ أُلغيت المسودة")
+            if removed is not None:
                 logging.info(
-                    f"[RED-CONTACT] privacy-restricted uid={_sender_uid} "
-                    f"admin={presser_id}")
-                await event.answer("❌ المرسل مقفل خاص — تعذّر الإرسال",
+                    f"[RED-CONTACT] draft cancelled admin={presser_id}")
+        except Exception as _e:
+            logging.warning(f"[RED-CONTACT] cancel failed: {_e!r}")
+
+    async def _handle_red_contact_send(self, event, sender_id):
+        """[RED-CONTACT-v4.5] إرسال نهائي بعد التعديل — بفحوص FloodWait كاملة
+        قبل المحاولة، وتسجيل أي تقييد يحدث حتى يرفض كل ضغط لاحق فورًا."""
+        try:
+            self._red_contact_cleanup()
+            drafts = getattr(self, '_red_contact_drafts', {})
+            draft = drafts.get(sender_id)
+            if draft is None:
+                await event.answer("⚠️ انتهت صلاحية المسودة (10 دقائق) — "
+                                   "اضغط 🔴 من تنبيه الطلب من جديد", alert=True)
+                return
+            _phone = draft.get('phone', '')
+            _uid = draft.get('uid')
+            _text = (draft.get('text') or "").strip()
+            if not _text:
+                await event.answer("⚠️ النص فارغ — عدّله أولًا", alert=True)
+                return
+
+            # (1) الحساب متصل؟
+            _client = self.user_clients.get(_phone)
+            if not _client or not _client.is_connected():
+                await event.answer("❌ الرقم الملتقط غير متصل حاليًا — "
+                                   "أُبقيت المسودة، جرّب لاحقًا", alert=True)
+                return
+
+            # (2) [FLOOD-SAFE] مقيّد مؤقتًا؟ لا محاولة إطلاقًا
+            try:
+                _fw_mgr = getattr(self, 'floodwait_mgr', None)
+                if _fw_mgr is not None:
+                    _is_bl, _rem = await _fw_mgr.is_blocked(_phone)
+                    if _is_bl:
+                        await event.answer(
+                            f"⏳ الرقم مقيّد مؤقتًا (متبقٍ "
+                            f"{self._fmt_wait(_rem)}) — أُبقيت المسودة، "
+                            f"أعد الإرسال بعد انتهاء المدة",
+                            alert=True)
+                        return
+            except Exception:
+                pass
+
+            # (3) الإرسال الواحد والوحيد — لا retry ولا إلحاح
+            try:
+                await _client.send_message(_uid, _text)
+                drafts.pop(sender_id, None)
+                logging.info(
+                    f"[RED-CONTACT] ✅ sent uid={_uid} via={_phone} "
+                    f"admin={sender_id} len={len(_text)}")
+                try:
+                    await event.edit(
+                        "✅ <b>تم إرسال رسالتك لصاحب الطلب</b>\n"
+                        "👤 المحادثة الآن بين يديك — تابعها يدويًا.",
+                        parse_mode='html')
+                except Exception:
+                    await event.answer("✅ تم الإرسال — المحادثة الآن لك")
+            except UserPrivacyRestrictedError:
+                drafts.pop(sender_id, None)
+                logging.info(
+                    f"[RED-CONTACT] privacy-restricted uid={_uid} "
+                    f"admin={sender_id}")
+                await event.answer("❌ المرسل مقفل خاصه — تعذّر الإرسال",
                                    alert=True)
             except FloodWaitError as _fw:
+                # [FLOOD-SAFE] تسجيل المدة كاملة (لا تقصير) — الحساب يُوقَف
+                # صمتًا حتى نهايتها وكل ضغط لاحق يُرفض فورًا قبل أي محاولة.
+                _wait_s = max(int(getattr(_fw, 'seconds', 600)), 1)
+                try:
+                    _fw_mgr = getattr(self, 'floodwait_mgr', None)
+                    if _fw_mgr is not None:
+                        await _fw_mgr.block(_phone, _wait_s + 30)
+                except Exception:
+                    pass
                 logging.warning(
-                    f"[RED-CONTACT] floodwait {_fw.seconds}s via {_phone}")
+                    f"[RED-CONTACT] FloodWait {_wait_s}s via={_phone} "
+                    f"— registered, account paused, no retry")
                 await event.answer(
-                    f"❌ تعذّر الإرسال (فيض {_fw.seconds}ث) — جرّب لاحقًا",
+                    f"⏳ تلغرام قيّدت الرقم مؤقتًا ({self._fmt_wait(_wait_s)}) "
+                    f"— أُوقِف كليًا حتى نهايتها وأُبقيت مسودتك. لن يحاول "
+                    f"البوت تلقائيًا إطلاقًا",
+                    alert=True)
+            except PeerFloodError:
+                # [FLOOD-SAFE] إجهاد حقيقي — الرقم يرتاح 24 ساعة كاملة
+                try:
+                    _fw_mgr = getattr(self, 'floodwait_mgr', None)
+                    if _fw_mgr is not None:
+                        await _fw_mgr.block(_phone, 86400)
+                except Exception:
+                    pass
+                logging.warning(
+                    f"[RED-CONTACT] PeerFlood via={_phone} — paused 24h")
+                await event.answer(
+                    "⚠️ الرقم وصل حد تلغرام للرسائل (PeerFlood) — يرتاح 24 "
+                    "ساعة كاملة. أُبقيت مسودتك",
                     alert=True)
             except Exception as _e:
                 logging.warning(f"[RED-CONTACT] send failed: {_e!r}")
-                await event.answer("❌ تعذّر الإرسال — جرّب لاحقًا", alert=True)
+                await event.answer("❌ تعذّر الإرسال — أُبقيت المسودة، "
+                                   "جرّب لاحقًا", alert=True)
         except Exception as _e:
-            logging.warning(f"[RED-CONTACT] callback failed: {_e!r}")
+            logging.warning(f"[RED-CONTACT] send handler failed: {_e!r}")
             try:
                 await event.answer("❌ خطأ غير متوقع", alert=True)
             except Exception:
@@ -5456,12 +5717,25 @@ class Monitor:
             # فقط — البوابة داخل _handle_red_contact (fail-closed).
             if data == "cbh":
                 await event.answer(
-                    "🔴 زر التواصل: يرسل «السلام عليكم» تلقائيًا إلى خاص "
-                    "صاحب الطلب من رقم مراقب مشترك بنفس مجموعته. "
-                    "الاستخدام: للمشرفين فقط.", alert=True)
+                    "🔴 زر المحادثة: يفتح لك مسودة اقتراح في خاص البوت — "
+                    "عدّل النص كما تريد (أو اختر اقتراحًا جاهزًا) ثم اضغط "
+                    "«إرسال الآن» ليُرسل من رقم المراقب الملتقط لخاص "
+                    "صاحب الطلب. الاستخدام: للمشرفين فقط.", alert=True)
                 return
             if data.startswith("cbc:"):
                 await self._handle_red_contact(event, data, sender_id)
+                return
+
+            # [RED-CONTACT-v4.5] أزرار مسودة المحادثة (خاص البوت) —
+            # كل زر يتحقق أن الضاغط هو صاحب المسودة نفسه.
+            if data == "rcsend":
+                await self._handle_red_contact_send(event, sender_id)
+                return
+            if data.startswith("rcsug:"):
+                await self._handle_red_contact_suggest(event, sender_id, data)
+                return
+            if data == "rccancel":
+                await self._handle_red_contact_cancel(event, sender_id)
                 return
 
             # AUTHORIZATION: state-changing actions require owner verification
@@ -12277,7 +12551,9 @@ class Monitor:
             if text == "/cancel":
                 if sender_id in self._login_sessions:
                     del self._login_sessions[sender_id]
-                await event.reply("❌ تم إلغاء عملية التسجيل.")
+                if sender_id in getattr(self, '_red_contact_drafts', {}):
+                    self._red_contact_drafts.pop(sender_id, None)
+                await event.reply("❌ تم إلغاء العملية الجارية.")
                 return
 
             if text == "/status":
@@ -12297,6 +12573,14 @@ class Monitor:
             # إذا كان في عملية تسجيل
             if sender_id in self._login_sessions:
                 await self._handle_login_step(event, sender, text)
+                return
+
+            # [RED-CONTACT-v4.5] اعتراض نص التعديل لمسودة الزر الأحمر:
+            # المشرف ضغط 🔴 فانفتحت مسودة اقتراح — أي رسالة يكتبها الآن
+            # (بغير أوامر) تُصبح النص الجديد للاقتراح، ثم يرسل بزر «إرسال الآن».
+            if (sender_id in getattr(self, '_red_contact_drafts', {})
+                    and not text.startswith('/')):
+                await self._handle_red_contact_text(event, sender_id, text)
                 return
 
             # === الأوامر الإدارية (تعمل في الخاص والقناة) ===
