@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import random
 import re
 import secrets
 import signal
@@ -123,6 +124,18 @@ REQUESTS_CHANNEL_ID_FALLBACK = -1004344657223
 # نجاح التعديل (تعديل النص ذاته يرفضه تلغرام MessageNotModified).
 _REQ_HINT_ACTIVATING = "للتواصل: يتم تفعيل الاسم والايدي للنقر خلال ثوانٍ"
 _REQ_HINT_ACTIVE = "للتواصل: اضغط الايدي 🆔 أو اسم المُرسِل أعلاه"
+# [DELETE-MARK-ID-ACTIVATE v4.4.24] أذيال علامة الحذف — واعية بمسار
+# الايدي: بعد حذف الأصل يظل ذكر الايدي/الاسم حيًا إن نُشّط (الكيان
+# مستقل عن الرسالة المحذوفة). الحالتان: قيد التفعيل (تنشيط لاحق
+# يرقّي الذيل) ومُنشَّط (الضغط يعمل فورًا).
+_REQ_DELTAIL_PENDING = (
+    "🔗 الرابط أعلاه لن يفتح شيئًا — جارٍ تفعيل الايدي والاسم "
+    "للنقر خلال ثوانٍ (تلقائي)."
+)
+_REQ_DELTAIL_ACTIVE = (
+    "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+    "اضغط الايدي 🆔 أو اسم المُرسِل أعلاه (يعمل رغم حذف الأصل)."
+)
 
 # === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
 # نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
@@ -1197,6 +1210,27 @@ class Config:
         self.journal_snapshot_enabled = os.getenv(
             "JOURNAL_SNAPSHOT_ENABLED", "false").strip().lower() in (
             "1", "true", "yes", "on")
+
+        # === [FLEET-COVERAGE v4.4.24] تغطية الأسطول ===
+        # سؤال المُشغّل (2026-11-20): «هل مطلوب من الحسابات المراقبة أن
+        # تكون متصلة بالإنترنت من أجل السحب أو إعادة التوجيه؟» — نعم؛
+        # القارئ غير المتصل لا يسحب ولا يوجّه. الحل: كل حساب مراقب متصل
+        # ينضم تدريجيًا لكل المجموعات المراقبة العامة (التكرار مقصود:
+        # أي حساب متصل يغطي أي مجموعة). سقف يومي + تباعد عشوائي.
+        self.fleet_coverage_enabled = os.getenv(
+            "FLEET_COVERAGE_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+        try:
+            self.fleet_coverage_interval_s = max(
+                900, int(os.getenv("FLEET_COVERAGE_INTERVAL_S", "21600")))
+        except ValueError:
+            self.fleet_coverage_interval_s = 21600
+        try:
+            self.fleet_coverage_daily_limit = max(
+                1, min(200, int(os.getenv(
+                    "FLEET_COVERAGE_DAILY_LIMIT", "25"))))
+        except ValueError:
+            self.fleet_coverage_daily_limit = 25
 
     def validate(self):
         errors = []
@@ -10635,6 +10669,9 @@ class Monitor:
                 _uname_clean = ''
             # (4) نص التنبيه من السجل (قراءة فقط — لا pop: علامة الحذف
             # اللاحقة تملك الإدخال)
+            # [DELETE-MARK-ID-ACTIVATE v4.4.24] لم يُجد في السجل الحي؟
+            # ابحث في سجل المعلّمة — الحذف سبق التنشيط فالإدخال نُقل
+            # هناك كي تُكمل هذه المهمة ترقية الايدي/الاسم بعد الزرع.
             _old_text = None
             _entry = None
             try:
@@ -10645,6 +10682,15 @@ class Monitor:
                         _old_text = str(_entry.get('text') or '') or None
             except Exception:
                 _old_text = None
+            if _old_text is None:
+                try:
+                    _regm = getattr(self, '_request_alerts_marked', None)
+                    if isinstance(_regm, dict):
+                        _entry = _regm.get((int(chat_id), int(msg_id)))
+                        if _entry is not None:
+                            _old_text = str(_entry.get('text') or '') or None
+                except Exception:
+                    _old_text = None
             if not _old_text:
                 return
             # (5) الترقية: استبدال تلميح «قيد التفعيل» بمسار يعمل فعلًا
@@ -10658,6 +10704,12 @@ class Monitor:
                 _new_text = _old_text.replace(
                     _REQ_HINT_ACTIVATING,
                     f"للتواصل: زر «مراسلة» أدناه أو @{_uname_clean} في سطر المُرسِل")
+                # [DELETE-MARK-ID-ACTIVATE v4.4.24] رقّ ذيل علامة الحذف
+                # المعلّقة إلى مسار زر المراسلة الحقيقي
+                _new_text = _new_text.replace(
+                    _REQ_DELTAIL_PENDING,
+                    "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+                    "اضغط زر «مراسلة» أو الـ@username في سطر «المرسل» أعلاه.")
                 # [AUDIT-ID-LINK-ACTIVATE v4.4.23] ترقية سطر المرسل نفسه
                 # (نفس نمط FAST-REQUEST): (@اليوزر) بجانب الاسم — تنبيهات
                 # الجولة وصلت بلا يوزر فالبذرة لم تمرّ عليها أبدًا؛ بدون
@@ -10679,6 +10731,10 @@ class Monitor:
             else:
                 _new_text = _old_text.replace(
                     _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
+                # [DELETE-MARK-ID-ACTIVATE v4.4.24] رقّ ذيل علامة الحذف
+                # المعلّقة إلى المسار الحي — الايدي/الاسم يعملان الآن
+                _new_text = _new_text.replace(
+                    _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
             if _new_text == _old_text and not _btns:
                 return  # لا تغيير — لا تعديل عبث
             # (6) عدّل التنبيه — إعادة الإرسال بنفس النص تُعيد تقييم ذكر
@@ -10778,10 +10834,22 @@ class Monitor:
                     if isinstance(_reg_a, dict):
                         _entry_a = _reg_a.get((int(chat_id), int(msg_id)))
                         _old_a = str((_entry_a or {}).get('text') or '')
+                    # [DELETE-MARK-ID-ACTIVATE v4.4.24] الحذف سبق التنشيط؟
+                    # الإدخال في سجل المعلّمة — نفس الترقية تعمل عليه
+                    # (تبديل التلميح + ترقية ذيل علامة الحذف للمسار الحي).
+                    if not _old_a:
+                        _regm_a = getattr(
+                            self, '_request_alerts_marked', None)
+                        if isinstance(_regm_a, dict):
+                            _entry_a = _regm_a.get(
+                                (int(chat_id), int(msg_id)))
+                            _old_a = str((_entry_a or {}).get('text') or '')
                     if not _old_a:
                         return
                     _new_a = _old_a.replace(_REQ_HINT_ACTIVATING,
                                             _REQ_HINT_ACTIVE)
+                    _new_a = _new_a.replace(_REQ_DELTAIL_PENDING,
+                                            _REQ_DELTAIL_ACTIVE)
                     if _new_a == _old_a:
                         return  # لا تلميح تفعيل — عُدّل مسبقًا/تنسيق قديم
                     try:
@@ -10995,27 +11063,76 @@ class Monitor:
             #   relay   → رأس «مُحوَّل من: الطالب» قابل للنقر دائمًا
             #   buttons → زر «مراسلة» (username — يعمل دائمًا)
             #   غير ذلك → بلا مسار تلقائي — قولها بصدق
+            # [DELETE-MARK-ID-ACTIVATE v4.4.24] وعي بمسار الايدي: إن كان
+            # ذكر الايدي/الاسم منشّطًا (تلميد _REQ_HINT_ACTIVE) فالضغط
+            # عليهما يفتح خاص المرسل رغم حذف الأصل — الكيان مستقل عن
+            # الرسالة المحذوفة. وإن لم يُنشّط بعد فالتنشيط (بذرة/
+            # ENTITY-RESCUE) ما زال يعمل خلفيًا — الذيل «قيد التفعيل»
+            # ويُرقّى تلقائيًا عند اكتمال الزرع (الإدخال يُحفظ أسفل).
+            _marked_src = str(entry.get('text') or '')
+            _has_active_hint = _REQ_HINT_ACTIVE in _marked_src
+            _has_dm_btn = False
+            try:
+                for _row in (entry.get('buttons') or []):
+                    for _b in (_row or []):
+                        _b_url = str(getattr(_b, 'url', '') or '')
+                        if _b_url and ('t.me' in _b_url):
+                            _has_dm_btn = True
+            except Exception:
+                _has_dm_btn = False
             if _relay_done:
                 marked += (
                     "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
                     "اضغط اسمه في رسالة التوجيه أسفل التنبيه "
                     "(تعمل حتى بعد حذف الأصل)."
                 )
-            elif entry.get('buttons'):
+            elif _has_dm_btn:
                 marked += (
                     "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
                     "اضغط زر «مراسلة» أو الـ@username في سطر «المرسل» أعلاه."
                 )
+            elif _has_active_hint:
+                # الذكر حي فعلًا الآن — الضغط على الايدي/الاسم يعمل
+                marked += _REQ_DELTAIL_ACTIVE
+            elif ('<a href="tg://user?id=' in _marked_src) or (
+                    int((entry.get('sender_meta') or {}).get(
+                        'sender_id', 0) or 0) > 0):
+                # فيه سطر ايدي/اسم قابل للتنشيط — التنشيط جارٍ خلفيًا
+                # وسيُرقّي هذا الذيل إلى المسار الحي عند اكتماله
+                marked += _REQ_DELTAIL_PENDING
             else:
                 marked += (
                     "🔗 الرابط أعلاه لن يفتح شيئًا — المُرسِل بلا username "
                     "ولا نسخة توجيه متاحة: لم يبقَ مسار تواصل تلقائي."
                 )
+            # حدّث نص الإدخال قبل الحفظ في سجل المعلّمة كي يعمل التنشيط
+            # المتأخر على النص المعلّم (تبديل التلميح + ترقية الذيل).
+            try:
+                entry['text'] = marked
+            except Exception:
+                pass
             await _bot_client.edit_message(
                 entry.get('target'), int(entry.get('alert_id')), marked,
                 parse_mode='html', link_preview=False,
                 buttons=entry.get('buttons'),
             )
+            # [DELETE-MARK-ID-ACTIVATE v4.4.24] احفظ الإدخال في سجل
+            # المعلّمة (بدل إسقاطه مع الـpop): مهمة التنشيط الخلفية
+            # (البذرة أو ENTITY-RESCUE) تجده هنا بعد الحذف فتُفعّل ذكر
+            # الايدي/الاسم وترقّي الذيل من «قيد التفعيل» إلى المسار الحي.
+            # العلامة نفسها لن تتكرر (idempotent عبر الـpop أعلاه).
+            try:
+                if not isinstance(getattr(self, '_request_alerts_marked', None), dict):
+                    self._request_alerts_marked = {}
+                _mk_key = (int(chat_id) if chat_id is not None else 0,
+                           int(msg_id))
+                self._request_alerts_marked[_mk_key] = entry
+                if len(self._request_alerts_marked) > 300:
+                    # سقف ذاكرة — احتفظ بأحدث 300
+                    for _k in list(self._request_alerts_marked.keys())[:-300]:
+                        self._request_alerts_marked.pop(_k, None)
+            except Exception:
+                pass
             logging.info(
                 f"[REQUEST-PATH] ⚠️ delete-marked alert "
                 f"chat_id={chat_id} msg_id={msg_id} "
@@ -15505,6 +15622,141 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[PERIODIC_SYNC] Error: {e}")
 
+    # ================================================================
+    # [FLEET-COVERAGE v4.4.24] تغطية الأسطول
+    # ================================================================
+    # سؤال المُشغّل (2026-11-20): «هل مطلوب من الحسابات المراقبة أن
+    # تكون متصلة بالإنترنت من أجل السحب أو إعادة التوجيه؟» — نعم:
+    # الحدث الحي وجولة الاستقصاء وإعادة التوجيه كلها تتطلب حسابًا
+    # قارئًا متصلًا وعضوًا في المجموعة. لذا: كل حساب مراقب متصل ينضم
+    # تدريجيًا لكل المجموعات المراقبة «العامة» التي ليس عضوًا فيها —
+    # التكرار مقصود (أي حساب متصل يغطي أي مجموعة حتى لو انقطع حسابها
+    # الأصلي). المجموعات الخاصة بلا يوزرنيم تُتخطى (لا انضمام بلا
+    # رابط دعوة). سقف يومي لكل حساب (25 افتراضيًا) + تباعد عشوائي
+    # 4-9 ثوانٍ كي لا تُوسم الحسابات بالسبام. env:
+    #   FLEET_COVERAGE_ENABLED / FLEET_COVERAGE_INTERVAL_S /
+    #   FLEET_COVERAGE_DAILY_LIMIT
+    # ================================================================
+    async def _fleet_coverage_pass(self):
+        """دورة تغطية واحدة: لكل مراقب متصل → انضمام للمجموعات الناقصة."""
+        try:
+            watchers = await self.db.get_active_watchers()
+            chats = await self.prod_db.get_monitored_chats(limit=5000)
+            # المجموعات القابلة للانضمام: مراقبة + لها يوزرنيم (عامة)
+            joinable = {}
+            for c in (chats or []):
+                _un = str(c.get('username') or '').strip().lstrip('@')
+                if _un and int(c.get('should_monitor', 1) or 0):
+                    joinable[int(c['chat_id'])] = {
+                        'username': _un,
+                        'title': str(c.get('chat_title') or '')[:48],
+                    }
+            if not joinable:
+                logging.info("[FLEET-COVERAGE] no public monitored chats — skip")
+                return
+            # ميزانية يومية لكل حساب (تتصفّر مع تغير اليوم UTC)
+            _day = datetime.utcnow().strftime('%Y-%m-%d')
+            if getattr(self, '_fleet_cov_day', None) != _day:
+                self._fleet_cov_day = _day
+                self._fleet_cov_joins = {}
+            budget = int(getattr(self.config, 'fleet_coverage_daily_limit', 25) or 25)
+            total_joined = 0
+            for w in (watchers or []):
+                phone = w['phone']
+                if w.get('role', 'monitor') != 'monitor':
+                    continue  # الفدائيون لهم نظامهم الخاص
+                client = self.user_clients.get(phone)
+                if not client or not client.is_connected():
+                    continue
+                used = int(self._fleet_cov_joins.get(phone, 0))
+                if used >= budget:
+                    continue
+                try:
+                    my_chats = set()
+                    async for dialog in client.iter_dialogs():
+                        if dialog.is_group or dialog.is_channel:
+                            my_chats.add(int(dialog.id))
+                    missing = [c for cid, c in joinable.items()
+                               if cid not in my_chats]
+                    if not missing:
+                        logging.info(f"[FLEET-COVERAGE] {phone}: تغطية كاملة ✓")
+                        continue
+                    from telethon.tl.functions.channels import JoinChannelRequest
+                    joined = 0
+                    for c in missing[: (budget - used)]:
+                        allowed = await self.rate_limiter.acquire(
+                            phone, 'join_channel')
+                        if not allowed:
+                            logging.info(
+                                f"[FLEET-COVERAGE] {phone}: rate limited — "
+                                f"يُستأنف في الدورة القادمة")
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                client(JoinChannelRequest(c['username'])),
+                                timeout=30)
+                            joined += 1
+                            await self.rate_limiter.record_success(
+                                phone, 'join_channel')
+                            logging.info(
+                                f"[FLEET-COVERAGE] {phone} انضم @"
+                                f"{c['username']} ({c['title']}) "
+                                f"[{used + joined}/{budget}]")
+                        except Exception as je:
+                            _jn = type(je).__name__
+                            if 'AlreadyParticipant' in _jn:
+                                continue  # سباق مزامنة — هو عضو فعلًا
+                            await self.rate_limiter.record_success(
+                                phone, 'join_channel')
+                            logging.info(
+                                f"[FLEET-COVERAGE] {phone} فشل الانضمام @"
+                                f"{c['username']}: {_jn}")
+                            if ('FloodWait' in _jn
+                                    or 'ChannelPrivate' in _jn
+                                    or 'InviteHash' in _jn
+                                    or 'UserBannedInChannel' in _jn):
+                                break  # استراحة لهذا الحساب
+                        await asyncio.sleep(random.uniform(4, 9))
+                    if joined:
+                        self._fleet_cov_joins[phone] = used + joined
+                        total_joined += joined
+                        logging.info(
+                            f"[FLEET-COVERAGE] {phone}: +{joined} في هذه "
+                            f"الدورة، متبقٍ {max(0, len(missing) - joined)} "
+                            f"(الخاصة بلا يوزرنيم مستثناة)")
+                except Exception as e:
+                    logging.warning(
+                        f"[FLEET-COVERAGE] {phone}: خطأ الدورة: {e}")
+            # حدّث reader_phones كي تعكس التغطية الجديدة فورًا
+            # (نفس آلية الاكتشاف التي تقرأها اللوحة مباشرة)
+            if total_joined > 0:
+                try:
+                    await self.source_registry.discover_all_sources_background(
+                        self.user_clients)
+                except Exception as _dr_e:
+                    logging.warning(
+                        f"[FLEET-COVERAGE] refresh readers failed: {_dr_e}")
+            logging.info(
+                f"[FLEET-COVERAGE] انتهت الدورة: +{total_joined} انضمامًا، "
+                f"{len(joinable)} مجموعة عامة قابلة للتغطية")
+        except Exception as e:
+            logging.error(f"[FLEET-COVERAGE] fatal: {e}")
+
+    async def _fleet_coverage_loop(self):
+        """حلقة التغطية — أول دورة بعد 5 دقائق من الإقلاع ثم كل 6 ساعات."""
+        await asyncio.sleep(300)  # انتظر اكتمال الإقلاع والمزامنة الأولى
+        while self._running:
+            try:
+                if getattr(self.config, 'fleet_coverage_enabled', True):
+                    await self._fleet_coverage_pass()
+                else:
+                    logging.info("[FLEET-COVERAGE] معطّل عبر env")
+            except Exception as e:
+                logging.error(f"[FLEET-COVERAGE] loop error: {e}")
+            await asyncio.sleep(int(
+                getattr(self.config, 'fleet_coverage_interval_s', 21600)
+                or 21600))
+
     async def _chat_classifier(self):
         """مهمة خلفية: تصنيف المجموعات المراقبة بالذكاء الاصطناعي.
 
@@ -16684,6 +16936,14 @@ class Monitor:
         asyncio.create_task(self._sync_monitored_chats())
         # كرر كل ساعة
         asyncio.create_task(self._periodic_sync())
+
+        # === [FLEET-COVERAGE v4.4.24] كل مراقب متصل ينضم لكل المجموعات ===
+        # تغطية زائدة مقصودة: أي حساب متصل يغطي أي مجموعة حتى لو انقطع
+        # حسابها الأصلي (السحب/التوجيه يتطلبان اتصالًا). أول دورة بعد
+        # 5 دقائق ثم كل 6 ساعات — بسقف يومي وتباعد عشوائي لكل حساب.
+        self._fleet_cov_day = None
+        self._fleet_cov_joins = {}
+        asyncio.create_task(self._fleet_coverage_loop())
 
         # === STARTUP HISTORY SCAN [Req-2] ===
         # Discover groups from RECENT message history of every connected monitor

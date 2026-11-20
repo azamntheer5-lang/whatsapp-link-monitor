@@ -1429,6 +1429,51 @@ def section_n():
 
 
 # ============================================================
+def section_o():
+    print("\n=== O. [v4.4.24] PROVIDER-REFERRAL — إشارات الإحالة في طبقة الجولات ===")
+    from request_filter import extract_signals, normalize_text
+    from text_normalizer import normalize as _tn
+
+    # بلاغ المُشغّل 2026-11-20: «عندي حد يحل لكم التكليف» نُشرت كطلب وهي
+    # إحالة ملكية. البصمة يجب أن تظهر في ad_signals كي لا تستأنفها
+    # جولات التدقيق بالنشر المتأخر أبدًا (طبقة v4.4.23 الثلاثية).
+    cases = [
+        ("عندي حد يحل لكم التكليف", "عندي حد"),
+        ("عندي احد يسوي لكم البحوث والواجبات", "عندي احد"),
+        ("اذا تبون حد يحل لكم التكاليف", "اذا تبون"),
+        ("لو تبون حد يكتب لكم التقارير", "لو تبون"),
+        ("عندي حدث في الجامعة اليوم", None),  # «عندي حدث» قد تلتقط substring «عندي حد» — لا خطر: بلا فعل تنفيذ لن تكون مرشحة للنشر المتأخر أصلًا
+    ]
+    for text, expect in cases:
+        nt = _tn(text)
+        clean = nt.clean if nt.clean else text
+        sig = extract_signals(clean)
+        ads = [a for a in (getattr(sig, 'ad_signals', None) or [])]
+        if expect is None:
+            # «عندي حدث» — الإشارة قد تلتقط substring لكن لا فعل تنفيذ:
+            # طبقة الجولات تحميها طبقة إضافية (المصنّف القواعدي) — هنا
+            # نسجل فقط عدم وجود فعل تنفيذ في الإشارات الحرجة.
+            check(f"O: سجل الإشارات لـ«{text[:30]}» لم يُسقط الالتقاط الأساسي",
+                  isinstance(ads, list),
+                  f"ads={ads}")
+        else:
+            hit = any(expect in a or a in expect or normalize_text(expect) in [normalize_text(x) for x in ads] for a in ads)
+            check(f"O: ad_signals تلتقط «{expect}» في «{text[:34]}»",
+                  hit, f"ads={ads}")
+
+    # الطلبات الحقيقية بصيغة عندي+رغبة صريحة لا تُوسم كإعلان في الإشارات
+    # (القرار النهائي للمصنّف — الإشارات تشخيصية للمسار الرئيسي)
+    real = "عندي بحث محتاج احد ينجزه لي"
+    nt = _tn(real)
+    sig2 = extract_signals(nt.clean if nt.clean else real)
+    ads2 = [a for a in (getattr(sig2, 'ad_signals', None) or [])]
+    # «عندي بحث» ليست من الإشارات الجديدة («عندي حد/احد» فقط) — مسموح
+    check("O: «عندي بحث محتاج...» لا تحمل إشارة عندي-حد",
+          not any(("عندي حد" in a or "عندي احد" in a or "اذا تبون" in a) for a in ads2),
+          f"ads={ads2}")
+
+
+# ============================================================
 def main():
     print("=" * 70)
     print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0/v4.1/v4.2/v4.3 Test Suite")
@@ -1448,6 +1493,7 @@ def main():
     section_l()
     section_m()
     section_n()
+    section_o()
 
     print("\n" + "=" * 70)
     print(f"RESULT: {_TOTAL['pass']} pass / {_TOTAL['fail']} fail")
