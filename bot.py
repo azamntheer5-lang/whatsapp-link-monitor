@@ -9355,9 +9355,12 @@ class Monitor:
                 try:
                     _rescue_fn = getattr(self, '_entity_rescue_edit_alert', None)
                     if callable(_rescue_fn):
+                        # [AUDIT-ID-LINK-ACTIVATE v4.4.23] prefer_phone:
+                        # حساب الالتقاط نفسه (رأى المرسل) أولًا للزرع.
                         asyncio.create_task(_rescue_fn(
                             sent_alert, target, sender_id, sender_display,
-                            chat_id, msg_id))
+                            chat_id, msg_id,
+                            prefer_phone=str(source_phone or '')))
                 except Exception:
                     pass
 
@@ -9987,6 +9990,11 @@ class Monitor:
                 'text': str(raw_text or '')[:300],
                 'reason': str(getattr(analysis, 'reason', '') or '')[:64],
                 'path': str(getattr(analysis, 'decision_path', '') or '')[:40],
+                # [AUDIT-FP-KILL v4.4.23] فئة الرفض — قرار المصنف الواثق
+                # بأن الرسالة عرض/إعلان (service_offer/resource_offer)
+                # لا تستأنفه الجولة بالنشر المتأخر (بلاغ المُشغّل
+                # 2026-11-20: إعلانات رُفضت ثم نشرتها الجولة).
+                'category': str(getattr(analysis, 'intent_type', '') or '')[:40],
                 'conf': float(getattr(analysis, 'confidence', 0.0) or 0.0),
                 'strong': _strong,
                 'ad': _has_ad,
@@ -10069,6 +10077,15 @@ class Monitor:
         """هل يستحق الرفض معاملة «مرشح فائت»؟ (توقيع قوي + ليس مكررًا
         وليس إعلانًا + سبب رفض قابل للمراجعة)"""
         if not entry.get('strong') or entry.get('ad'):
+            return False
+        # [AUDIT-FP-KILL v4.4.23] فئات العرض/الإعلان — قرار المصنف الواثق
+        # (0.95+) بأن المرسل مُقدّم لا طالب: إحالة تواصل، «عندي دكتور»،
+        # عروض الملفات، النصائح المُقدَّمة. الجولة لا تستأنفها — بلاغ
+        # المُشغّل 2026-11-20 «هذول مو طلبات» (رسالتا ترشيح وإعلان شرطي
+        # نُشرتا خطأً رغم رفض الفلتر الصحيح لهما).
+        if str(entry.get('category') or '') in (
+                'service_offer', 'resource_offer', 'advertisement',
+                'advice_giving'):
             return False
         if entry.get('published') or entry.get('audited'):
             return False
@@ -10252,6 +10269,17 @@ class Monitor:
         _link = f"https://t.me/c/{_internal}/{entry['msg_id']}"
         _del_note = ('\n⚠️ <i>الأصل حُذف من المجموعة قبل سحبه — النص محفوظ هنا'
                      ' من عازلة الالتقاط</i>' if entry.get('deleted') else '')
+        # [AUDIT-ID-LINK-ACTIVATE v4.4.23] تلميح التفعيل — نفس دورة حياة
+        # المسار الرئيسي: روابط الايدي/الاسم (tg://user?id) يرسلها البوت
+        # والكيان غير معروف له بعد → نص ميت لا يدخل خاص المرسل (بلاغ
+        # المُشغّل 2026-11-20: الايدي القابل للنقر لا يعمل عند غياب
+        # اليوزرنيم — مثال حي: ترشيح محذوف الأصل بلا أي مسار تواصل).
+        # الكيان يُزرع بعد الإرسال (rescue أدناه) ثم يُعدّل التنبيه:
+        # التلميح يتغير من «قيد التفعيل» إلى «اضغط الايدي أو الاسم»
+        # والذكر يصير حيًا لدى كل المشتركين. نص مختلف يضمن قبول التعديل
+        # (تعديل النص ذاته يرفضه تلغرام MessageNotModified).
+        _hint_line = (f'\n💡 <i>{_REQ_HINT_ACTIVATING}</i>'
+                      if _sid > 0 else '')
         alert = (f'🔍 <b>طلب فائت — من جولة التدقيق التلقائية</b>\n'
                  f'👤 <b>المرسل:</b> '
                  f'<a href="tg://user?id={_sid}">{_safe_sender}</a>'
@@ -10266,7 +10294,8 @@ class Monitor:
                  f'🔗 <a href="{_link}">عرض الرسالة الأصلية</a>\n'
                  f'ℹ️ <i>فلتر رفضه مبدئيًا ({html_module.escape(str(entry.get("reason") or ""))}) '
                  f'والجولة نشرته لقوة مؤشراته — راجعه، وإن لم يكن طلبًا '
-                 f'ردّ بـ«تجاهل الرسالة»</i>')
+                 f'ردّ بـ«تجاهل الرسالة»</i>'
+                 f'{_hint_line}')
         _buttons = None
         try:
             if _sid > 0 and entry.get('phone'):
@@ -10309,10 +10338,31 @@ class Monitor:
                         })
         except Exception:
             pass
+        # [AUDIT-ID-LINK-ACTIVATE v4.4.23] زرع كيان المرسل + تعديل التنشيط
+        # — نفس آلية ENTITY-RESCUE المُجرّبة في المسار الرئيسي، بحساب
+        # الالتقاط نفسه (entry['phone']) أولًا: هو رأى المرسل في المجموعة
+        # فكيانه (access hash) في جلسته. مهمة خلفية — لا تؤخر الجولة،
+        # وغير قاتلة: فشلها يترك تلميح «قيد التفعيل» الصادق كما هو.
+        if _sid > 0:
+            try:
+                _resq_fn = getattr(self, '_entity_rescue_edit_alert', None)
+                if callable(_resq_fn):
+                    _resq_t = asyncio.create_task(_resq_fn(
+                        sent, _target, _sid,
+                        str(entry.get('sender_display') or ''),
+                        int(entry['chat_id']), int(entry['msg_id']),
+                        prefer_phone=str(entry.get('phone') or '')))
+                    _resq_set = getattr(self, '_request_bg_tasks', None)
+                    if isinstance(_resq_set, set):
+                        _resq_set.add(_resq_t)
+                        _resq_t.add_done_callback(_resq_set.discard)
+            except Exception:
+                pass
         logging.info(
             f"[AUDIT-ROUNDS] 🔍 late-published chat_id={entry['chat_id']} "
             f"msg_id={entry['msg_id']} reason={entry.get('reason')} "
-            f"deleted_original={bool(entry.get('deleted'))}"
+            f"deleted_original={bool(entry.get('deleted'))} "
+            f"id_link_rescue_scheduled={bool(_sid > 0)}"
         )
         return True
 
@@ -10466,9 +10516,13 @@ class Monitor:
     # (لو وُجد username) زر «✉️ مراسلة». بلا نقل → التلميح الصادق
     # يبقى (لا وعود ميتة). غير قاتل تمامًا.
 
-    async def _entity_transfer_via_capture(self, sender_id, sender_display):
+    async def _entity_transfer_via_capture(self, sender_id, sender_display,
+                                           prefer_phone=''):
         """[ENTITY-RESCUE] زرع كيان الطالب لدى البوت عبر رسالة ذكر من
-        حساب الالتقاط. يعيد True عند الإرسال. غير قاتل."""
+        حساب الالتقاط. يعيد True عند الإرسال. غير قاتل.
+        [AUDIT-ID-LINK-ACTIVATE v4.4.23] prefer_phone: حساب الالتقاط الذي
+        رأى المرسل (صاحب access hash في جلسته) يُجرَّب أولًا — باقي
+        الأسطول قد لا يعرفه أصلًا فتفشل رسالة الذكر."""
         try:
             _sid = int(sender_id or 0)
             if _sid <= 0:
@@ -10488,10 +10542,20 @@ class Monitor:
                 return False
             _uc = getattr(self, 'user_clients', None) or {}
             _cap = None
-            for _c in _uc.values():
-                if _c is not None and getattr(_c, 'is_connected', lambda: False)():
+            # [AUDIT-ID-LINK-ACTIVATE v4.4.23] حساب الالتقاط نفسه أولًا —
+            # هو رأى المرسل (access hash في جلسته)؛ غيره قد لا يعرفه.
+            _pref = str(prefer_phone or '').strip()
+            if _pref:
+                _c = _uc.get(_pref)
+                if _c is not None and getattr(
+                        _c, 'is_connected', lambda: False)():
                     _cap = _c
-                    break
+            if _cap is None:
+                for _c in _uc.values():
+                    if _c is not None and getattr(
+                            _c, 'is_connected', lambda: False)():
+                        _cap = _c
+                        break
             if _cap is None:
                 logging.debug("[ENTITY-RESCUE] no connected capture client")
                 return False
@@ -10517,11 +10581,15 @@ class Monitor:
             return False
 
     async def _entity_rescue_edit_alert(self, sent_alert, target, sender_id,
-                                        sender_display, chat_id, msg_id):
+                                        sender_display, chat_id, msg_id,
+                                        prefer_phone=''):
         """[ENTITY-RESCUE] ترقية تنبيه طلب خسر سباق الحذف (بلا جسر ولا
         username): زرع الكيان ثم تعديل التنبيه — الاسم يصير قابلًا للنقر
         لدى كل المشتركين + (لو ظهر username) زر «✉️ مراسلة». بلا نقل
-        كيان → التلميح الصادق الأصلي يبقى. غير قاتل تمامًا."""
+        كيان → التلميح الصادق الأصلي يبقى. غير قاتل تمامًا.
+        [AUDIT-ID-LINK-ACTIVATE v4.4.23] يستخدمه أيضًا مسار النشر المتأخر
+        (جولات التدقيق) — روابط الايدي/الاسم في تنبيه الجولة تصير ذكرًا
+        حيًا بنفس الآلية. prefer_phone يوجّه الزرع لحساب الالتقاط."""
         try:
             _sid = int(sender_id or 0)
             if _sid <= 0:
@@ -10542,7 +10610,8 @@ class Monitor:
                 _planted = False
             # (2) غير معروف → زرعه عبر حساب الالتقاط
             if not _planted:
-                _ok = await self._entity_transfer_via_capture(_sid, sender_display)
+                _ok = await self._entity_transfer_via_capture(
+                    _sid, sender_display, prefer_phone=prefer_phone)
                 if not _ok:
                     return  # بلا كيان — التلميح الصادق يبقى
                 try:
@@ -10589,6 +10658,24 @@ class Monitor:
                 _new_text = _old_text.replace(
                     _REQ_HINT_ACTIVATING,
                     f"للتواصل: زر «مراسلة» أدناه أو @{_uname_clean} في سطر المُرسِل")
+                # [AUDIT-ID-LINK-ACTIVATE v4.4.23] ترقية سطر المرسل نفسه
+                # (نفس نمط FAST-REQUEST): (@اليوزر) بجانب الاسم — تنبيهات
+                # الجولة وصلت بلا يوزر فالبذرة لم تمرّ عليها أبدًا؛ بدون
+                # هذا كان التلميح يشير إلى @غير موجود في السطر. no-op آمن
+                # لو اختلفت صيغة الاسم (تطابق نصي فقط).
+                try:
+                    _safe_disp = html_module.escape(
+                        str(sender_display or '').strip())
+                    if _safe_disp:
+                        _old_mention = (f'<a href="tg://user?id={_sid}">'
+                                        f'{_safe_disp}</a>')
+                        _new_mention = (f'{_safe_disp} '
+                                        f'<a href="https://t.me/{_uname_clean}">'
+                                        f'(@{_uname_clean})</a>')
+                        _new_text = _new_text.replace(
+                            _old_mention, _new_mention, 1)
+                except Exception:
+                    pass
             else:
                 _new_text = _old_text.replace(
                     _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
