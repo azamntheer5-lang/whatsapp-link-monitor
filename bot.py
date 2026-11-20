@@ -19807,7 +19807,7 @@ _JOIN_PAGE_HTML = """<!DOCTYPE html>
 <script>
 (function () {
   "use strict";
-  var st = { cc: "967", flag: "\uD83C\uDDF6\uD83C\uDDE6", phone: "", busy: false };
+  var st = { cc: "967", flag: "\\uD83C\\uDDFE\\uD83C\\uDDEA", phone: "", busy: false };
   var $ = function (id) { return document.getElementById(id); };
   function show(id) {
     var steps = ["s1", "s2", "s3", "s3p", "s4"];
