@@ -95,7 +95,7 @@ def _content_word_count(clean_text: str) -> int:
 # كله في bot.py (بناء الأزرار + _handle_red_contact + فرع في
 # _on_callback). منطق القواعد هنا لم يتغير — العلامة تُحدِّث الإصدار
 # المُتحقَّق منه في /api/filter_stats.
-FILTER_VERSION = "v4.4.17"
+FILTER_VERSION = "v4.4.18"
 FILTER_MODE = "ai_intent_classifier"
 
 

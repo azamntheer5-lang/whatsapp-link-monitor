@@ -110,6 +110,20 @@ BLOCKED_SENDER_USERNAMES = frozenset({
 # المعرف الرقمي الموثق للقناة (getChat مباشر):
 REQUESTS_CHANNEL_ID_FALLBACK = -1004344657223
 
+# === [ID-LINK v4.4.18] طريقة الايدي — طلب المُشغّل (2026-11-20) ===
+# «وهناك طريقه الايدي يحط رابط مخفي على الايدي مجرد الصغط عليه يدخلك
+#  الى خاص المرسل» + «اذا كان ماعنده يوزر يتم اعاده التوجيه الى البوت
+#  من اجل يكون الاسم قابل للنقر وبعد ذلك البوت يعدل الرسالة في القناه».
+# سير العمل: (1) التنبيه يُرسل فورًا بسطر 🆔 يحمل رابطًا مخفيًا
+# tg://user?id=<الايدي> + اسم المرسل كذكر نصي. (2) البذرة وجّهت الأصل
+# لخاص البوت (قبل الفلترة — تسبق حذف بوتات الحماية) فصار الكيان معروفًا
+# للبوت. (3) البوت يعدّل رسالة القناة بنفس النص → الذكر/رابط الايدي
+# يتحولان ذكرًا حيًا قابلًا للنقر لدى كل المشتركين (كيان مزروع). التلميح
+# يتغير من «قيد التفعيل» إلى «اضغط الايدي أو الاسم» — نص مختلف يضمن
+# نجاح التعديل (تعديل النص ذاته يرفضه تلغرام MessageNotModified).
+_REQ_HINT_ACTIVATING = "للتواصل: يتم تفعيل الاسم والايدي للنقر خلال ثوانٍ"
+_REQ_HINT_ACTIVE = "للتواصل: اضغط الايدي 🆔 أو اسم المُرسِل أعلاه"
+
 # === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
 # نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
 # الترتيب لا يهم) خلال نافذة الـ12 ساعة → تنبيه واحد فقط. نص مختلف
@@ -961,11 +975,24 @@ class Config:
         #     الفلترة). الافتراضي 'false' = لا توجيل مبكر إطلاقًا (أوقف فيضان
         #     خاص البوت بنسخ رسائل ليست طلبات)؛ جسر الـACCEPT (v4.4.7)
         #     وENTITY-RESCUE يبقيان مسار تواصل الطلبات المحذوفة سليمًا.
+        # [LINK-TASK-PERM-OFF] طلب المُشغّل النهائي (2026-11-20): «وسحب
+        # الروابط وقفه نهائياً» — الافتراضي false في الكود نفسه (كان true
+        # لعقد اختبارات محلية). الاستخراج/السحب للطابور/النشر/الانضمام
+        # التلقائي عبر المجدول: موقوفة. مسار الطلبات لا يتأثر. الانضمام
+        # اليدوي بزر «الانضمام» مستقل عن هذا المفتاح تمامًا.
         self.link_task_enabled = os.getenv(
-            "LINK_TASK_ENABLED", "true").strip().lower() in (
+            "LINK_TASK_ENABLED", "false").strip().lower() in (
             "1", "true", "yes", "on")
+        # [SEED-RACE-v4.4.18] طلب المُشغّل (2026-11-20): «الطلب الذي معاه
+        # يوزر يسحب فوراً بدون اعادة توجيه اما اذا كان ماعنده يوزر يتم
+        # اعاده التوجيه الى البوت من اجل يكون الاسم قابل للنقر وبعد ذلك
+        # البوت يعدل الرسالة في القناه» — البذرة توجّل الأصل من حساب
+        # الالتقاط إلى خاص البوت فور الاستلام (قبل الفلترة — تسبق حذف
+        # بوتات الحماية بالمللي) لمرسلٍ بلا username فقط، فتُزرع لدى البوت
+        # إمكانية تنشيط الذكر + رابط الايدي المخفي في التنبيه بعد الإرسال.
+        # المرفوضات تُحذف نسخها فورًا (_seed_race_cleanup) — لا فيضان.
         self.seed_race_enabled = os.getenv(
-            "SEED_RACE_ENABLED", "false").strip().lower() in (
+            "SEED_RACE_ENABLED", "true").strip().lower() in (
             "1", "true", "yes", "on")
 
         # === Request Filter v2 controls — Kill Switch + Rate Limit + Circuit Breaker ===
@@ -1116,6 +1143,14 @@ class Config:
         self.journal_no_text_retention_s = int(os.getenv("JOURNAL_NO_TEXT_RETENTION_S", "21600"))
         self.delete_miss_reconcile = os.getenv("DELETE_MISS_RECONCILE", "true").lower() == "true"
         self.journal_recovery_enabled = os.getenv("JOURNAL_RECOVERY", "true").lower() == "true"
+        # === [SUPA-MSG-KILL v4.4.18] إيقاف احتفاظ Supabase بالرسائل — طلب
+        # المُشغّل (2026-11-20): «ما ابي سوبابس يضل يحتفظ بالرسائل ما لها
+        # اي داعي» — مرآة message_journal_snapshot إلى Supabase متوقفة
+        # (default false): لا إرسال صفوف ولا استرجاع عند الإقلاع. الجورنال
+        # المحلي (SQLite على القرص المحلي) يبقى — لا علاقة له بـSupabase.
+        self.journal_snapshot_enabled = os.getenv(
+            "JOURNAL_SNAPSHOT_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on")
 
     def validate(self):
         errors = []
@@ -2916,11 +2951,11 @@ def _link_task_enabled(owner) -> bool:
         _val = getattr(_cfg, 'link_task_enabled', None)
         if _val is None:
             return os.getenv(
-                "LINK_TASK_ENABLED", "true").strip().lower() in (
+                "LINK_TASK_ENABLED", "false").strip().lower() in (
                 "1", "true", "yes", "on")
         return bool(_val)
     except Exception:
-        return True
+        return False
 
 
 # -------------------------------------------------------------------
@@ -3965,8 +4000,12 @@ class ChannelGate:
 class IgnoreStore:
     SENDER_PREFIX = "ign:sender:"
     MSG_PREFIX = "ign:msg:"
+    # [IGNORE-GROUP v4.4.18] «اقول تجاهل المجموعة يتم تجاهل بشكل دائم» —
+    # المفتاح chat_id الرقمي للمجموعة (يعمل بلا يوزر ولأي مجموعة).
+    GROUP_PREFIX = "ign:group:"
     ROLE_SENDER = "ignore_sender"
     ROLE_MSG = "ignore_msg"
+    ROLE_GROUP = "ignore_group"
     REFRESH_S = 300  # تحديث دوري من Supabase (تزامن بين الأقسام)
 
     def __init__(self, monitor):
@@ -3983,6 +4022,8 @@ class IgnoreStore:
         self.msg_sigs: Dict[str, dict] = {}
         # hash النص المُطبّع → بصمة دلالية
         self.msg_exact: Dict[str, str] = {}
+        # [IGNORE-GROUP] chat_id → {'tt','by','ts'}
+        self.groups: Dict[int, dict] = {}
         self._http = None
         self._task = None
         self.actions: List[str] = []
@@ -4044,7 +4085,8 @@ class IgnoreStore:
         self._task = asyncio.create_task(self._refresh_loop())
         self.log(
             f"ACTIVE — senders={len(self.senders)} "
-            f"messages={len(self.msg_sigs)} refresh={self.REFRESH_S}s")
+            f"messages={len(self.msg_sigs)} "
+            f"groups={len(self.groups)} refresh={self.REFRESH_S}s")
 
     async def _refresh_loop(self):
         while True:
@@ -4063,7 +4105,8 @@ class IgnoreStore:
         try:
             async with self._http.get(
                 f"{self.supabase_url}/rest/v1/watchers"
-                f"?or=(role.eq.{self.ROLE_SENDER},role.eq.{self.ROLE_MSG})"
+                f"?or=(role.eq.{self.ROLE_SENDER},role.eq.{self.ROLE_MSG}"
+                f",role.eq.{self.ROLE_GROUP})"
                 f"&select=phone,display_name,role&limit=1000",
                 headers=self._supa_headers()) as r:
                 if r.status != 200:
@@ -4077,6 +4120,7 @@ class IgnoreStore:
         _usernames: Dict[str, int] = {}
         _sigs: Dict[str, dict] = {}
         _exact: Dict[str, str] = {}
+        _groups: Dict[int, dict] = {}
         for row in rows or []:
             try:
                 phone = str(row.get('phone') or '')
@@ -4110,13 +4154,28 @@ class IgnoreStore:
                     _ex = str(meta.get('ex') or '')
                     if _ex:
                         _exact[_ex] = _sig
+                elif (role == self.ROLE_GROUP
+                        and phone.startswith(self.GROUP_PREFIX)):
+                    # [IGNORE-GROUP] chat_id رقمي — يعمل بلا يوزر
+                    try:
+                        _gid = int(phone[len(self.GROUP_PREFIX):])
+                        if _gid:
+                            _groups[_gid] = {
+                                'tt': str(meta.get('tt') or ''),
+                                'by': int(meta.get('by') or 0),
+                                'ts': float(meta.get('ts') or 0.0),
+                            }
+                    except (TypeError, ValueError):
+                        continue
             except Exception:
                 continue
         self.senders = _senders
         self.usernames = _usernames
         self.msg_sigs = _sigs
         self.msg_exact = _exact
-        self.log(f"reloaded: senders={len(_senders)} messages={len(_sigs)}")
+        self.groups = _groups
+        self.log(f"reloaded: senders={len(_senders)} "
+                 f"messages={len(_sigs)} groups={len(_groups)}")
 
     # ---------- queries ----------
 
@@ -4142,6 +4201,19 @@ class IgnoreStore:
             _sg = self.sig_of(raw_text)
             if _sg and _sg in self.msg_sigs:
                 return (True, f"message sig {_sg[:8]}")
+        return (False, '')
+
+    def is_group_ignored(self, chat_id):
+        """[IGNORE-GROUP] هل المجموعة مُتجاهَلة بأمر الرد؟ يعيد (hit,
+        reason). المفتاح chat_id الرقمي — دائم حتى لو تغير عنوانها."""
+        try:
+            _cid = int(chat_id or 0)
+        except (TypeError, ValueError):
+            _cid = 0
+        if _cid and _cid in self.groups:
+            _m = self.groups[_cid]
+            return (True, f"group id={_cid}"
+                    + (f" {_m.get('tt')}" if _m.get('tt') else ''))
         return (False, '')
 
     # ---------- mutations ----------
@@ -4222,6 +4294,38 @@ class IgnoreStore:
         self.log(f"message ignored sig={(_sig or _ex)[:12]} by={by} stored={ok}")
         return ok
 
+    async def add_group(self, chat_id, title='', by=0) -> bool:
+        """[IGNORE-GROUP] تجاهل مجموعة (chat_id رقمي) بشكل دائم — لن
+        تُرسل أي requests منها مستقبلًا مهما بدت حقيقية."""
+        try:
+            _cid = int(chat_id)
+        except (TypeError, ValueError):
+            return False
+        if not _cid:
+            return False
+        meta = {"cid": _cid, "tt": str(title or '')[:80],
+                "by": int(by or 0), "ts": time.time()}
+        self.groups[_cid] = {'tt': meta['tt'], 'by': meta['by'],
+                             'ts': meta['ts']}
+        ok = await self._upsert_row(
+            f"{self.GROUP_PREFIX}{_cid}",
+            json_module.dumps(meta, ensure_ascii=False), self.ROLE_GROUP)
+        self._record(f"🔇 مجموعة: {_cid} {meta['tt'][:30]}")
+        self.log(f"group ignored chat_id={_cid} title={meta['tt'][:40]!r} "
+                 f"by={by} stored={ok}")
+        return ok
+
+    async def remove_group(self, chat_id) -> bool:
+        """[IGNORE-GROUP] إلغاء تجاهل مجموعة."""
+        try:
+            _cid = int(chat_id)
+        except (TypeError, ValueError):
+            return False
+        self.groups.pop(_cid, None)
+        ok = await self._delete_rows(f"{self.GROUP_PREFIX}{_cid}")
+        self._record(f"↩️ إلغاء تجاهل مجموعة: {_cid}")
+        return ok
+
     async def remove_sender(self, uid) -> bool:
         try:
             uid = int(uid)
@@ -4290,12 +4394,17 @@ class IgnoreStore:
             lines.append(f"  • {_sig[:10]} — «{(_m.get('txt') or '')[:40]}»")
         if len(self.msg_sigs) > 10:
             lines.append(f"  … و{len(self.msg_sigs) - 10} آخر")
+        lines.append(f"مجموعات مُتجاهَلة: {len(self.groups)}")
+        for _gid, _m in list(self.groups.items())[:10]:
+            lines.append(f"  • {_gid} — {(_m.get('tt') or '')[:40]}")
+        if len(self.groups) > 10:
+            lines.append(f"  … و{len(self.groups) - 10} آخر")
         if self.actions:
             lines.append("آخر الإجراءات:")
             lines.extend(f"  {a}" for a in self.actions[-6:])
         lines.append(
             "💡 للتجاهل: رد على التنبيه بـ«تجاهل المرسل» أو «تجاهل الرسالة»"
-            " — أو وجّه التنبيه للبوت ثم رد عليه.")
+            " أو «تجاهل المجموعة» — أو وجّه التنبيه للبوت ثم رد عليه.")
         return "\n".join(lines)
 
 
@@ -5010,18 +5119,24 @@ class Monitor:
 
             # === أوامر الانضمام الجماعي ===
             if data == "bulk_join":
+                # [JOIN-BUTTON v4.4.18] طلب المُشغّل (2026-11-20): «اما
+                # الانضمام يبدأ بزر الحين وقفه واذا احتجت اربط ارقام
+                # فدائيه واضغط زر الانضمام» — ضغطة واحدة تكفي: إلغاء
+                # الإيقاف (محفوظ في DB) + تشغيل عامل الانضمام إن لم يكن
+                # يعمل. سحب الروابط موقوف نهائيًا — هذا الزر هو طريق
+                # الانضمام الوحيد (يقرأ روابط قناة الروابط ويحاول عبر
+                # الحسابات الفدائية المرتبطة role=joiner).
                 await event.answer("بدء الانضمام...")
-                # Scheduler يبدأ تلقائياً — هذا الزر لاستئناف/إعادة تشغيل يدوي
-                if hasattr(self, '_joiner_task') and self._joiner_task and not self._joiner_task.done():
-                    if self._join_paused:
-                        # Worker يعمل لكن متوقف — استأنف
-                        self._join_paused = False
-                        await self.prod_db.set_setting('join_paused', 'false')
-                        await event.reply("▶️ تم استئناف الانضمام تلقائياً")
-                    else:
-                        await event.reply("✅ الانضمام يعمل تلقائياً\nأرسل /bulk_join_status لرؤية التقدم")
+                self._join_paused = False
+                try:
+                    await self.prod_db.set_setting('join_paused', 'false')
+                except Exception:
+                    pass
+                if getattr(self, '_bulk_join_running', False):
+                    await event.reply(
+                        "✅ الانضمام يعمل الآن\n"
+                        "أرسل /bulk_join_status أو زر «تقدم الانضمام»")
                 else:
-                    # Worker متوقف — أعد تشغيله
                     self._bulk_join_running = True
                     self._bulk_join_stop = False
                     self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
@@ -5029,7 +5144,8 @@ class Monitor:
                     await event.reply(
                         "🚀 بدأ الانضمام\n\n"
                         "📝 سيقرأ روابط من القائمة ويحاول الانضمام.\n"
-                        "⏱️ معدل آمن: انضمام كل دقيقة"
+                        "⏱️ معدل آمن: انضمام كل دقيقة\n"
+                        "⛔ للإيقاف: زر «إيقاف الانضمام» أو /bulk_join_stop"
                     )
                 return
 
@@ -5995,7 +6111,9 @@ class Monitor:
                         self._journal_recovery())
                     logging.warning("[SUPERVISOR] restarted journal_recovery")
                 # 3. Journal snapshot (persistence) — guarded: 8b adds the method
-                if hasattr(self, '_journal_snapshot_loop') and self._running:
+                if (hasattr(self, '_journal_snapshot_loop') and self._running
+                        and getattr(getattr(self, 'config', None),
+                                    'journal_snapshot_enabled', False)):
                     if (getattr(self, '_journal_snapshot_task', None) is None
                             or self._journal_snapshot_task.done()):
                         self._journal_snapshot_task = asyncio.create_task(
@@ -7167,6 +7285,10 @@ class Monitor:
                 return 0
             if not self._journal_enabled():
                 return 0
+            # [SUPA-MSG-KILL v4.4.18] المرآة متوقفة — لا استرجاع أصلًا.
+            if not getattr(getattr(self, 'config', None),
+                           'journal_snapshot_enabled', False):
+                return 0
             session = await self.db._get_supabase_session()
             url = (
                 f"{self.db.supabase_url}/rest/v1/message_journal_snapshot?"
@@ -7831,6 +7953,21 @@ class Monitor:
         _ig_store = getattr(self, 'ignore_store', None)
         if _ig_store is not None:
             try:
+                # [IGNORE-GROUP v4.4.18] المجموعة أولاً — أرخص فحص (int في
+                # dict): «اقول تجاهل المجموعة يتم تجاهل بشكل دائم» — لا
+                # بذرة ولا فلترة ولا إرسال لأي رسالة من مجموعة مُتجاهَلة.
+                _igg_hit, _igg_why = _ig_store.is_group_ignored(chat_id)
+                if _igg_hit:
+                    logging.info(
+                        f"[REQUEST-PATH] REJECT reason=ignored_group "
+                        f"({_igg_why}) chat_id={chat_id} msg_id={msg_id}"
+                    )
+                    try:
+                        await self.metrics.record_skip(
+                            'request_ignored_group')
+                    except Exception:
+                        pass
+                    return
                 _ig_sid = int(getattr(event, 'sender_id', 0) or 0)
                 _ig_un = _sender_username_normalized(
                     getattr(event, 'sender', None))
@@ -8339,17 +8476,17 @@ class Monitor:
         # لو موجود → ترقية حقيقية (زر t.me + @يوزر في سطر المرسل)،
         # (4) username متوفر → الجسر غير لازم → نظّف نسخته (لا يتامى).
         _bridge = None
+        # [ID-LINK v4.4.18] جمع غير حاجب — طلب المُشغّل: «اهم شي السرعه
+        # لان الرساله تحذف في اجزاء من الثانيه». جاهزة البذرة الآن؟
+        # استخدمها فورًا (بلا أي نداء إضافي). لم تكتمل؟ لا انتظار إطلاقًا
+        # قبل الإرسال — تُجمع بعد الإرسال (≤2.5s) ويُعدَّل التنبيه حينها
+        # (تنشيط الذكر + رابط الايدي). الإرسال أولًا دائمًا.
         try:
-            _aw_fn = getattr(self, '_seed_race_collect', None)
-            if callable(_aw_fn):
-                _bridge = await _aw_fn(chat_id, msg_id)
+            _try_fn = getattr(self, '_seed_race_try_collect', None)
+            if callable(_try_fn):
+                _bridge = _try_fn(chat_id, msg_id)
         except Exception:
             _bridge = None
-        # [FAST-REQUEST] البذرة أُطلقت قبل حلّ المرسل (بالتوازي — أعلاه)
-        # لتسابق حذف بوتات الحماية. هنا نجمع نتيجتها بسقف 1.5s فقط:
-        # الأغلب يكتمل خلال 200-600ms (توجيل واحد). تأخرت؟ التنبيه
-        # يُرسل بلا انتظار إضافي، وتُجمَع البذرة بعد الإرسال (shield —
-        # المهمة تستمر، لا إلغاء) ويُوجَّه توجيلها أسفل التنبيه حينها.
         if _bridge is None and _seed_task is not None:
             try:
                 _bridge = await asyncio.wait_for(
@@ -8387,6 +8524,20 @@ class Monitor:
         else:
             sender_line = f'👤 <b>المرسل:</b> {safe_sender}'
 
+        # [ID-LINK v4.4.18] سطر الايدي — رابط مخفي على رقم الايدي نفسه
+        # (tg://user?id): مجرد الضغط على الايدي يدخلك خاص المرسل — يعمل
+        # بلا username إطلاقًا (المفتاح رقمي). يُرسل فورًا مع التنبيه
+        # ويُنشَّط بالتعديل بعد الإرسال (الكيان المزروع عبر البذرة يحوّله
+        # ذكرًا حيًا لدى كل المشتركين).
+        id_line = ''
+        try:
+            _sid_il = int(sender_id or 0)
+            if _sid_il > 0:
+                id_line = (f'\n🆔 <b>الايدي:</b> '
+                           f'<a href="tg://user?id={_sid_il}">{_sid_il}</a>')
+        except Exception:
+            id_line = ''
+
         # نص الطلب: اقتباس مستقل — قابل للتوسيع للنصوص الطويلة
         # (blockquote expandable = علامة ⌄ للفتح في تطبيقات تلغرام)
         _quote_open = ('blockquote expandable'
@@ -8394,7 +8545,7 @@ class Monitor:
 
         # [v4.4.0] التنبيه يبدأ مباشرة ببطاقة المعلومات — بلا عنوان
         # فئة وبلا سطر سبب (طلبا المُشغّل معًا في نفس الرسالة).
-        alert = sender_line + "\n"
+        alert = sender_line + id_line + "\n"
         alert += f"👥 <b>المجموعة:</b> {safe_chat}\n"
         alert += f"🕒 <b>التاريخ:</b> {html_module.escape(date_str)}\n"
         alert += "💬 <b>نص الطلب:</b>\n"
@@ -8460,13 +8611,10 @@ class Monitor:
         #     دائمًا — مسار مضمون).
         #   - بلا جسر → قول الحقيقة: الاسم قد لا يستجيب + السبب.
         if dm_mode == 'text_mention':
-            if _bridge:
-                alert += ("\n💡 <i>للتواصل: اضغط اسم المُرسِل في رسالة التوجيه "
-                          "أسفل هذا التنبيه</i>")
-            else:
-                alert += ("\n💡 <i>للتواصل: المُرسِل بلا username — اسمه أعلاه "
-                          "قد لا يستجيب للضغط (قيد تلغرام على رسائل "
-                          "البوتات)</i>")
+            # [ID-LINK v4.4.18] التنبيه يصل بأقصى سرعة (بلا انتظار البذرة)
+            # والتلميح يقول الحقيقة: التفعيل جارٍ خلال ثوانٍ (البذرة أو
+            # ENTITY-RESCUE — أيهما زرع الكيان أولًا يُعدّل التنبيه).
+            alert += f"\n💡 <i>{_REQ_HINT_ACTIVATING}</i>"
 
         # [IGNORE-BY-REPLY] ميتا التنبيه — يُخزّن في السجل لتخدم أمر
         # التجاهل بالرد (تجاهل المرسل/الرسالة) دون أي نداء API إضافي.
@@ -8475,6 +8623,7 @@ class Monitor:
             'sender_username': _uname_clean or '',
             'sender_name': str(sender_display or '')[:80],
             'chat_id': int(chat_id),
+            'chat_title': str(chat_title or '')[:120],
             'msg_id': int(msg_id),
             'raw_text': str(raw_text or '')[:2000],
         }
@@ -8527,57 +8676,43 @@ class Monitor:
                     _reg_alert_fn(chat_id, msg_id, target, sent_alert,
                                   alert, dm_buttons, sender_meta=_alert_meta)
 
-            # === [ENTITY-RESCUE] لا جسر ولا username (خسرنا سباق الحذف) ===
-            # الكيان يظل حيًا بعد حذف الرسالة: حساب الالتقاط (رأى الطالب
-            # في المجموعة) يزرع كيانه لدى البوت عبر رسالة ذكر قصيرة،
-            # ثم نُرقّي التنبيه بعد ثوانٍ: الاسم يتحول لذكر حقيقي قابل
-            # للنقر لدى كل المشتركين + (لو وُجد username) زر «✉️ مراسلة».
-            # بلا نقل كيان → التلميح الصادق الأصلي يبقى. مهمة خلفية —
-            # لا تعطّل المسار ولا تؤخر الإرسال. غير قاتل تمامًا.
-            if (dm_mode == 'text_mention' and not _bridge
-                    and int(sender_id or 0) > 0):
+            # === [ID-LINK v4.4.18] اجمع بذرة السباق بعد الإرسال (≤2.5s) ===
+            # التنبيه وصل القناة بأقصى سرعة (طلب المُشغّل: السرعة بالمللي).
+            # البذرة وجّهت الأصل لخاص البوت قبل الفلترة (تسبق حذف بوتات
+            # الحماية) فزرعت كيان المرسل — نجمعها الآن إن لم تُجمع، ثم
+            # يُعدَّل التنبيه: الذكر + رابط الايدي يصيران حيّين لدى كل
+            # المشتركين (+ username لو ظهر → زر «مراسلة»). username كان
+            # متوفرًا؟ لا حاجة لنسخة البذرة — تُحذف (لا يتامى).
+            if _bridge is None:
                 try:
-                    _rescue_fn = getattr(self, '_entity_rescue_edit_alert', None)
-                    if callable(_rescue_fn):
-                        asyncio.create_task(_rescue_fn(
-                            sent_alert, target, sender_id, sender_display,
-                            chat_id, msg_id))
+                    _col_fn = getattr(self, '_seed_race_collect', None)
+                    if callable(_col_fn):
+                        _bridge = await _col_fn(chat_id, msg_id, timeout=2.5)
+                except Exception:
+                    _bridge = None
+            if isinstance(_bridge, dict) and _uname_clean:
+                try:
+                    asyncio.create_task(
+                        self._seed_copy_delete(_bridge, 'username-resolved'))
                 except Exception:
                     pass
+                _bridge = None
+            if isinstance(_bridge, dict):
+                # سجّل حالة الجسر (بلا توجيل قناة — relay معطل دائمًا)
+                _psf = getattr(
+                    self, '_relay_and_register_request_alert', None)
+                if callable(_psf):
+                    await _psf(target, _bridge, sent_alert,
+                               chat_id, msg_id, alert, dm_buttons,
+                               sender_meta=_alert_meta)
 
-            # === [FAST-REQUEST] بذرة تأخرت عن سقف ما قبل الإرسال؟ ===
-            # التنبيه وصل القناة بأقصى سرعة — اجمع البذرة الآن (≤3s)
-            # ووجّه نسختها أسفل التنبيه + سجّل حالة الجسر (تعليم الحذف
-            # يملك إعادة المحاولة). username حلّ لاحقًا؟ نظّف نسخة البذرة
-            # (لا يتامى).
-            if _seed_task is not None and _bridge is None:
-                try:
-                    _late_b = await asyncio.wait_for(
-                        asyncio.shield(_seed_task), timeout=3.0)
-                except Exception:
-                    _late_b = None
-                if isinstance(_late_b, dict):
-                    if _uname_clean:
-                        try:
-                            asyncio.create_task(
-                                self._seed_copy_delete(
-                                    _late_b, 'username-resolved'))
-                        except Exception:
-                            pass
-                    else:
-                        _bridge = _late_b
-                        _psf = getattr(
-                            self, '_relay_and_register_request_alert', None)
-                        if callable(_psf):
-                            await _psf(target, _bridge, sent_alert,
-                                       chat_id, msg_id, alert, dm_buttons,
-                                       sender_meta=_alert_meta)
-
-            # === [FAST-REQUEST] ترقية username بعد الإرسال ===
+            # === [FAST-REQUEST] ترقية/تنشيط ما بعد الإرسال (بذرة) ===
             # بذرة بلا يوزر وقت الإرسال (dm=text_mention): كيان الطالب
-            # صار معروفًا للبوت → استخراج username (يعمل حتى بعد حذف
-            # الأصل — الكيان مستقل عن الرسالة) → تعديل التنبيه: (@يوزر)
-            # في سطر المرسل + زر «✉️ مراسلة». مهمة خلفية مُتعقَّبة.
+            # صار معروفًا للبوت → (أ) username ظهر؟ تعديل التنبيه يضيف
+            # (@يوزر) في سطر المرسل + زر «✉️ مراسلة». (ب) بلا username؟
+            # [ID-LINK v4.4.18] تعديل التنشيط: نفس النص بتلميح جديد →
+            # إعادة تقييم الذكر ورابط الايدي والكيان معروف → ذكر حي
+            # قابل للنقر لدى كل المشتركين. مهمة خلفية مُتعقَّبة.
             if _bridge and dm_mode == 'text_mention':
                 try:
                     _tu = asyncio.create_task(
@@ -8588,6 +8723,25 @@ class Monitor:
                     if isinstance(_tasks_u, set):
                         _tasks_u.add(_tu)
                         _tu.add_done_callback(_tasks_u.discard)
+                except Exception:
+                    pass
+
+            # === [ENTITY-RESCUE] لا بذرة ولا username (خسرنا سباق الحذف) ===
+            # الكيان يظل حيًا بعد حذف الرسالة: حساب الالتقاط (رأى الطالب
+            # في المجموعة) يزرع كيانه لدى البوت عبر رسالة ذكر قصيرة،
+            # ثم نُرقّي التنبيه بعد ثوانٍ: الاسم ورابط الايدي يتحولان
+            # ذكرًا حقيقيًا قابلًا للنقر لدى كل المشتركين + (لو وُجد
+            # username) زر «✉️ مراسلة». بلا نقل كيان → تلميح «قيد
+            # التفعيل» يبقى صادقًا حتى ينجح أحد المسارين. مهمة خلفية —
+            # لا تعطّل المسار ولا تؤخر الإرسال. غير قاتل تمامًا.
+            if (dm_mode == 'text_mention' and not _bridge
+                    and int(sender_id or 0) > 0):
+                try:
+                    _rescue_fn = getattr(self, '_entity_rescue_edit_alert', None)
+                    if callable(_rescue_fn):
+                        asyncio.create_task(_rescue_fn(
+                            sent_alert, target, sender_id, sender_display,
+                            chat_id, msg_id))
                 except Exception:
                     pass
 
@@ -8702,12 +8856,19 @@ class Monitor:
         إلى خاص البوت — يزرع كيان المُرسِل لدى البوت ويحفظ نسخة تنجو من
         حذف الأصل. يعيد {'seed_msg_id', 'cap_user_id', 'done': False}
         أو None (غير قاتل).
-        [MENTION-BRIDGE-KILL 2026-11-20] متوقف افتراضيًا — تشخيص إنتاجي:
-        معرفات البذور العائدة من Telethon لا تطابق معرفات Bot API
-        → التوجيل اللاحق ينشر رسائل خاطئة من خاص البوت داخل القناة."""
+        [SEED-RACE-v4.4.18] البذرة (التوجيل لخاص البوت فقط) صارت تحت
+        SEED_RACE_ENABLED (افتراضي true — طلب المُشغّل 2026-11-20: مرسل
+        بلا username يُوجَّل للبوت كي يصبح الاسم/الايدي قابلين للنقر بعد
+        تعديل التنبيه). توجيل القناة (relay — _mention_bridge_relay) يبقى
+        تحت MENTION_BRIDGE_ENABLED معطلًا دائمًا: حادثة 2026-11-20 نشرت
+        رسائل أكتوبر خاطئة بالقناة (معرفات Telethon≠Bot API في التوجيل
+        من خاص البوت) — البذرة ذاتها بريئة (تذهب لخاص البوت فقط)."""
         try:
-            if not getattr(getattr(self, 'config', None),
-                           'mention_bridge_enabled', False):
+            _cfg_sb = getattr(self, 'config', None)
+            _seed_ok = (bool(getattr(_cfg_sb, 'seed_race_enabled', False))
+                        or bool(getattr(_cfg_sb,
+                                        'mention_bridge_enabled', False)))
+            if not _seed_ok:
                 return None
             _sid = int(sender_id or 0)
             if _sid <= 0:
@@ -8955,10 +9116,11 @@ class Monitor:
             logging.debug(f"[SEED-RACE] start error (non-fatal): {_sr_e}")
             return False
 
-    async def _seed_race_collect(self, chat_id, msg_id):
+    async def _seed_race_collect(self, chat_id, msg_id, timeout=10):
         """[SEED-RACE] اجمع نتيجة بذرة السباق (لو وُجدت) — استهلاك.
         يعيد dict الجسر عند النجاح أو None (بلا بذرة/فشلت). المتصل
-        يهبط للبذرة المتأخرة. غير قاتل."""
+        يهبط للبذرة المتأخرة. timeout قابل للضبط (الافتراضي 10s؛ ما بعد
+        الإرسال v4.4.18 يستخدم 2.5s). غير قاتل."""
         try:
             _key = (int(chat_id), int(msg_id))
             reg = getattr(self, '_seed_race_reg', None)
@@ -8976,7 +9138,37 @@ class Monitor:
                 if _t.done():
                     _br = _t.result() if not _t.cancelled() else None
                 else:
-                    _br = await asyncio.wait_for(asyncio.shield(_t), timeout=10)
+                    _br = await asyncio.wait_for(
+                        asyncio.shield(_t), timeout=timeout)
+            except Exception:
+                _br = None
+            if isinstance(_br, dict):
+                entry['bridge'] = _br
+                return _br
+            return None
+        except Exception:
+            return None
+
+    def _seed_race_try_collect(self, chat_id, msg_id):
+        """[ID-LINK v4.4.18] جمع غير حاجب: يعيد dict الجسر فقط لو كانت
+        مهمة البذرة قد اكتملت فعلًا (بلا أي انتظار)، وإلا None ويبقى
+        الإدخال في السجل ليُجمع بعد الإرسال (_seed_race_collect).
+        تزامني بالكامل — صفر نداءات API — لا يؤخر الإرسال أبدًا."""
+        try:
+            _key = (int(chat_id), int(msg_id))
+            reg = getattr(self, '_seed_race_reg', None)
+            if not isinstance(reg, dict):
+                return None
+            entry = reg.get(_key)
+            if not entry or entry.get('consumed'):
+                return None
+            _t = entry.get('task')
+            if not isinstance(_t, asyncio.Task) or not _t.done():
+                return None
+            reg.pop(_key, None)
+            entry['consumed'] = True
+            try:
+                _br = _t.result() if not _t.cancelled() else None
             except Exception:
                 _br = None
             if isinstance(_br, dict):
@@ -9179,20 +9371,20 @@ class Monitor:
                 _old_text = None
             if not _old_text:
                 return
-            # (5) الترقية: استبدال التلميح الصادق بمسار يعمل فعلًا
-            _HINT_OLD = ("للتواصل: المُرسِل بلا username — اسمه أعلاه "
-                         "قد لا يستجيب للضغط (قيد تلغرام على رسائل البوتات)")
+            # (5) الترقية: استبدال تلميح «قيد التفعيل» بمسار يعمل فعلًا
+            # [ID-LINK v4.4.18] التلميح الجديد يوجّه لضغط الايدي 🆔 أو
+            # الاسم — كلاهما يصير ذكرًا حيًا بعد هذا التعديل (الكيان
+            # المزروع يُقيَّم عند إعادة الإرسال).
             _new_text = _old_text
             _btns = None
             if _uname_clean:
                 _btns = [[Button.url("✉️ مراسلة", f"https://t.me/{_uname_clean}")]]
                 _new_text = _old_text.replace(
-                    _HINT_OLD,
+                    _REQ_HINT_ACTIVATING,
                     f"للتواصل: زر «مراسلة» أدناه أو @{_uname_clean} في سطر المُرسِل")
             else:
                 _new_text = _old_text.replace(
-                    _HINT_OLD,
-                    "للتواصل: اضغط اسم المُرسِل أعلاه — مسار التواصل مُفعّل")
+                    _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
             if _new_text == _old_text and not _btns:
                 return  # لا تغيير — لا تعديل عبث
             # (6) عدّل التنبيه — إعادة الإرسال بنفس النص تُعيد تقييم ذكر
@@ -9266,8 +9458,58 @@ class Monitor:
                         str(getattr(_seen, 'username', '') or '').lstrip('@'))
             except Exception:
                 _uname = ''
+            # [ID-LINK v4.4.18] بلا username فعليًا → تعديل التنشيط: نفس
+            # نص التنبيه بتلميح جديد فقط (نص مختلف يضمن قبول التعديل —
+            # تعديل النص ذاته يرفضه تلغرام MessageNotModified). إعادة
+            # الإرسال تُقيّم ذكر tg://user?id والكيان الآن معروف للبوت
+            # (زرعته البذرة) → الاسم + رابط الايدي 🆔 يصيران ذكرًا حيًا
+            # قابلًا للنقر لدى كل المشتركين (آلية edit المُجرَّبة في
+            # v4.4.6/v4.4.7 + ENTITY-RESCUE).
             if len(_uname) < 4:
-                return  # لا username فعليًا — التوجيل أسفل التنبيه يكفي
+                try:
+                    _sid_act = int(sender_id or 0)
+                    if _sid_act <= 0:
+                        return
+                    _known = None
+                    try:
+                        _known = await asyncio.wait_for(
+                            _bot_client.get_entity(_sid_act), timeout=4)
+                    except Exception:
+                        _known = None
+                    if _known is None:
+                        return  # الكيان لم يُزرع بعد — لا تعديل عبث
+                    _reg_a = getattr(self, '_request_alerts', None)
+                    _entry_a = None
+                    _old_a = ''
+                    if isinstance(_reg_a, dict):
+                        _entry_a = _reg_a.get((int(chat_id), int(msg_id)))
+                        _old_a = str((_entry_a or {}).get('text') or '')
+                    if not _old_a:
+                        return
+                    _new_a = _old_a.replace(_REQ_HINT_ACTIVATING,
+                                            _REQ_HINT_ACTIVE)
+                    if _new_a == _old_a:
+                        return  # لا تلميح تفعيل — عُدّل مسبقًا/تنسيق قديم
+                    try:
+                        await _bot_client.edit_message(
+                            target, _alert_id, _new_a,
+                            parse_mode='html', link_preview=False)
+                    except Exception as _act_e:
+                        logging.debug(
+                            f"[FAST-REQUEST] activation edit failed "
+                            f"(non-fatal): {_act_e}")
+                        return
+                    logging.info(
+                        f"[FAST-REQUEST] ✅ mention+ID activated "
+                        f"chat_id={chat_id} msg_id={msg_id} "
+                        f"alert_id={_alert_id} (no username — mention live "
+                        f"for all subscribers)")
+                    if _entry_a is not None:
+                        _entry_a['text'] = _new_a
+                except Exception as _af_e:
+                    logging.debug(
+                        f"[FAST-REQUEST] activation error (non-fatal): {_af_e}")
+                return
             # (2) نص التنبيه من السجل + الترقية (سطر المرسل + التلميح)
             _reg = getattr(self, '_request_alerts', None)
             _entry = None
@@ -9283,6 +9525,7 @@ class Monitor:
                             f'<a href="https://t.me/{_uname}">(@{_uname})</a>')
             _new_text = _old_text.replace(_old_mention, _new_mention)
             for _hint_old in (
+                    _REQ_HINT_ACTIVATING,
                     "للتواصل: اضغط اسم المُرسِل في رسالة التوجيل أسفل هذا التنبيه",
                     "للتواصل: المُرسِل بلا username — اسمه أعلاه "
                     "قد لا يستجيب للضغط (قيد تلغرام على رسائل البوتات)"):
@@ -11004,12 +11247,17 @@ class Monitor:
             return str(text or '')
 
     def _ignore_kind_from_text(self, text: str):
-        """'sender' | 'message' | None من نص أمر التجاهل (متسامح
-        إملائيًا: تجاهل المرسل / تجاهل الرسالة/الرساله)."""
+        """'sender' | 'message' | 'group' | None من نص أمر التجاهل (متسامح
+        إملائيًا: تجاهل المرسل / تجاهل الرسالة/الرساله / تجاهل المجموعة)."""
         try:
             _n = self._ignore_normalize(text)
             if 'تجاهل المرسل' in _n:
                 return 'sender'
+            # [IGNORE-GROUP v4.4.18] «اقول تجاهل المجموعة يتم تجاهل بشكل
+            # دائم» — ة→ه بعد التطبيع؛ المجموع/المجموعه كلاهما يُقبل.
+            if ('تجاهل المجموعه' in _n or 'تجاهل المجموع' in _n
+                    or 'تجاهل القروب' in _n or 'تجاهل المجموعة' in _n):
+                return 'group'
             if 'تجاهل الرساله' in _n or 'تجاهل الرسال' in _n:
                 return 'message'
         except Exception:
@@ -11125,7 +11373,7 @@ class Monitor:
                 return None
             meta = {'chat_id': 0, 'msg_id': 0, 'sender_id': 0,
                     'sender_username': '', 'sender_name': '',
-                    'raw_text': ''}
+                    'chat_title': '', 'raw_text': ''}
             # (1) زر 🔴 تواصل — cbc:<chat_id>:<sender_id>:<source_phone>
             try:
                 for _row in (_m.buttons or []):
@@ -11152,7 +11400,7 @@ class Monitor:
                         meta['sender_id'] = _fsid
             except Exception:
                 pass
-            # (3) النص الخام: اسم المرسل + username + نص الطلب
+            # (3) النص الخام: اسم المرسل + username + نص الطلب + المجموعة
             _raw = getattr(_m, 'raw_text', '') or ''
             if _raw:
                 try:
@@ -11166,6 +11414,13 @@ class Monitor:
                                 r'\s*\(@[A-Za-z0-9_]+\)', '', _nline)
                         if not meta['sender_name']:
                             meta['sender_name'] = _nline[:60]
+                except Exception:
+                    pass
+                # [IGNORE-GROUP v4.4.18] عنوان المجموعة من سطر «المجموعة:»
+                try:
+                    _gm = re.search(r'المجموعة:?\s*([^\n]+)', _raw)
+                    if _gm:
+                        meta['chat_title'] = _gm.group(1).strip()[:60]
                 except Exception:
                     pass
                 meta['raw_text'] = self._alert_text_from_plain(_raw)
@@ -11196,7 +11451,34 @@ class Monitor:
             except Exception:
                 pass
             return
-        if kind == 'sender':
+        if kind == 'group':
+            # [IGNORE-GROUP v4.4.18] تجاهل المجموعة المصدر بشكل دائم —
+            # المفتاح chat_id الرقمي من ميتا التنبيه (زر cbc أو السجل).
+            _gid = int(meta.get('chat_id') or 0)
+            if not _gid:
+                try:
+                    await event.reply(
+                        "⚠️ لا يمكن تحديد المجموعة من هذا التنبيه "
+                        "— لا تجاهل ممكن.")
+                except Exception:
+                    pass
+                return
+            _gtt = str(meta.get('chat_title') or '')[:60]
+            _ok = await _ig.add_group(_gid, _gtt, by=_by)
+            try:
+                await event.reply(
+                    f"🔇 تم تجاهل المجموعة نهائيًا"
+                    + (f": {_gtt}" if _gtt else '')
+                    + f" (id={_gid})\n"
+                    f"لن تصل أي طلبات منها مستقبلًا حتى لو بدت حقيقية."
+                    + ("" if _ok else
+                       "\n⚠️ حُفظ مؤقتًا (تعذّر الوصول للمخزن الدائم)"))
+            except Exception:
+                pass
+            logging.info(
+                f"[IGNORE] group ignored chat_id={_gid} by={_by} "
+                f"alert_id={alert_id} stored={_ok}")
+        elif kind == 'sender':
             _sid = int(meta.get('sender_id') or 0)
             if _sid <= 0:
                 try:
@@ -11282,6 +11564,7 @@ class Monitor:
                         "✅ وصل التنبيه. أرسل الآن:\n"
                         "• تجاهل المرسل — لتجاهل كل طلباته مستقبلًا\n"
                         "• تجاهل الرسالة — لتجاهل هذا النص مستقبلًا\n"
+                        "• تجاهل المجموعة — لتجاهل كل رسائل هذه المجموعة\n"
                         "(أو رد على التوجيه بالأمر نفسه)")
                 except Exception:
                     pass
@@ -11322,7 +11605,7 @@ class Monitor:
             try:
                 await event.reply(
                     "⚠️ وجّه تنبيه الطلب من القناة إليّ أولًا، ثم أرسل:\n"
-                    "• تجاهل المرسل\n• تجاهل الرسالة")
+                    "• تجاهل المرسل\n• تجاهل الرسالة\n• تجاهل المجموعة")
             except Exception:
                 pass
             return True
@@ -11425,11 +11708,12 @@ class Monitor:
                 _ig = getattr(self, 'ignore_store', None)
                 if _ig is None:
                     await reply("⚠️ نظام التجاهل غير مهيأ.")
-                elif len(parts) < 3 or parts[1] not in ("sender", "msg"):
+                elif len(parts) < 3 or parts[1] not in ("sender", "msg", "group"):
                     await reply(
                         "ℹ️ الاستخدام:\n"
                         "/ignore_remove sender <user_id>\n"
-                        "/ignore_remove msg <بادئة البصمة من /ignore_list>")
+                        "/ignore_remove msg <بادئة البصمة من /ignore_list>\n"
+                        "/ignore_remove group <chat_id>")
                 elif parts[1] == "sender":
                     if not parts[2].isdigit():
                         await reply("ℹ️ user_id يجب أن يكون رقمًا.")
@@ -11437,6 +11721,15 @@ class Monitor:
                         _ok = await _ig.remove_sender(int(parts[2]))
                         await reply(
                             ("✅ أُلغي تجاهل المرسل " if _ok
+                             else "⚠️ أُلغي محليًا ") + parts[2])
+                elif parts[1] == "group":
+                    # [IGNORE-GROUP v4.4.18] chat_id سالب عادةً (-100…)
+                    if not parts[2].lstrip('-').isdigit():
+                        await reply("ℹ️ chat_id يجب أن يكون رقمًا (مع -).")
+                    else:
+                        _ok = await _ig.remove_group(int(parts[2]))
+                        await reply(
+                            ("✅ أُلغي تجاهل المجموعة " if _ok
                              else "⚠️ أُلغي محليًا ") + parts[2])
                 else:
                     _n = await _ig.remove_message(parts[2])
@@ -15159,12 +15452,16 @@ class Monitor:
         # Supabase snapshot (an ephemeral-disk restart wipes the local SQLite,
         # so this is what keeps fast-deleted messages rescuable across
         # Render free-tier restarts WITHOUT buying a persistent disk).
-        try:
-            restored_n = await self._restore_journal_from_supabase()
-            if restored_n:
-                logging.info(f"📓 [JOURNAL-SNAPSHOT] pre-recovery: restored {restored_n} row(s) from Supabase")
-        except Exception as _restore_e:
-            logging.warning(f"📓 [JOURNAL-SNAPSHOT] restore at startup failed: {_restore_e}")
+        # [SUPA-MSG-KILL v4.4.18] لا استرجاع رسائل من Supabase (المرآة
+        # متوقفة بطلب المُشغّل — الجدول فُرِّغ ولا صفوف جديدة أصلًا).
+        if getattr(getattr(self, 'config', None),
+                   'journal_snapshot_enabled', False):
+            try:
+                restored_n = await self._restore_journal_from_supabase()
+                if restored_n:
+                    logging.info(f"📓 [JOURNAL-SNAPSHOT] pre-recovery: restored {restored_n} row(s) from Supabase")
+            except Exception as _restore_e:
+                logging.warning(f"📓 [JOURNAL-SNAPSHOT] restore at startup failed: {_restore_e}")
         if self.config.journal_recovery_enabled:
             if not hasattr(self, '_journal_recovery_task') or self._journal_recovery_task is None or self._journal_recovery_task.done():
                 self._journal_recovery_task = asyncio.create_task(self._journal_recovery())
@@ -15173,9 +15470,19 @@ class Monitor:
         # === [PERSISTENCE Option C] JOURNAL SNAPSHOT LOOP (30s) ===
         # Mirrors at-risk journal rows to Supabase message_journal_snapshot.
         # Survives ephemeral-disk restart; supervisor will resurrect on death.
-        if not hasattr(self, '_journal_snapshot_task') or self._journal_snapshot_task is None or self._journal_snapshot_task.done():
-            self._journal_snapshot_task = asyncio.create_task(self._journal_snapshot_loop())
-            logging.info("📓 Journal Snapshot started (30s cycle — Supabase durability mirror)")
+        # [SUPA-MSG-KILL v4.4.18] متوقفة افتراضيًا — طلب المُشغّل (2026-11-20):
+        # «ما ابي سوبابس يضل يحتفظ بالرسائل ما لها اي داعي». لا تُطلق إلا
+        # لو ضُبط JOURNAL_SNAPSHOT_ENABLED=true صراحةً. الجورنال المحلي
+        # (SQLite محلي) يبقى — لا علاقة له بـSupabase.
+        if getattr(getattr(self, 'config', None),
+                   'journal_snapshot_enabled', False):
+            if not hasattr(self, '_journal_snapshot_task') or self._journal_snapshot_task is None or self._journal_snapshot_task.done():
+                self._journal_snapshot_task = asyncio.create_task(self._journal_snapshot_loop())
+                logging.info("📓 Journal Snapshot started (30s cycle — Supabase durability mirror)")
+        else:
+            logging.info(
+                "📓 Journal Snapshot OFF (operator order 2026-11-20 — "
+                "no Supabase message retention; local SQLite journal unaffected)")
 
         # === [N07] AI DRAINER (30s) — processes ai_pending backlog ===
         # Self-disables when AI_DRAIN_ENABLED != 'true' (default), so it's
@@ -17616,8 +17923,22 @@ async def api_deploy_check_handler(request):
         "durable": bool(_igs and _igs._http),
         "ignored_senders": len(getattr(_igs, 'senders', {}) or {}),
         "ignored_messages": len(getattr(_igs, 'msg_sigs', {}) or {}),
+        "ignored_groups": len(getattr(_igs, 'groups', {}) or {}),
         "mention_bridge": bool(getattr(
             getattr(monitor, 'config', None), 'mention_bridge_enabled', False)),
+    }
+    # 7.7 [ID-LINK v4.4.18] مسار تواصل الطلبات — يوزر/بلا يوزر
+    _m_cfg = getattr(monitor, 'config', None)
+    report["request_contact_flow"] = {
+        "seed_race_forward": bool(getattr(_m_cfg, 'seed_race_enabled', False)),
+        "id_link_line": True,
+        "mention_relay": bool(getattr(_m_cfg, 'mention_bridge_enabled', False)),
+    }
+    # 7.8 [SUPA-MSG-KILL] احتفاظ Supabase بالرسائل — يجب أن يكون متوقفًا
+    report["supabase_message_retention"] = {
+        "snapshot_enabled": bool(getattr(
+            _m_cfg, 'journal_snapshot_enabled', False)),
+        "note": "OFF by operator order 2026-11-20",
     }
     if not (_igs and _igs.enabled):
         report["issues"].append(
@@ -18073,6 +18394,18 @@ async def main():
     # === [REQUEST-FILTER v2] startup snapshot — version + mode + kill switch + guards ===
     # المُشغّل يستطيع grep على هذه الأسطر للتحقق من إعدادات الفلتر الجديد.
     logging.info(f"REQUEST_FILTER_VERSION={REQUEST_FILTER_VERSION}")
+    # [v4.4.18] لقطة أعلام مسار التواصل/التجاهل/الاحتفاظ — أوامر المُشغّل
+    # 2026-11-20 (يوزر فوري بلا توجيه / بلا يوزر: بذرة→تعديل التنبيه /
+    # تجاهل المجموعة / لا احتفاظ Supabase / سحب الروابط موقوف نهائيًا).
+    logging.info(
+        "CONTACT_FLOW="
+        f"seed_race={'on' if getattr(config,'seed_race_enabled',False) else 'off'}"
+        f" id_link=on"
+        f" mention_relay={'on' if getattr(config,'mention_bridge_enabled',False) else 'off'}"
+        f" ignore_group=on"
+        f" supa_msg_retention={'on' if getattr(config,'journal_snapshot_enabled',False) else 'off'}"
+        f" link_task={'on' if getattr(config,'link_task_enabled',False) else 'off'}"
+    )
     logging.info(f"REQUEST_FILTER_MODE={REQUEST_FILTER_MODE}")
     _rf_en = getattr(config, 'request_filter_enabled', False)
     logging.info(f"REQUEST_FILTER_ENABLED={'true' if _rf_en else 'false'}")
