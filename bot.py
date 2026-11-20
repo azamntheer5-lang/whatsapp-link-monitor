@@ -9151,17 +9151,30 @@ class Monitor:
         else:
             sender_line = f'👤 <b>المرسل:</b> {safe_sender}'
 
-        # [ID-LINK v4.4.18] سطر الايدي — رابط مخفي على رقم الايدي نفسه
-        # (tg://user?id): مجرد الضغط على الايدي يدخلك خاص المرسل — يعمل
-        # بلا username إطلاقًا (المفتاح رقمي). يُرسل فورًا مع التنبيه
-        # ويُنشَّط بالتعديل بعد الإرسال (الكيان المزروع عبر البذرة يحوّله
-        # ذكرًا حيًا لدى كل المشتركين).
+        # [ID-LINK v4.4.18 → ID-DIALER-FIX v4.4.25] سطر الايدي — رابط
+        # مخفي على رقم الايدي نفسه. بلاغ المُشغّل 2026-11-20: «اضغط على
+        # الايدي يدخلني تطبيق الاتصال» — السبب الجذري: رابط tg://user?id
+        # ميت (الكيان غير مزروع لدى البوت — يحدث حتمًا لمرسل معه username
+        # لأن البذرة لا تُطلق له أصلًا) يُسلَّم نصًا خامًا فيُعرض الرقم
+        # في أندرويد كرقم هاتف → يفتح الاتصال. الإصلاح المزدوج:
+        #   (1) الأرقام داخل <code> دائمًا — النص monospace لا يُكشف كرقم
+        #       هاتف أبدًا (يقتل مسار الاتصال حتى لو مات الرابط).
+        #   (2) مرسل معه username → الرابط https://t.me/<username> بدل
+        #       tg://user?id: يعمل فورًا لدى كل المشتركين بلا زرع كيان.
+        #   (3) بلا username → يبقى tg://user?id (تنشّطه البذرة/الإنقاذ
+        #       بعد الإرسال) — وأثناء موته لا يفتح الاتصال أبدًا.
         id_line = ''
         try:
             _sid_il = int(sender_id or 0)
             if _sid_il > 0:
-                id_line = (f'\n🆔 <b>الايدي:</b> '
-                           f'<a href="tg://user?id={_sid_il}">{_sid_il}</a>')
+                if _uname_clean:
+                    id_line = (f'\n🆔 <b>الايدي:</b> '
+                               f'<a href="https://t.me/{_uname_clean}">'
+                               f'<code>{_sid_il}</code></a>')
+                else:
+                    id_line = (f'\n🆔 <b>الايدي:</b> '
+                               f'<a href="tg://user?id={_sid_il}">'
+                               f'<code>{_sid_il}</code></a>')
         except Exception:
             id_line = ''
 
@@ -10318,7 +10331,7 @@ class Monitor:
                  f'👤 <b>المرسل:</b> '
                  f'<a href="tg://user?id={_sid}">{_safe_sender}</a>'
                  f'\n🆔 <b>الايدي:</b> '
-                 f'<a href="tg://user?id={_sid}">{_sid}</a>\n'
+                 f'<a href="tg://user?id={_sid}"><code>{_sid}</code></a>\n'
                  f"👥 <b>المجموعة:</b> {_safe_chat}\n"
                  f"🕒 <b>الالتقاط:</b> "
                  f"{datetime.fromtimestamp(entry['ts']).strftime('%Y-%m-%d %H:%M')}"
