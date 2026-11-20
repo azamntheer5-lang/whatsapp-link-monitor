@@ -9759,9 +9759,19 @@ class Monitor:
                     return False
             except Exception:
                 pass
-        _target = str(entry.get('target') or '')
-        if not _target:
+        # [LATE-PUBLISH-TARGET-FIX v4.4.21] العازلة تخزن الهدف نصًا، وتمرير
+        # السلسلة الرقمية السالبة لـTelethon يجعل parse_phone يجرّد '-' بالـregex
+        # ويفسّرها رقم هاتف — والبوتات لا تحل الهواتف (ValueError: "Cannot
+        # get entity by phone number as a bot") → فشل كل عمليات النشر
+        # المتأخر (مثال حي: جولة #23 — 3 مرشحين، 3 أخطاء). المسار الرئيسي
+        # يمرر int دائمًا — نحوّل للرقم نفسه هنا (يوزرنيم نصي يبقى نصًا).
+        _target_raw = str(entry.get('target') or '')
+        if not _target_raw:
             return False
+        try:
+            _target = int(_target_raw)
+        except ValueError:
+            _target = _target_raw
         # بناء التنبيه — نفس البنية الرسمية (PREMIUM-FORMAT)
         _sid = int(entry.get('sender_id') or 0)
         _safe_sender = html_module.escape(
