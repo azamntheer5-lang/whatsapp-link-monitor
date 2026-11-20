@@ -1114,6 +1114,40 @@ class Config:
                 "REQUEST_FILTER_DEDUP_TTL_S", "900"))
         except ValueError:
             self.request_filter_dedup_ttl_s = 900
+        # === [AUDIT-ROUNDS v4.4.19] جولات التدقيق التلقائية — أمر المُشغّل ===
+        # (2026-11-20): «ابيك تسوي جولات تلقائيه وتتاكد هل هناك طلبات
+        # حقيقية تم تجاوزها وهل هناك طلبات حقيقية تم حذفها ولم يستطع
+        # سحبها وعالج المشكله». دورة تدقيق دورية: إحصاءات السحب/الحذف،
+        # كشف الطلبات الفائتة (توقيع الطلب القوي)، نشرها متأخرًا بسقف
+        # مضبوط، وتقرير هضمي للمالك. الذاكرة فقط — لا تخزين رسائل في
+        # Supabase إطلاقًا (أمر المُشغّل: لا احتفاظ بالرسائل).
+        self.audit_rounds_enabled = os.getenv(
+            "AUDIT_ROUNDS_ENABLED", "true").strip().lower() in (
+                "1", "true", "yes", "on")
+        try:
+            self.audit_round_interval_s = int(os.getenv(
+                "AUDIT_ROUND_INTERVAL_S", "900"))
+        except ValueError:
+            self.audit_round_interval_s = 900
+        self.audit_round_interval_s = max(
+            300, min(86400, self.audit_round_interval_s))
+        self.audit_late_publish_enabled = os.getenv(
+            "AUDIT_LATE_PUBLISH_ENABLED", "true").strip().lower() in (
+                "1", "true", "yes", "on")
+        try:
+            self.audit_late_publish_max_per_round = int(os.getenv(
+                "AUDIT_LATE_PUBLISH_MAX_PER_ROUND", "2"))
+        except ValueError:
+            self.audit_late_publish_max_per_round = 2
+        self.audit_late_publish_max_per_round = max(
+            0, min(5, self.audit_late_publish_max_per_round))
+        try:
+            self.audit_digest_heartbeat_rounds = int(os.getenv(
+                "AUDIT_DIGEST_HEARTBEAT_ROUNDS", "16"))
+        except ValueError:
+            self.audit_digest_heartbeat_rounds = 16
+        self.audit_digest_heartbeat_rounds = max(
+            1, self.audit_digest_heartbeat_rounds)
         self.owner_id = None
         oid = os.getenv("OWNER_ID", "")
         if oid:
@@ -6088,6 +6122,10 @@ class Monitor:
         # If the operator wants to enable the drainer, they restart the
         # process — same pattern as every other env-gated worker.
         ai_drain_on = os.getenv('AI_DRAIN_ENABLED', 'false').lower() in ('true', '1', 'yes')
+        # [AUDIT-ROUNDS v4.4.19] قرار مفعّلية الجولات يُقرأ مرة واحدة
+        # (نفس نمط ai_drain_on — يمنع عاصفة إعادة تشغيل لو المعطّل).
+        audit_rounds_on = bool(getattr(getattr(self, 'config', None),
+                                       'audit_rounds_enabled', True))
         while self._running:
             try:
                 # 1. PollingScheduler — lock-protected to prevent the 30s
@@ -6198,6 +6236,17 @@ class Monitor:
                     self._quiet_source_task = asyncio.create_task(
                         self._quiet_source_watch_loop())
                     logging.warning("[SUPERVISOR] restarted quiet_source_watch")
+                # 13. [AUDIT-ROUNDS v4.4.19] جولات التدقيق التلقائية
+                # (كل 15 دقيقة افتراضيًا): ربط الحذف بالسحب، كشف الطلبات
+                # الفائتة، النشر المتأخر بسقف، وتقرير المالك الهضمي.
+                # لو ماتت: لا تدقيق ذاتي ولا تقارير — يشعلها المشرف.
+                # (المتغير مخزّن عند بدء المشرف — نفس نمط ai_drain_on.)
+                if audit_rounds_on and self._running and (
+                        getattr(self, '_audit_round_task', None) is None
+                        or self._audit_round_task.done()):
+                    self._audit_round_task = asyncio.create_task(
+                        self._audit_round_loop())
+                    logging.warning("[SUPERVISOR] restarted audit_rounds")
                 # 12. [REQAUDIT-3] Per-account user_client loops. Previously
                 # these were fire-and-forget in self._user_tasks and NOT
                 # supervised — a terminal `return` on not_authorized (now
@@ -8116,6 +8165,30 @@ class Monitor:
                 f"model={analysis.ai_model or '-'} latency={analysis.ai_latency_ms}ms "
                 f"chat_id={chat_id} msg_id={msg_id}"
             )
+            # [AUDIT-ROUNDS v4.4.19] سجّل الرفض في عازلة التدقيق (ذاكرة
+            # فقط — لا Supabase) لتفحصه جولة التدقيق الدورية.
+            try:
+                _aud_fn = getattr(self, '_audit_record_reject', None)
+                if callable(_aud_fn):
+                    _aud_snd = getattr(event, 'sender', None)
+                    _aud_snd_name = ''
+                    try:
+                        if _aud_snd is not None:
+                            _aud_snd_name = ' '.join(
+                                str(x) for x in (
+                                    getattr(_aud_snd, 'first_name', ''),
+                                    getattr(_aud_snd, 'last_name', '')) if x)
+                            if not _aud_snd_name:
+                                _aud_snd_name = str(
+                                    getattr(_aud_snd, 'title', '') or '')
+                    except Exception:
+                        _aud_snd_name = ''
+                    _aud_fn(raw_text, chat_id, msg_id,
+                            int(getattr(event, 'sender_id', 0) or 0),
+                            analysis, str(target or ''), source_phone,
+                            _chat_title_for_ai, _aud_snd_name[:80])
+            except Exception:
+                pass
             # [SEED-RACE] رُفض → نظّف نسخة البذرة من خاص البوت (لو وُجدت)
             getattr(self, '_seed_race_cleanup',
                     lambda *a, **k: None)(chat_id, msg_id, 'filter-reject')
@@ -8225,10 +8298,23 @@ class Monitor:
                 if _min_ent is not None else None
         except Exception:
             _min_un = None
-        # [MENTION-BRIDGE-KILL] البذرة متوقفة افتراضيًا — لا تُنشأ أصلًا
+        # [MENTION-BRIDGE-KILL] البذرة المتوقفة افتراضيًا — لا تُنشأ أصلًا
+        # [SEED-POST-ACCEPT v4.4.19] إعادة هيكلة جذرية لموضع البذرة:
+        # شكوى المُشغّل (2026-11-20): «البوت قاعد يعيد توجيه رسائل دش
+        # الى خاص البوت ما لها داعي» — بذرة ما قبل الفلترة كانت توجّل
+        # أي رسالة فيها إشارة ضعيفة واحدة ('لي'/'حد'/'شخص') قبل أن
+        # ترفضها الفلترة، فيغرق خاص البوت بنسخ الدردشة. في وضع المحرك
+        # القواعدي (الحتمي — قرار خلال ~1-5ms) البذرة تُطلق هنا فقط:
+        # بعد قرار القبول مباشرة (نفس مستوى سرعة السباق) وقبل حلّ
+        # المرسل/الإرسال → لا يصل خاص البوت إلا ما اجتاز الفلترة فعليًا
+        # (دقة 100%، صفر توجيل للدردشة). بذرة ما قبل الفلترة تبقى
+        # لمستقبل وضع الـAI فقط (SEED_RACE_ENABLED + بوابة الحكم المحلي).
+        _seed_cfg_19 = bool(getattr(getattr(self, 'config', None),
+                                    'seed_race_enabled', False)) \
+            or bool(getattr(getattr(self, 'config', None),
+                            'mention_bridge_enabled', False))
         if (sender_id > 0 and not _min_un
-                and getattr(getattr(self, 'config', None),
-                            'mention_bridge_enabled', False)):
+                and _seed_cfg_19):
             _seed_fn_p = getattr(self, '_mention_bridge_seed', None)
             if callable(_seed_fn_p):
                 try:
@@ -8487,12 +8573,11 @@ class Monitor:
                 _bridge = _try_fn(chat_id, msg_id)
         except Exception:
             _bridge = None
-        if _bridge is None and _seed_task is not None:
-            try:
-                _bridge = await asyncio.wait_for(
-                    asyncio.shield(_seed_task), timeout=1.5)
-            except Exception:
-                _bridge = None
+        # [SPEED-v4.4.19] لا انتظار حاجب قبل الإرسال إطلاقًا — كان هذا
+        # الموضع ينتظر اكتمال البذرة حتى 1.5s قبل الإرسال. الآن: الجمع
+        # غير الحاجب أعلاه (try_collect) يكفي؛ البذرة تُجمع بعد الإرسال
+        # (≤2.5s) ويُنشّط الذكر/رابط الايدي بالتعديل — التنبيه يصل بأقصى
+        # سرعة مستقلة تمامًا عن زمن البذرة (طلب المُشغّل: السرعة بالمللي).
         # [FAST-REQUEST] استخراج username من كيان البذرة انتقل لما بعد
         # الإرسال (_seed_username_upgrade_edit): كان يكلف 300-700ms على
         # المسار الحرج؛ التنبيه يصل الآن بأقصى سرعة والزر يُضاف بتعديل
@@ -8658,6 +8743,19 @@ class Monitor:
                 f"dm={dm_mode} "
                 f"elapsed={int((time.time() - _req_t0) * 1000)}ms"
             )
+            # [AUDIT-ROUNDS v4.4.19] سجّل القبول + سرعة المسار (ذاكرة فقط)
+            # — تُغذي إحصاءات جولة التدقيق (متوسط سرعة السحب + سباق الحذف).
+            try:
+                _aud_a = getattr(self, '_audit_record_accept', None)
+                if callable(_aud_a):
+                    _aud_a(chat_id, msg_id, int(sender_id or 0),
+                           int((time.time() - _req_t0) * 1000),
+                           getattr(sent_alert, 'id', 0) or 0,
+                           str(target or ''), _uname_clean,
+                           str(sender_display or '')[:80],
+                           str(chat_title or '')[:120], source_phone)
+            except Exception:
+                pass
             # [REQ-DELETED-MARK-v4.4.6 + MENTION-BRIDGE-v4.4.7] سجّل
             # التنبيه للتعليم عند حذف الأصل (رابط التنبيه يموت عند الحذف
             # — نحتاج معرّف رسالة التنبيه كي نُعدّلها لاحقًا بعلامة ⚠️)
@@ -8688,6 +8786,16 @@ class Monitor:
                     _col_fn = getattr(self, '_seed_race_collect', None)
                     if callable(_col_fn):
                         _bridge = await _col_fn(chat_id, msg_id, timeout=2.5)
+                except Exception:
+                    _bridge = None
+            # [SEED-POST-ACCEPT v4.4.19] اجمع بذرة ما بعد القبول (وضع
+            # المحرك القواعدي) — بعد الإرسال فقط (≤2.5s): التنبيه وصل
+            # بالفعل بأقصى سرعة؛ الجمع هنا يغذي تنشيط الذكر/رابط الايدي
+            # بالتعديل (المسار المُجرّب إنتاجيًا).
+            if _bridge is None and _seed_task is not None:
+                try:
+                    _bridge = await asyncio.wait_for(
+                        asyncio.shield(_seed_task), timeout=2.5)
                 except Exception:
                     _bridge = None
             if isinstance(_bridge, dict) and _uname_clean:
@@ -8774,6 +8882,18 @@ class Monitor:
                     buttons=dm_buttons,
                 )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
+                # [AUDIT-ROUNDS v4.4.19] سجّل قبول مسار FloodWait أيضًا
+                try:
+                    _aud_a2 = getattr(self, '_audit_record_accept', None)
+                    if callable(_aud_a2):
+                        _aud_a2(chat_id, msg_id, int(sender_id or 0),
+                                int((time.time() - _req_t0) * 1000),
+                                getattr(sent_alert, 'id', 0) or 0,
+                                str(target or ''), _uname_clean,
+                                str(sender_display or '')[:80],
+                                str(chat_title or '')[:120], source_phone)
+                except Exception:
+                    pass
                 # [REQ-DELETED-MARK + MENTION-BRIDGE] نفس الإجراء بعد إعادة المحاولة
                 _post_send_fn2 = getattr(self, '_relay_and_register_request_alert', None)
                 if callable(_post_send_fn2):
@@ -9014,6 +9134,16 @@ class Monitor:
             if not getattr(getattr(self, 'config', None),
                            'seed_race_enabled', False):
                 return False
+            # [SEED-POST-ACCEPT v4.4.19] وضع المحرك القواعدي (الحتمي،
+            # قرار ~1-5ms): لا بذرة ما قبل الفلترة إطلاقًا — تُطلق بعد
+            # قرار القبول مباشرة (نقطة إنشاء _seed_task في مسار القبول).
+            # هذا هو الإصلاح الجذري لشكوى المُشغّل (2026-11-20): «البوت
+            # قاعد يعيد توجيه رسائل دش الى خاص البوت ما لها داعي» —
+            # أمثلة الإنتاج الست (عروض/دردشة طلابية) كانت تُبذر جميعًا
+            # بسبب إشارة ضعيفة واحدة ثم تُحذف — الآن لا تُبذر أصلًا.
+            _clf_sr = getattr(self, 'request_classifier', None)
+            if str(getattr(_clf_sr, 'version', '') or '').lower().startswith('rule'):
+                return False  # القواعدي: البذرة بعد القبول فقط (دقة 100%)
             _key = (int(chat_id), int(msg_id))
             reg = getattr(self, '_seed_race_reg', None)
             if not isinstance(reg, dict):
@@ -9066,6 +9196,17 @@ class Monitor:
                 _reqish = False
             if not _reqish:
                 return False
+            # (6b) [AUDIT-v4.4.19] بوابة الحكم المحلي السريع (وضع الـAI
+            # فقط — القواعدي يُرجع False أعلاه قبل الوصول هنا): نفس
+            # بوابات الفلتر المحلية (relay/عدد الكلمات/إشارات/حرس الدردشة)
+            # — الدردشة الصريحة لا تُبذر أصلًا حتى في وضع الـAI.
+            try:
+                from request_filter import quick_local_verdict as _qlv_fn
+                _qok, _qwhy = _qlv_fn(_txt)
+                if not _qok:
+                    return False
+            except Exception:
+                pass  # فشل البوابة لا يمنع البذرة (غير قاتل)
             # (7) سقف معدل البذور (يحمي حسابات الالتقاط من فيضان التوجيه)
             _rl = getattr(self, '_seed_race_rate', None)
             if _rl is None:
@@ -9244,6 +9385,554 @@ class Monitor:
         except Exception as _sd_e:
             logging.debug(f"[SEED-RACE] seed copy delete failed (non-fatal): {_sd_e}")
             return False
+
+    # ==================================================================
+    # [AUDIT-ROUNDS v4.4.19] جولات التدقيق التلقائية — أمر المُشغّل 2026-11-20
+    # ==================================================================
+    # «ابيك تسوي جولات تلقائيه وتتاكد هل هناك طلبات حقيقية تم تجاوزها
+    #  وهل هناك طلبات حقيقية تم حذفها ولم يستطع سحبها وعالج المشكله»
+    #
+    # البنية (ذاكرة فقط — لا تخزين رسائل في Supabase إطلاقًا):
+    #   _audit_rejects  : عازلة الرفض (bounded 3000، TTL ساعة) — كل ما
+    #                     رفضه الفلتر + الإشارات + التوقيع القوي.
+    #   _audit_accepts  : عازلة القبول (bounded 500) — السرعة/الحذف.
+    #   _audit_deletes  : أحداث الحذف (bounded 3000) — تُربط بالجولة.
+    #   الجولة (كل 15 دقيقة افتراضيًا):
+    #     1) ربط الحذف: حُذف بعد تنبيهنا = فزنا بالسباق (المحتوى بالقناة)
+    #        وحُذف بعد رفضٍ قوي = فائت محتمل (بوتات الحماية تحذف الطلبات
+    #        الحقيقية غالبًا — مؤشر خطر إضافي).
+    #     2) المرشحون: توقيع الطلب القوي (طالب/شخص + فعل تنفيذ + خدمة)
+    #        بلا إشارات إعلانية — المرفوضون الوحيدون الذين يُنشرون متأخرًا.
+    #     3) النشر المتأخر: سقف مضبوط (2/جولة، 6/ساعة) بنفس تنسيق التنبيه
+    #        الرسمي + وسم 🔍 + تسجيل في سجل التجاهل بالرد (تكافؤ كامل).
+    #     4) تقرير هضمي للمالك (OWNER_ID): أرقام + أبرز المرشحين، ونبضة
+    #        سكون دورية (كل 16 جولة = 4 ساعات افتراضيًا).
+    #   /api/audit : لقطة JSON كاملة (لجولات التحقق الخارجية cron).
+    # غير قاتل بالكامل — أي فشل يُسجَّل ولا يوقف مسار الطلبات أبدًا.
+
+    _AUDIT_REJECTS_MAX = 3000
+    _AUDIT_ACCEPTS_MAX = 500
+    _AUDIT_DELETES_MAX = 3000
+    _AUDIT_TTL_S = 3600.0
+    _AUDIT_LATE_HOURLY_MAX = 6
+
+    def _audit_lazy_init(self) -> dict:
+        """تهيئة كسولة آمنة (نمط الكود) — تُعيد حالة التدقيق."""
+        st = getattr(self, '_audit_state', None)
+        if isinstance(st, dict):
+            return st
+        st = {
+            'rejects': [],
+            'accepts': [],
+            'deletes': [],
+            'round_no': 0,
+            'last_round_ts': 0.0,
+            'last_round_at': '',
+            'last_round_stats': {},
+            'digest_last_sent': 0.0,
+            'heartbeat_last_sent': 0.0,
+            'late_hourly': [],       # أوقات النشر المتأخر (سقف/ساعة)
+            'late_published_log': [],  # آخر 10 عمليات نشر متأخر
+            'totals': {
+                'accepts': 0, 'rejects': 0, 'deleted_after_alert': 0,
+                'late_published': 0, 'potential_misses': 0,
+                'deleted_potential_misses': 0, 'digests_sent': 0,
+                'reject_reasons': {},
+            },
+            'latency_recent': [],    # آخر 100 قياس سرعة (ms)
+            'digest_errors': 0,
+            'late_errors': 0,
+        }
+        try:
+            self._audit_state = st
+        except Exception:
+            pass
+        return st
+
+    def _audit_record_reject(self, raw_text, chat_id, msg_id, sender_id,
+                             analysis, target, source_phone,
+                             chat_title='', sender_display='') -> None:
+        """سجّل رفض الفلتر في العازلة (تزامني، سريع، غير قاتل)."""
+        try:
+            st = self._audit_lazy_init()
+            now = time.time()
+            # التوقيع القوي يُحسب مستقلًا (analysis قد لا يحمل الإشارات
+            # للبوابات المبكرة مثل word_count — إعادة الحساب أرخص وأدق)
+            _sig_ar = None
+            try:
+                _sig_ar = extract_signals(str(raw_text or ''))
+            except Exception:
+                _sig_ar = None
+            _strong = False
+            _has_ad = False
+            if _sig_ar is not None:
+                _strong = (bool(_sig_ar.requester_signals)
+                           or bool(_sig_ar.person_signals)) \
+                    and bool(_sig_ar.execution_signals) \
+                    and bool(_sig_ar.service_signals)
+                _has_ad = bool(_sig_ar.ad_signals)
+            st['rejects'].append({
+                'ts': now,
+                'chat_id': int(chat_id or 0),
+                'msg_id': int(msg_id or 0),
+                'sender_id': int(sender_id or 0),
+                'text': str(raw_text or '')[:300],
+                'reason': str(getattr(analysis, 'reason', '') or '')[:64],
+                'path': str(getattr(analysis, 'decision_path', '') or '')[:40],
+                'conf': float(getattr(analysis, 'confidence', 0.0) or 0.0),
+                'strong': _strong,
+                'ad': _has_ad,
+                'target': str(target or ''),
+                'phone': str(source_phone or ''),
+                'chat_title': str(chat_title or '')[:120],
+                'sender_display': str(sender_display or '')[:80],
+                'deleted': False,
+                'audited': False,
+                'reported': False,
+                'published': False,
+            })
+            st['totals']['rejects'] += 1
+            _rsn = str(getattr(analysis, 'reason', '') or 'unknown')[:40]
+            st['totals']['reject_reasons'][_rsn] = \
+                st['totals']['reject_reasons'].get(_rsn, 0) + 1
+            # سقف صلب: احذف الأقدم (مثلث منتهي الصلاحية أولًا)
+            if len(st['rejects']) > self._AUDIT_REJECTS_MAX:
+                _cutoff = now - self._AUDIT_TTL_S
+                st['rejects'] = [e for e in st['rejects']
+                                 if e['ts'] >= _cutoff] \
+                    or st['rejects'][-self._AUDIT_REJECTS_MAX // 2:]
+                if len(st['rejects']) > self._AUDIT_REJECTS_MAX:
+                    st['rejects'] = st['rejects'][-self._AUDIT_REJECTS_MAX // 2:]
+        except Exception as _ar_e:
+            logging.debug(f"[AUDIT-ROUNDS] record_reject error: {_ar_e}")
+
+    def _audit_record_accept(self, chat_id, msg_id, sender_id, elapsed_ms,
+                             alert_id, target, uname, sender_display,
+                             chat_title, source_phone) -> None:
+        """سجّل قبولًا مُرسلًا + سرعة المسار (تزامني، غير قاتل)."""
+        try:
+            st = self._audit_lazy_init()
+            now = time.time()
+            st['accepts'].append({
+                'ts': now,
+                'chat_id': int(chat_id or 0),
+                'msg_id': int(msg_id or 0),
+                'sender_id': int(sender_id or 0),
+                'elapsed_ms': int(elapsed_ms or 0),
+                'alert_id': int(alert_id or 0),
+                'target': str(target or ''),
+                'uname': str(uname or ''),
+                'sender_display': str(sender_display or '')[:80],
+                'chat_title': str(chat_title or '')[:120],
+                'phone': str(source_phone or ''),
+                'deleted': False,
+            })
+            st['totals']['accepts'] += 1
+            st['latency_recent'].append(int(elapsed_ms or 0))
+            if len(st['latency_recent']) > 100:
+                st['latency_recent'] = st['latency_recent'][-100:]
+            if len(st['accepts']) > self._AUDIT_ACCEPTS_MAX:
+                st['accepts'] = st['accepts'][-self._AUDIT_ACCEPTS_MAX // 2:]
+        except Exception as _aa_e:
+            logging.debug(f"[AUDIT-ROUNDS] record_accept error: {_aa_e}")
+
+    def _audit_record_delete(self, chat_id, msg_id) -> None:
+        """سجّل حدث حذف رسالة (تزامني، غير قاتل). يُربط في الجولة."""
+        try:
+            if chat_id is None:
+                return
+            st = self._audit_lazy_init()
+            st['deletes'].append({
+                'ts': time.time(),
+                'chat_id': int(chat_id),
+                'msg_id': int(msg_id or 0),
+            })
+            if len(st['deletes']) > self._AUDIT_DELETES_MAX:
+                _cutoff = time.time() - self._AUDIT_TTL_S
+                st['deletes'] = [e for e in st['deletes']
+                                 if e['ts'] >= _cutoff] \
+                    or st['deletes'][-self._AUDIT_DELETES_MAX // 2:]
+                if len(st['deletes']) > self._AUDIT_DELETES_MAX:
+                    st['deletes'] = st['deletes'][-self._AUDIT_DELETES_MAX // 2:]
+        except Exception as _ad_e:
+            logging.debug(f"[AUDIT-ROUNDS] record_delete error: {_ad_e}")
+
+    def _audit_candidate_ok(self, entry) -> bool:
+        """هل يستحق الرفض معاملة «مرشح فائت»؟ (توقيع قوي + ليس مكررًا
+        وليس إعلانًا + سبب رفض قابل للمراجعة)"""
+        if not entry.get('strong') or entry.get('ad'):
+            return False
+        if entry.get('published') or entry.get('audited'):
+            return False
+        _bad_reasons = ('already_decided_db', 'semantic_duplicate',
+                        'relay_bot_repost_duplicate', 'empty',
+                        'empty_after_normalize', 'ignored_by_command',
+                        'ignored_group', 'sender_blocked', 'sender_repeat',
+                        'request_broadcast_channel')
+        if entry.get('reason') in _bad_reasons:
+            return False
+        return True
+
+    async def _audit_run_round(self) -> None:
+        """جولة تدقيق واحدة: ربط الحذف + المرشحون + النشر المتأخر +
+        التقرير الهضمي. غير قاتلة بالكامل."""
+        st = self._audit_lazy_init()
+        now = time.time()
+        st['round_no'] += 1
+        rnd = st['round_no']
+        last_ts = st['last_round_ts'] or (now - 60)
+
+        # (1) ربط أحداث الحذف الجديدة بالقبولات/الرفوضات (فهرس O(1))
+        _acc_idx = {(e['chat_id'], e['msg_id']): e
+                    for e in st['accepts'] if not e.get('deleted')}
+        _rej_idx = {(e['chat_id'], e['msg_id']): e
+                    for e in st['rejects'] if not e.get('deleted')}
+        _new_deletes = 0
+        for d in st['deletes']:
+            if d['ts'] <= last_ts:
+                continue
+            _new_deletes += 1
+            _k = (d['chat_id'], d['msg_id'])
+            _a = _acc_idx.get(_k)
+            if _a is not None:
+                _a['deleted'] = True
+                _a['deleted_after_s'] = max(0.0, d['ts'] - _a['ts'])
+                st['totals']['deleted_after_alert'] += 1
+                continue
+            _r = _rej_idx.get(_k)
+            if _r is not None:
+                _r['deleted'] = True
+                _r['deleted_after_s'] = max(0.0, d['ts'] - _r['ts'])
+
+        # (2) إحصاءات النافذة (منذ الجولة السابقة)
+        _w_accepts = [e for e in st['accepts'] if e['ts'] > last_ts]
+        _w_rejects = [e for e in st['rejects'] if e['ts'] > last_ts]
+        _won = [e for e in _w_accepts if e.get('deleted')]
+        _cands = [e for e in st['rejects']
+                  if self._audit_candidate_ok(e)]
+        _cands_deleted = [e for e in _cands if e.get('deleted')]
+        st['totals']['potential_misses'] = len(
+            [e for e in st['rejects']
+             if e.get('strong') and not e.get('ad')])
+        st['totals']['deleted_potential_misses'] = len(
+            [e for e in st['rejects']
+             if e.get('strong') and not e.get('ad') and e.get('deleted')])
+
+        # (3) النشر المتأخر — سقف مضبوط (المحذوفة أولًا: بوتات الحماية
+        # تحذف الطلبات الحقيقية — خطر الفوات أعلى)
+        published_now = []
+        late_on = bool(getattr(getattr(self, 'config', None),
+                               'audit_late_publish_enabled', True))
+        max_per_round = int(getattr(getattr(self, 'config', None),
+                                    'audit_late_publish_max_per_round', 2))
+        if late_on and max_per_round > 0 and _cands:
+            _hour_ago = now - 3600.0
+            st['late_hourly'] = [t for t in st['late_hourly']
+                                 if t > _hour_ago]
+            _budget = min(max_per_round,
+                          self._AUDIT_LATE_HOURLY_MAX
+                          - len(st['late_hourly']))
+            _cands_sorted = sorted(
+                _cands, key=lambda e: (not e.get('deleted'), e['ts']),
+                reverse=False)
+            _cands_sorted = sorted(
+                _cands_sorted, key=lambda e: e.get('deleted') is True,
+                reverse=True)
+            for entry in _cands_sorted:
+                if _budget <= 0:
+                    break
+                try:
+                    ok = await self._audit_late_publish(entry)
+                except Exception as _lp_e:
+                    logging.warning(
+                        f"[AUDIT-ROUNDS] late publish error: {_lp_e}")
+                    ok = False
+                entry['audited'] = True
+                if ok:
+                    entry['published'] = True
+                    published_now.append(entry)
+                    st['late_hourly'].append(time.time())
+                    _budget -= 1
+        # علّم كل المرشحين كمدققين (نُشروا أو لا — أُدرجوا في الهضم أو لا):
+        # يمنع إعادة معالجتهم وإعادة سردهم في كل جولة (سبام تقارير).
+        # إحصاءات potential_misses التراكمية تظل تحصيهم بمعزل عن هذا العلم.
+        for entry in _cands:
+            entry['audited'] = True
+
+        # (4) التقرير الهضمي للمالك
+        try:
+            await self._audit_digest(rnd, st, _w_accepts, _w_rejects,
+                                     _won, _cands, _cands_deleted,
+                                     published_now, _new_deletes)
+        except Exception as _dg_e:
+            st['digest_errors'] += 1
+            logging.warning(f"[AUDIT-ROUNDS] digest error: {_dg_e}")
+
+        # (5) لقطة الجولة (تقرأها /api/audit)
+        _lat = st['latency_recent']
+        st['last_round_stats'] = {
+            'round_no': rnd,
+            'at': datetime.now().isoformat(timespec='seconds'),
+            'window_s': int(now - last_ts),
+            'accepts': len(_w_accepts),
+            'rejects': len(_w_rejects),
+            'deletes_seen': _new_deletes,
+            'deleted_after_alert': len(_won),
+            'candidates_pending': len(_cands),
+            'candidates_deleted': len(_cands_deleted),
+            'late_published_now': len(published_now),
+            'avg_latency_ms': (int(sum(_lat) / len(_lat))
+                               if _lat else None),
+            'max_latency_ms': (max(_lat) if _lat else None),
+        }
+        st['last_round_ts'] = now
+        st['last_round_at'] = st['last_round_stats']['at']
+        logging.info(
+            f"[AUDIT-ROUNDS] ✅ round #{rnd}: "
+            f"accepts={len(_w_accepts)} rejects={len(_w_rejects)} "
+            f"deleted_after_alert={len(_won)} "
+            f"candidates={len(_cands)} (deleted={len(_cands_deleted)}) "
+            f"late_published={len(published_now)}"
+        )
+
+    async def _audit_late_publish(self, entry) -> bool:
+        """انشر طلبًا فائتًا (توقيع قوي) لقناة الطلبات بوسم جولة التدقيق.
+        نفس تنسيق التنبيه الرسمي + تسجيل سجل التجاهل بالرد (تكافؤ كامل).
+        يعيد True عند النجاح. غير قاتل."""
+        _cfg = getattr(self, 'config', None)
+        if not getattr(_cfg, 'request_filter_enabled', False):
+            return False
+        _bot_client = getattr(self, 'bot_client', None)
+        if not _bot_client or not _bot_client.is_connected():
+            return False
+        # احترم أوامر التجاهل (مرسل/رسالة/مجموعة) — تكافؤ كامل مع المسار
+        _ig = getattr(self, 'ignore_store', None)
+        if _ig is not None:
+            try:
+                _ghit, _ = _ig.is_group_ignored(entry['chat_id'])
+                if _ghit:
+                    return False
+                _ihit, _ = _ig.is_ignored(
+                    int(entry.get('sender_id') or 0), '', entry.get('text'))
+                if _ihit:
+                    return False
+            except Exception:
+                pass
+        _target = str(entry.get('target') or '')
+        if not _target:
+            return False
+        # بناء التنبيه — نفس البنية الرسمية (PREMIUM-FORMAT)
+        _sid = int(entry.get('sender_id') or 0)
+        _safe_sender = html_module.escape(
+            str(entry.get('sender_display') or '') or 'غير متوفر')
+        if not entry.get('sender_display'):
+            _safe_sender = 'غير متوفر'
+        _safe_chat = html_module.escape(
+            str(entry.get('chat_title') or '') or 'غير معروف')
+        _safe_text = html_module.escape(str(entry.get('text') or '')[:1500])
+        _internal = str(entry['chat_id']).replace('-100', '')
+        _link = f"https://t.me/c/{_internal}/{entry['msg_id']}"
+        _del_note = ('\n⚠️ <i>الأصل حُذف من المجموعة قبل سحبه — النص محفوظ هنا'
+                     ' من عازلة الالتقاط</i>' if entry.get('deleted') else '')
+        alert = (f'🔍 <b>طلب فائت — من جولة التدقيق التلقائية</b>\n'
+                 f'👤 <b>المرسل:</b> '
+                 f'<a href="tg://user?id={_sid}">{_safe_sender}</a>'
+                 f'\n🆔 <b>الايدي:</b> '
+                 f'<a href="tg://user?id={_sid}">{_sid}</a>\n'
+                 f"👥 <b>المجموعة:</b> {_safe_chat}\n"
+                 f"🕒 <b>الالتقاط:</b> "
+                 f"{datetime.fromtimestamp(entry['ts']).strftime('%Y-%m-%d %H:%M')}"
+                 f"{_del_note}\n"
+                 f"💬 <b>نص الطلب:</b>\n"
+                 f"<blockquote expandable>{_safe_text}</blockquote>\n\n"
+                 f'🔗 <a href="{_link}">عرض الرسالة الأصلية</a>\n'
+                 f'ℹ️ <i>فلتر رفضه مبدئيًا ({html_module.escape(str(entry.get("reason") or ""))}) '
+                 f'والجولة نشرته لقوة مؤشراته — راجعه، وإن لم يكن طلبًا '
+                 f'ردّ بـ«تجاهل الرسالة»</i>')
+        _buttons = None
+        try:
+            if _sid > 0 and entry.get('phone'):
+                _cb = f"cbc:{entry['chat_id']}:{_sid}:{entry.get('phone') or ''}"
+                _buttons = [[
+                    Button.inline("🔴 تواصل مع المرسل", _cb.encode('utf-8')),
+                    Button.inline("❓", b"cbh")]]
+        except Exception:
+            _buttons = None
+        sent = await _bot_client.send_message(
+            _target, alert, parse_mode='html', link_preview=False,
+            buttons=_buttons)
+        _st = self._audit_lazy_init()
+        _st['totals']['late_published'] += 1
+        _st['late_published_log'].append({
+            'ts': time.time(),
+            'chat_id': entry['chat_id'],
+            'msg_id': entry['msg_id'],
+            'reason': entry.get('reason'),
+            'text': str(entry.get('text') or '')[:80],
+            'alert_id': getattr(sent, 'id', 0) or 0,
+        })
+        if len(_st['late_published_log']) > 10:
+            _st['late_published_log'] = _st['late_published_log'][-10:]
+        # سجّل في سجل التجاهل بالرد (تكافؤ كامل مع التنبيهات الرسمية)
+        try:
+            _reg_fn = getattr(self, '_register_request_alert', None)
+            if callable(_reg_fn):
+                _reg_fn(entry['chat_id'], entry['msg_id'], _target, sent,
+                        alert, _buttons, relay=None, sender_meta={
+                            'sender_id': _sid,
+                            'sender_username': '',
+                            'sender_name': str(entry.get('sender_display')
+                                               or '')[:80],
+                            'chat_id': int(entry['chat_id']),
+                            'chat_title': str(entry.get('chat_title')
+                                              or '')[:120],
+                            'msg_id': int(entry['msg_id']),
+                            'raw_text': str(entry.get('text') or '')[:2000],
+                        })
+        except Exception:
+            pass
+        logging.info(
+            f"[AUDIT-ROUNDS] 🔍 late-published chat_id={entry['chat_id']} "
+            f"msg_id={entry['msg_id']} reason={entry.get('reason')} "
+            f"deleted_original={bool(entry.get('deleted'))}"
+        )
+        return True
+
+    async def _audit_digest(self, rnd, st, w_accepts, w_rejects, won,
+                            cands, cands_deleted, published_now,
+                            new_deletes) -> None:
+        """التقرير الهضمي للمالك: أرقام الجولة + أبرز المرشحين + نبضة."""
+        _cfg = getattr(self, 'config', None)
+        _owner = getattr(_cfg, 'owner_id', None)
+        now = time.time()
+        _hb_every = int(getattr(_cfg, 'audit_digest_heartbeat_rounds', 16))
+        notable = bool(cands or cands_deleted or published_now or won)
+        heartbeat = (rnd % max(1, _hb_every) == 0)
+        if not notable and not heartbeat:
+            return
+        if not _owner:
+            return
+        _bot_client = getattr(self, 'bot_client', None)
+        if not _bot_client or not _bot_client.is_connected():
+            return
+        _lat = st['latency_recent']
+        _avg = int(sum(_lat) / len(_lat)) if _lat else 0
+        lines = [f'🔍 <b>جولة التدقيق #{rnd}</b>']
+        lines.append(
+            f'✅ طلبات سُحبت هذه الجولة: <b>{len(w_accepts)}</b>'
+            + (f' (متوسط السرعة {_avg}ms)' if _avg else ''))
+        if won:
+            lines.append(
+                f'🗑️ حُذف أصله من المجموعة <b>بعد</b> سحبها (فزنا بالسباق، '
+                f'المحتوى محفوظ بالقناة): <b>{len(won)}</b>')
+        lines.append(f'📊 مرفوضات الجولة: {len(w_rejects)}'
+                     + (f' | أحداث حذف: {new_deletes}' if new_deletes else ''))
+        if cands_deleted:
+            lines.append(
+                f'⚠️ <b>مرشح فائت محتمل حُذف أصله قبل السحب: '
+                f'{len(cands_deleted)}</b> (بوتات الحماية غالبًا):')
+            for e in cands_deleted[:3]:
+                lines.append(
+                    f'  • «{html_module.escape(str(e["text"])[:90])}» '
+                    f'— {html_module.escape(str(e.get("chat_title") or ""))[:30]} '
+                    f'({html_module.escape(str(e.get("reason") or ""))})')
+        if published_now:
+            lines.append(
+                f'📤 نُشر متأخرًا لقناة الطلبات بوسم 🔍: <b>'
+                f'{len(published_now)}</b>')
+        elif cands:
+            lines.append(
+                f'👀 مرشحون قيد المراجعة (لم تُنشر — راجع /api/audit): '
+                f'{len(cands)}')
+            for e in cands[:3]:
+                lines.append(
+                    f'  • «{html_module.escape(str(e["text"])[:90])}» '
+                    f'— {html_module.escape(str(e.get("chat_title") or ""))[:30]} '
+                    f'({html_module.escape(str(e.get("reason") or ""))})')
+        if not notable and heartbeat:
+            lines.append('✅ لا طلبات فائتة مرصودة — الوضع سليم')
+        text = '\n'.join(lines)
+        try:
+            await _bot_client.send_message(
+                int(_owner), text, parse_mode='html', link_preview=False)
+            st['totals']['digests_sent'] += 1
+            st['digest_last_sent'] = now
+            if not notable:
+                st['heartbeat_last_sent'] = now
+        except Exception as _dg_e:
+            st['digest_errors'] += 1
+            logging.warning(f"[AUDIT-ROUNDS] digest DM failed: {_dg_e}")
+
+    def _audit_stats_snapshot(self) -> dict:
+        """لقطة JSON كاملة لحالة التدقيق — يقرؤها /api/audit وdeploy_check."""
+        try:
+            st = self._audit_lazy_init()
+            _cfg = getattr(self, 'config', None)
+            _task = getattr(self, '_audit_round_task', None)
+            _lat = st['latency_recent']
+            _sorted_lat = sorted(_lat) if _lat else []
+            _p95 = (_sorted_lat[int(len(_sorted_lat) * 0.95) - 1]
+                    if len(_sorted_lat) >= 20 else None)
+            return {
+                'enabled': bool(getattr(_cfg, 'audit_rounds_enabled', True)),
+                'loop_alive': bool(_task is not None and not _task.done()),
+                'interval_s': int(getattr(_cfg, 'audit_round_interval_s', 900)),
+                'late_publish': {
+                    'enabled': bool(getattr(
+                        _cfg, 'audit_late_publish_enabled', True)),
+                    'max_per_round': int(getattr(
+                        _cfg, 'audit_late_publish_max_per_round', 2)),
+                    'hourly_cap': self._AUDIT_LATE_HOURLY_MAX,
+                },
+                'round_no': st['round_no'],
+                'last_round_at': st.get('last_round_at', ''),
+                'last_round': st.get('last_round_stats', {}),
+                'totals_since_boot': {
+                    **st['totals'],
+                    'avg_latency_ms': (int(sum(_lat) / len(_lat))
+                                       if _lat else None),
+                    'p95_latency_ms': _p95,
+                    'max_latency_ms': (max(_lat) if _lat else None),
+                },
+                'recent_late_published': list(
+                    reversed(st['late_published_log'][-5:])),
+                'digest': {
+                    'last_sent_at': (datetime.fromtimestamp(
+                        st['digest_last_sent']).isoformat(timespec='seconds')
+                        if st['digest_last_sent'] else ''),
+                    'heartbeat_last_at': (datetime.fromtimestamp(
+                        st['heartbeat_last_sent']).isoformat(
+                            timespec='seconds')
+                        if st['heartbeat_last_sent'] else ''),
+                    'errors': st['digest_errors'],
+                },
+                'buffers': {
+                    'rejects': len(st['rejects']),
+                    'accepts': len(st['accepts']),
+                    'deletes': len(st['deletes']),
+                },
+            }
+        except Exception as _sn_e:
+            return {'error': str(_sn_e)[:160]}
+
+    async def _audit_round_loop(self):
+        """حلقة الجولات التدقيقية الدورية (كل 15 دقيقة افتراضيًا).
+        غير قاتلة — المشرف يعيد إشعالها لو ماتت."""
+        interval = int(getattr(getattr(self, 'config', None),
+                               'audit_round_interval_s', 900) or 900)
+        logging.info(
+            f"[AUDIT-ROUNDS] 🔄 loop started — interval={interval}s "
+            f"(late_publish="
+            f"{getattr(getattr(self, 'config', None), 'audit_late_publish_enabled', True)})")
+        await asyncio.sleep(min(120, interval))  # استقرار الإقلاع أولًا
+        while getattr(self, '_running', False):
+            try:
+                await self._audit_run_round()
+            except Exception as _rl_e:
+                logging.warning(f"[AUDIT-ROUNDS] round failed (non-fatal): {_rl_e}")
+            await asyncio.sleep(max(60, interval))
+        logging.info("[AUDIT-ROUNDS] loop stopped (_running=False)")
+
 
     # ------------------------------------------------------------------
     # [ENTITY-RESCUE] إنقاذ التواصل بعد خسارة سباق الحذف
@@ -9864,6 +10553,14 @@ class Monitor:
                 # this, one bad row silently skipped processing for 49 messages
                 # that were never rescued.
                 try:
+                    # [AUDIT-ROUNDS v4.4.19] سجّل حدث الحذف لربطه في جولة
+                    # التدقيق (ذاكرة فقط — سقف مضبوط، غير قاتل).
+                    try:
+                        _aud_d = getattr(self, '_audit_record_delete', None)
+                        if callable(_aud_d):
+                            _aud_d(chat_id, deleted_msg_id)
+                    except Exception:
+                        pass
                     # === [REQ-DELETED-MARK-v4.4.6] طلب مُنشر في قناة الطلبات؟ ===
                     # علّم تنبيهه فورًا (⚠️ + توجيه التواصل) قبل أي منطق
                     # إنقاذ: رسالة الطلب نصية بلا روابط غالبًا، ومسارات
@@ -15555,6 +16252,29 @@ class Monitor:
         except Exception as _ig_e:
             logging.error(f"[IGNORE-STORE] start failed (non-fatal): {_ig_e}")
 
+        # === [AUDIT-ROUNDS v4.4.19] جولات التدقيق التلقائية ===
+        # أمر المُشغّل (2026-11-20): «ابيك تسوي جولات تلقائيه وتتاكد هل
+        # هناك طلبات حقيقية تم تجاوزها وهل هناك طلبات حقيقية تم حذفها
+        # ولم يستطع سحبها وعالج المشكله». المشرف يعيد إشعالها لو ماتت.
+        try:
+            if not getattr(self.config, 'audit_rounds_enabled', True):
+                logging.info(
+                    "[AUDIT-ROUNDS] disabled by env (AUDIT_ROUNDS_ENABLED=false)")
+            else:
+                if (getattr(self, '_audit_round_task', None) is None
+                        or self._audit_round_task.done()):
+                    self._audit_round_task = asyncio.create_task(
+                        self._audit_round_loop())
+                    logging.info(
+                        f"[AUDIT-ROUNDS] ✅ armed — interval="
+                        f"{getattr(self.config, 'audit_round_interval_s', 900)}s "
+                        f"late_publish="
+                        f"{'on' if getattr(self.config, 'audit_late_publish_enabled', True) else 'off'} "
+                        f"(max {getattr(self.config, 'audit_late_publish_max_per_round', 2)}/round, "
+                        f"6/hour) digest→OWNER_ID")
+        except Exception as _aud_e:
+            logging.error(f"[AUDIT-ROUNDS] start failed (non-fatal): {_aud_e}")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -17697,6 +18417,27 @@ link_queue_pending {link_queue_pending}
     return web.Response(text=metrics, content_type="text/plain")
 
 
+async def api_audit_handler(request):
+    """[AUDIT-ROUNDS v4.4.19] لقطة حالة جولات التدقيق التلقائية.
+
+    JSON كامل: التفعيل/الحيوية/الفترات + آخر جولة (إحصاءات نافذة) +
+    المجاميع منذ الإقلاع (سحب/حذف/فائتون/نشر متأخر/سرعة) + آخر عمليات
+    النشر المتأخر + حالة التقرير الهضمي. تقرأها جولات التحقق الخارجية
+    (cron) والمُشغّل للتشخيص الفوري.
+    """
+    monitor = request.app.get("monitor")
+    if not monitor:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        _snap_fn = getattr(monitor, '_audit_stats_snapshot', None)
+        snap = _snap_fn() if callable(_snap_fn) else {
+            'error': 'audit methods not present on monitor'}
+    except Exception as e:
+        snap = {'error': str(e)[:160]}
+    return web.json_response(snap, headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def api_deploy_check_handler(request):
     """Diagnostic endpoint: full deployment health check.
 
@@ -17756,6 +18497,34 @@ async def api_deploy_check_handler(request):
             # إظهار أول 4 أحرف فقط للأمان
             masked = val[:4] + "..." + val[-2:] if len(val) > 8 else "***"
             report["env_vars"][var] = f"✅ set ({masked})"
+
+    # [AUDIT-ROUNDS v4.4.19] لقطة الجولات التدقيقية — أمر المُشغّل
+    # (2026-11-20): «ابيك تسوي جولات تلقائيه وتتاكد هل هناك طلبات
+    # حقيقية تم تجاوزها وهل هناك طلبات حقيقية تم حذفها ولم يستطع
+    # سحبها وعالج المشكله».
+    try:
+        _aud_fn_dc = getattr(monitor, '_audit_stats_snapshot', None)
+        _aud_snap_dc = _aud_fn_dc() if callable(_aud_fn_dc) else None
+        if isinstance(_aud_snap_dc, dict) and 'error' not in _aud_snap_dc:
+            report["audit_rounds"] = {
+                "enabled": _aud_snap_dc.get('enabled'),
+                "loop_alive": _aud_snap_dc.get('loop_alive'),
+                "interval_s": _aud_snap_dc.get('interval_s'),
+                "round_no": _aud_snap_dc.get('round_no'),
+                "last_round_at": _aud_snap_dc.get('last_round_at'),
+                "last_round": _aud_snap_dc.get('last_round', {}),
+                "totals": _aud_snap_dc.get('totals_since_boot', {}),
+                "late_publish": _aud_snap_dc.get('late_publish', {}),
+                "buffers": _aud_snap_dc.get('buffers', {}),
+            }
+            if not _aud_snap_dc.get('loop_alive', False) \
+                    and _aud_snap_dc.get('enabled'):
+                report["issues"].append(
+                    "AUDIT-ROUNDS loop NOT alive (supervisor should restart)")
+        else:
+            report["audit_rounds"] = _aud_snap_dc or {"status": "unavailable"}
+    except Exception as _aud_dc_e:
+        report["audit_rounds"] = {"error": str(_aud_dc_e)[:120]}
 
     # 2. Supabase key type + connectivity test
     if db.supabase_url and db.supabase_key:
@@ -18329,6 +19098,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/filter_stats", api_filter_stats_handler)  # [STAGE 6] filter decisions dashboard
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
+    app.router.add_get("/api/audit", api_audit_handler)  # [AUDIT-ROUNDS v4.4.19] جولات التدقيق
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
     app.router.add_get("/api/link_source_check", api_link_source_check_handler)  # check if source is monitored
@@ -18405,6 +19175,25 @@ async def main():
         f" ignore_group=on"
         f" supa_msg_retention={'on' if getattr(config,'journal_snapshot_enabled',False) else 'off'}"
         f" link_task={'on' if getattr(config,'link_task_enabled',False) else 'off'}"
+    )
+    # [AUDIT-ROUNDS v4.4.19] لقطة الجولات التدقيقية — أمر المُشغّل 2026-11-20
+    # («جولات تلقائيه وتتاكد هل هناك طلبات حقيقية تم تجاوزها...») +
+    # وضع البذرة الجديد (بعد القبول في وضع المحرك القواعدي — صفر توجيل
+    # دردشة لخاص البوت).
+    logging.info(
+        "AUDIT_ROUNDS="
+        f"enabled={'on' if getattr(config,'audit_rounds_enabled',True) else 'off'}"
+        f" interval={getattr(config,'audit_round_interval_s',900)}s"
+        f" late_publish={'on' if getattr(config,'audit_late_publish_enabled',True) else 'off'}"
+        f" (max {getattr(config,'audit_late_publish_max_per_round',2)}/round, 6/hour)"
+    )
+    logging.info(
+        "SEED_MODE="
+        + ("post_accept_rules=on"
+           if os.getenv("REQUEST_AI_ENABLED", "false").lower()
+           not in ("true", "1", "yes")
+           else "pre_filter_gated=on (AI mode)")
+        + " (rule-engine: بذرة بعد القبول فقط — صفر توجيل دردشة لخاص البوت)"
     )
     logging.info(f"REQUEST_FILTER_MODE={REQUEST_FILTER_MODE}")
     _rf_en = getattr(config, 'request_filter_enabled', False)

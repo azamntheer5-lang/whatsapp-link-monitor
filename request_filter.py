@@ -1691,6 +1691,41 @@ def chatter_guard_check(norm: str, sig: "SignalReport | None" = None) -> str:
     return ''
 
 
+def quick_local_verdict(text: str):
+    """[AUDIT-v4.4.19] حكم محلي سريع لبذرة السباق (وضع الـAI فقط).
+
+    نفس بوابات analyze_request_v4 المحلية (relay/عدد الكلمات/إشارات/
+    حرس الدردشة) قبل مرحلة الـAI — تزامني بالكامل (ميكروثانية، صفر
+    شبكة). يُعيد (True, '') لو مرّت كل البوابات أو (False, reason).
+    فشل داخلي → (True, '') — البوابة لا تمنع البذرة أبدًا (غير قاتل).
+    """
+    try:
+        from text_normalizer import normalize as _qlv_normalize
+        if not text or not text.strip():
+            return (False, 'empty')
+        nt = _qlv_normalize(text)
+        if not nt.clean or not nt.clean.strip():
+            return (False, 'empty_after_normalize')
+        if _is_relay_wrapper(nt.canonical, text):
+            return (False, 'relay_wrapper')
+        if _content_word_count(nt.clean) > 12:
+            _sig_q = extract_signals(text)
+            _strong_q = (bool(_sig_q.requester_signals)
+                         or bool(_sig_q.person_signals)) \
+                and bool(_sig_q.execution_signals) \
+                and bool(_sig_q.service_signals)
+            if not _strong_q:
+                return (False, 'request_too_long')
+        _sig_v = extract_signals(text)
+        if not admission_allowed(_sig_v, text):
+            return (False, 'no_signals')
+        if chatter_guard_check(normalize_text(nt.clean), _sig_v):
+            return (False, 'chatter_guard')
+        return (True, '')
+    except Exception:
+        return (True, '')
+
+
 # ============================================================
 # v4.0 Orchestrator — المراحل 1→2/3→4/5
 # ============================================================
@@ -1774,12 +1809,28 @@ async def analyze_request_v4(
     # طالب، بينما الطلب الحقيقي 3–12 كلمة مضمونًا. (بعد relay-wrapper
     # للحفاظ على كشف إعادة نشر البوتات الناقلة).
     if _content_word_count(nt.clean) > 12:
-        res.reason = "request_too_long"
-        res.intent_type = "too_long"
-        res.decision_path = "word_count_gate"
-        res.confidence = 0.0
-        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
-        return res
+        # [AUDIT-v4.4.19] إعفاء التوقيع القوي — أمر المُشغّل (2026-11-20):
+        # «تتاكد هل هناك طلبات حقيقية تم تجاوزها ... وعالج المشكله». حد
+        # الـ12 كلمة كان يرفض الطلب الحقيقي الطويل قبل أي تصنيف («ابي احد
+        # يسوي لي بحث كامل مع المراجع والتوثيق وملف بوربوينت» = 17 كلمة
+        # → رفضت رغم قبول المحرك القواعدي لها بثقة 0.96 — مثال مُثبت
+        # بالفحص المحلي). الإعفاء الجراحي: رسالة تحمل التوقيع القوي
+        # (طالب/شخص + فعل تنفيذ + خدمة) تتجاوز بوابة العدّ ويبقى القرار
+        # للمصنّف نفسه. الدردشة/الإعلانات لا تحمل التوقيع الثلاثي أبدًا
+        # (مُثبت على أمثلة إنتاج المُشغّل 2026-11-20 — كلها strong=False).
+        _sig_wc = extract_signals(text)
+        _strong_wc = (bool(_sig_wc.requester_signals)
+                      or bool(_sig_wc.person_signals)) \
+            and bool(_sig_wc.execution_signals) \
+            and bool(_sig_wc.service_signals)
+        if not _strong_wc:
+            res.reason = "request_too_long"
+            res.intent_type = "too_long"
+            res.decision_path = "word_count_gate"
+            res.confidence = 0.0
+            await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+            return res
+        # توقيع قوي → تخطَّ البوابة — المصنّف يحسم (strong_word_pass)
 
     # ---- [v4.2] persistent decision dedup (chat_id, msg_id) ----
     # قرار نهائي سابق لنفس الرسالة (إعادة تسليم بين الحسابات / restart)
