@@ -19732,15 +19732,15 @@ _JOIN_PAGE_HTML = """<!DOCTYPE html>
   <div class="card">
     <!-- الخطوة 1: الدولة -->
     <div class="step on" id="s1">
-      <h2>&#127470;&#127486; اختر دولتك</h2>
+      <h2>&#127757; اختر دولتك</h2>
       <p class="sub">سيتم تعبئة رمز الدولة تلقائيًا في الخطوة التالية.</p>
       <div class="country">
         <button class="cbtn" data-cc="967" data-flag="&#127486;&#127466;">
           <span class="fl">&#127486;&#127466;</span>
           <span>اليمن<small>&#8207;+967</small></span>
         </button>
-        <button class="cbtn" data-cc="966" data-flag="&#127486;&#127462;">
-          <span class="fl">&#127486;&#127462;</span>
+        <button class="cbtn" data-cc="966" data-flag="&#127480;&#127462;">
+          <span class="fl">&#127480;&#127462;</span>
           <span>السعودية<small>&#8207;+966</small></span>
         </button>
       </div>
