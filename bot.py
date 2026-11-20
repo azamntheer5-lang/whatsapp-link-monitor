@@ -84,6 +84,11 @@ from filter_store import DecisionLogger
 from request_guard import RateLimiter as RequestRateLimiter, CircuitBreaker, ContentDeduper
 from text_normalizer import normalize as _text_normalize
 
+# [AUTOREPLY-v4.4.26] محرك الرد الأولي السريع — حسابات «💬 رد تلقائي»
+# ترسل التحية الأولى لصاحب الطلب خلال ثوانٍ من اكتشافه؛ الفريق البشري
+# يتولى المحادثة بعدها (توضيح المُشغّل 2026-11-20: السرعة فقط هي المطلوبة).
+from autoreply_engine import AutoReplyEngine
+
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
@@ -2955,7 +2960,7 @@ class MessageFormatter:
             "• 🧹 تنظيف القناة من المكرر\n\n"
             "🚀 للبدء، اضغط زر «🔐 تسجيل الدخول» أدناه\n"
             "أو استخدم الأزرار للتحكم في النظام.\n\n"
-            "💡 يمكنك أيضاً كتابة: Boot أو /start"
+            "💡 يمكنك أيضاً كتابة: Bot أو Boot أو /start"
         )
 
     @staticmethod
@@ -2980,8 +2985,9 @@ class MessageFormatter:
             "📌 أوامر التحكم بالانضمام:\n"
             "• /pause_join — إيقاف الانضمام\n"
             "• /resume_join — استئناف الانضمام\n"
-            "• /set_role <phone> <role> — تغيير دور الحساب (monitor/joiner/backup)\n"
+            "• /set_role <phone> <role> — تغيير دور الحساب (monitor/joiner/backup/autoreply)\n"
             "• /join_status — حالة حسابات الفدائيين\n"
+            "• /autoreply_status — حالة حسابات الرد التلقائي\n"
             "• /enable_joiner <phone> — تفعيل فدائي\n"
             "• /disable_joiner <phone> — إيقاف فدائي\n\n"
             "📌 أوامر التحقق (E2E):\n"
@@ -5027,6 +5033,10 @@ class Monitor:
         # محلل الذكاء الاصطناعي (مسار الروابط فقط — معطّل افتراضيًا
         # عبر AI_BATCH_MODE=true؛ تصنيف الطلبات لم يععد يستخدمه إطلاقًا)
         self.ai_analyzer = AIAnalyzer()
+        # [AUTOREPLY-v4.4.26] محرك الرد الأولي — تحية سريعة من حسابات
+        # role='autoreply' فور نشر تنبيه الطلب؛ الفريق البشري يكمل بعدها.
+        # غير قاتل: أي فشل داخله يُسجل ويُتخطى (الزر الأحمر باقٍ كاحتياط).
+        self.autoreply = AutoReplyEngine(self)
         # ===== [REQUEST-FILTER v4.4.0 — AI-OFF] المُصنّف الحتمي =====
         # طلب المُشغّل (2026-09-04): إلغاء الذكاء الاصطناعي من تصنيف الطلبات
         # وإرجاع الفلتر — بنتيجة أقوى. الافتراضي الآن: محرّك قواعدي حتمي
@@ -5455,12 +5465,16 @@ class Monitor:
                 return
 
             # AUTHORIZATION: state-changing actions require owner verification
-            # (login_start, scan_week, scan_month, scan_stop, reset_scan)
+            # (login_start + role buttons, scan_*, reset_*)
+            # [AUTOREPLY-v4.4.26] أزرار الدور الثلاثة أصبحت مقيدة أيضًا
+            # بطلب المُشغّل: «ولايستطيع احد غير الضغط عليهم» — حتى لو فتح
+            # رسالة قديمة فيها الأزرار، الضغط من غير المالك يُرفض.
             # Read-only actions (status, help, main_menu) and per-message
             # actions (save, copy, share on links the user can already see)
             # are allowed for anyone in the channel.
             STATE_CHANGING_CALLBACKS = {
-                "login_start", "scan_week", "scan_month", "scan_stop", "reset_scan",
+                "login_start", "login_monitor", "login_joiner", "login_autoreply",
+                "scan_week", "scan_month", "scan_stop", "reset_scan",
                 "add_watcher",
             }
             is_state_changing = (
@@ -5481,9 +5495,11 @@ class Monitor:
                 await self._handle_login_start(event, sender)
                 return
 
-            # معالجة اختيار الدور (مراقب / فدائي)
-            if data == "login_monitor" or data == "login_joiner":
-                role = "monitor" if data == "login_monitor" else "joiner"
+            # معالجة اختيار الدور (مراقب / فدائي / رد تلقائي)
+            if data in ("login_monitor", "login_joiner", "login_autoreply"):
+                role = {"login_monitor": "monitor",
+                        "login_joiner": "joiner",
+                        "login_autoreply": "autoreply"}[data]
                 await self._start_login_with_role(event, sender, role)
                 return
 
@@ -9311,6 +9327,18 @@ class Monitor:
                            str(chat_title or '')[:120], source_phone)
             except Exception:
                 pass
+            # === [AUTOREPLY-v4.4.26] الرد الأولي السريع — تحية فورية من
+            # حسابات الرد التلقائي (fire-and-forget: لا تعطّل مسار التنبيه
+            # إطلاقًا؛ فشله لا يؤثر على شيء — الزر الأحمر باقٍ كاحتياط).
+            try:
+                _ar_engine = getattr(self, 'autoreply', None)
+                if _ar_engine is not None:
+                    asyncio.create_task(_ar_engine.greet(
+                        int(sender_id or 0), str(sender_display or '')[:80],
+                        _uname_clean or '', int(chat_id), int(msg_id),
+                        str(raw_text or '')[:500], str(source_phone or '')))
+            except Exception:
+                pass
             # [REQ-DELETED-MARK-v4.4.6 + MENTION-BRIDGE-v4.4.7] سجّل
             # التنبيه للتعليم عند حذف الأصل (رابط التنبيه يموت عند الحذف
             # — نحتاج معرّف رسالة التنبيه كي نُعدّلها لاحقًا بعلامة ⚠️)
@@ -9440,6 +9468,17 @@ class Monitor:
                     buttons=dm_buttons,
                 )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
+                # [AUTOREPLY-v4.4.26] نفس الخطاف بعد مسار إعادة المحاولة —
+                # المساران لا يلتقيان أبدًا (الأول نجح=لا FloodWait هنا).
+                try:
+                    _ar_engine2 = getattr(self, 'autoreply', None)
+                    if _ar_engine2 is not None:
+                        asyncio.create_task(_ar_engine2.greet(
+                            int(sender_id or 0), str(sender_display or '')[:80],
+                            _uname_clean or '', int(chat_id), int(msg_id),
+                            str(raw_text or '')[:500], str(source_phone or '')))
+                except Exception:
+                    pass
                 # [AUDIT-ROUNDS v4.4.19] سجّل قبول مسار FloodWait أيضًا
                 try:
                     _aud_a2 = getattr(self, '_audit_record_accept', None)
@@ -12224,8 +12263,10 @@ class Monitor:
             self._cleanup_expired_login_sessions()
 
             # الأوامر
-            # Boot (بدون شرطة) أو /start كلاهما يفتح القائمة الرئيسية
-            if text.strip().lower() in ("boot", "/start", "/boot", "بوت", "ابدأ", "Start"):
+            # Bot / Boot (بدون شرطة) أو /start — كلها تفتح القائمة الرئيسية
+            # [AUTOREPLY-v4.4.26] «Bot» صار أمرًا صريحًا بطلب المُشغّل:
+            # «مثلاً اكتب Bot يطلع لي تسجيل الدخول وبقية الأوامر السابقة».
+            if text.strip().lower() in ("bot", "/bot", "boot", "/start", "/boot", "بوت", "ابدأ", "start"):
                 await self._handle_start(event, sender)
                 return
 
@@ -12277,6 +12318,7 @@ class Monitor:
                 admin_commands = [
                     '/pause_join', '/resume_join', '/set_role',
                     '/enable_joiner', '/disable_joiner', '/join_status',
+                    '/autoreply_status',
                     '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
                     '/leave_bad_groups', '/clean_queue', '/rejoin_published',
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
@@ -12320,7 +12362,7 @@ class Monitor:
                 "• /login - تسجيل الدخول بحسابك\n"
                 "• /status - حالتك\n"
                 "• /cancel - إلغاء العملية\n\n"
-                "💡 اكتب Boot لفتح القائمة الرئيسية"
+                "💡 اكتب Bot أو Boot لفتح القائمة الرئيسية"
             )
 
         except Exception as e:
@@ -12354,7 +12396,9 @@ class Monitor:
             await event.edit("⚠️ الخادم مشغول. حاول بعد دقيقة.")
             return
 
-        role_name = "👁️ مراقب" if role == "monitor" else "🚀 فدائي"
+        # [AUTOREPLY-v4.4.26] دور ثالث: 💬 رد تلقائي
+        role_name = {"monitor": "👁️ مراقب", "joiner": "🚀 فدائي",
+                     "autoreply": "💬 رد تلقائي"}.get(role, "👁️ مراقب")
 
         self._login_sessions[sender_id] = {
             "step": "phone",
@@ -12390,10 +12434,13 @@ class Monitor:
             await event.reply("⚠️ الخادم مشغول بعدة تسجيلات. حاول بعد دقيقة.")
             return
 
-        # عرض زرين لاختيار الدور
+        # عرض ثلاثة أدوار للاختيار [AUTOREPLY-v4.4.26] — الثالث بطلب
+        # المُشغّل: «يطلع لي ثلاثة خيارات حساب مراقب او حساب فدائي او
+        # حساب رد تلقائي» (كانت خيارين فقط).
         buttons = [
             [Button.inline("👁️ حساب مراقب (Monitor)", b"login_monitor")],
             [Button.inline("🚀 حساب فدائي (Joiner)", b"login_joiner")],
+            [Button.inline("💬 حساب رد تلقائي (Auto-Reply)", b"login_autoreply")],
             [Button.inline("🔙 إلغاء", b"login_cancel")],
         ]
 
@@ -12407,6 +12454,10 @@ class Monitor:
             "• ينضم تلقائياً للمجموعات المكتشفة\n"
             "• بحدود أمان: 10 مجموعات/يوم، 30-60 دقيقة فاصل\n"
             "• يتوقف تلقائياً عند انخفاض الصحة\n\n"
+            "💬 **الرد التلقائي (Auto-Reply):**\n"
+            "• يرسل التحية الأولى لصاحب الطلب خلال ثوانٍ\n"
+            "• سرعة الرد فقط — الفريق البشري يكمل المحادثة\n"
+            "• بحدود أمان: 25 تحية/يوم، فاصل 4 دقائق\n\n"
             "⚠️ اختر الدور المناسب للمهمة التي تريدها:",
             buttons=buttons,
             parse_mode='html'
@@ -12567,19 +12618,32 @@ class Monitor:
                 await temp_client.disconnect()
                 del self._login_sessions[sender_id]
 
+                # [AUTOREPLY-v4.4.26] ثلاثة أدوار في رسالة النجاح
+                role_label = {'joiner': '🚀 فدائي (Joiner)',
+                              'autoreply': '💬 رد تلقائي (Auto-Reply)',
+                              'monitor': '👁️ مراقب (Monitor)'}.get(role, '👁️ مراقب (Monitor)')
+                if role == 'joiner':
+                    role_desc = (f"🚀 **حساب فدائي** — سيبدأ البوت بالانضمام التلقائي\n"
+                                 f"للمجموعات المكتشفة بحدود أمان:\n"
+                                 f"• 10 مجموعات/يوم\n"
+                                 f"• 30-60 دقيقة بين كل انضمام\n"
+                                 f"• أوقات نشطة: 8ص-12ظ، 4ع-10م\n\n")
+                elif role == 'autoreply':
+                    role_desc = (f"💬 **حساب رد تلقائي** — سيبدأ بإرسال التحية\n"
+                                 f"الأولى لصاحب الطلب خلال ثوانٍ من اكتشافه،\n"
+                                 f"ثم يكمل الفريق البشري المحادثة من هذا الحساب:\n"
+                                 f"• سقف أمان: 25 تحية/يوم\n"
+                                 f"• فاصل ≥ 4 دقائق بين كل تحية\n"
+                                 f"• تحية واحدة لكل عميل خلال 24 ساعة\n\n")
+                else:
+                    role_desc = (f"👁️ **حساب مراقب** — سيبدأ البوت بمراقبة\n"
+                                 f"مجموعاتك ويسحب الروابط تلقائياً.\n\n")
                 await event.reply(
                     f"🎉 تم تسجيل الحساب بنجاح!\n\n"
                     f"👤 الاسم: {display_name}\n"
                     f"📞 الرقم: {phone}\n"
-                    f"🏷️ الدور: {'🚀 فدائي (Joiner)' if role == 'joiner' else '👁️ مراقب (Monitor)'}\n\n"
-                    + (f"🚀 **حساب فدائي** — سيبدأ البوت بالانضمام التلقائي\n"
-                       f"للمجموعات المكتشفة بحدود أمان:\n"
-                       f"• 10 مجموعات/يوم\n"
-                       f"• 30-60 دقيقة بين كل انضمام\n"
-                       f"• أوقات نشطة: 8ص-12ظ، 4ع-10م\n\n"
-                       if role == 'joiner'
-                       else f"👁️ **حساب مراقب** — سيبدأ البوت بمراقبة\n"
-                       f"مجموعاتك ويسحب الروابط تلقائياً.\n\n")
+                    f"🏷️ الدور: {role_label}\n\n"
+                    + role_desc
                     + f"✅ شكراً لانضمامك!"
                 )
 
@@ -12625,16 +12689,25 @@ class Monitor:
                 await temp_client.disconnect()
                 del self._login_sessions[sender_id]
 
+                # [AUTOREPLY-v4.4.26] نفس الترقية الثلاثية في مسار 2FA
+                role_label2 = {'joiner': '🚀 فدائي (Joiner)',
+                               'autoreply': '💬 رد تلقائي (Auto-Reply)',
+                               'monitor': '👁️ مراقب (Monitor)'}.get(role, '👁️ مراقب (Monitor)')
+                if role == 'joiner':
+                    role_desc2 = (f"🚀 **حساب فدائي** — سيبدأ البوت بالانضمام التلقائي\n"
+                                  f"للمجموعات المكتشفة بحدود أمان.\n\n")
+                elif role == 'autoreply':
+                    role_desc2 = (f"💬 **حساب رد تلقائي** — تحية أولى سريعة\n"
+                                  f"لكل طلب مكتشف ثم يكمل الفريق البشري.\n\n")
+                else:
+                    role_desc2 = (f"👁️ **حساب مراقب** — سيبدأ البوت بمراقبة\n"
+                                  f"مجموعاتك ويسحب الروابط تلقائياً.\n\n")
                 await event.reply(
                     f"🎉 تم تسجيل الحساب بنجاح!\n\n"
                     f"👤 الاسم: {display_name}\n"
                     f"📞 الرقم: {phone}\n"
-                    f"🏷️ الدور: {'🚀 فدائي (Joiner)' if role == 'joiner' else '👁️ مراقب (Monitor)'}\n\n"
-                    + (f"🚀 **حساب فدائي** — سيبدأ البوت بالانضمام التلقائي\n"
-                       f"للمجموعات المكتشفة بحدود أمان.\n\n"
-                       if role == 'joiner'
-                       else f"👁️ **حساب مراقب** — سيبدأ البوت بمراقبة\n"
-                       f"مجموعاتك ويسحب الروابط تلقائياً.\n\n")
+                    f"🏷️ الدور: {role_label2}\n\n"
+                    + role_desc2
                     + f"✅ شكراً لانضمامك!"
                 )
                 logging.info(f"[LOGIN] New {role} (2FA): {phone}")
@@ -13327,21 +13400,23 @@ class Monitor:
                     await reply(
                         "📋 الاستخدام: /set_role <phone> <role>\n"
                         "الأدوار المتاحة:\n"
-                        "  • monitor — يراقب فقط (لا ينضم)\n"
-                        "  • joiner  — فدائي ينضم للمجموعات\n"
-                        "  • backup  — احتياطي (ينضم عند الحاجة)\n\n"
+                        "  • monitor  — يراقب فقط (لا ينضم)\n"
+                        "  • joiner   — فدائي ينضم للمجموعات\n"
+                        "  • backup   — احتياطي (ينضم عند الحاجة)\n"
+                        "  • autoreply — رد تلقائي (التحية الأولى فقط)\n\n"
                         "مثال: /set_role +967739407274 joiner\n\n"
                         "⚠️ ملاحظة: الحساب الفدائي يجب أن يكون عضواً في مجموعات مختلفة عن المراقب"
                     )
                 else:
                     target_phone = parts[1]
                     new_role = parts[2].lower().strip()
-                    if new_role not in ('monitor', 'joiner', 'backup'):
-                        await reply(f"❌ دور غير صالح: {new_role}\nالأدوار: monitor / joiner / backup")
+                    if new_role not in ('monitor', 'joiner', 'backup', 'autoreply'):
+                        await reply(f"❌ دور غير صالح: {new_role}\nالأدوار: monitor / joiner / backup / autoreply")
                     else:
                         ok = await self.db._supabase_update_watcher(target_phone, role=new_role)
                         if ok:
-                            role_icon = {'monitor': '👁️', 'joiner': '🚀', 'backup': '🔄'}.get(new_role, '❓')
+                            role_icon = {'monitor': '👁️', 'joiner': '🚀', 'backup': '🔄',
+                                         'autoreply': '💬'}.get(new_role, '❓')
                             await reply(
                                 f"{role_icon} تم تغيير دور الحساب {target_phone} إلى: {new_role}\n"
                                 f"📦 Source: Supabase (sole source of truth)\n\n"
@@ -13352,6 +13427,14 @@ class Monitor:
                             # لو الحساب متصل، حدّث في الذاكرة (role يُقرأ من Supabase في كل عملية)
                         else:
                             await reply(f"❌ فشل تحديث Supabase للحساب: {target_phone}")
+
+            elif cmd == "/autoreply_status":
+                # === [AUTOREPLY-v4.4.26] تقرير حسابات الرد التلقائي ===
+                _ar = getattr(self, 'autoreply', None)
+                if _ar is None:
+                    await reply("ℹ️ محرك الرد التلقائي غير مهيأ.")
+                else:
+                    await reply(await _ar.status_report())
 
             elif cmd == "/join_status":
                 # === تقرير حالة كل حساب فدائي — يقرأ من Supabase ===
