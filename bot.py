@@ -928,6 +928,28 @@ class Config:
         except ValueError:
             self.channel_gate_sweep_s = 600
 
+        # === [IGNORE-BY-REPLY-v4.4.17] تجاهل بأمر الرد — طلب المُشغّل (2026-11-20) ===
+        # «ارد على الرسالة انا او احد الاعضاء وقال تجاهل الرساله يتم تجاهل
+        #  الرساله في المرات القادمة واذا قال تجاهل المرسل يتم تجاهل الرسل
+        #  في المرات القادمة حتى لو كان الطلب حقيقي ... حتى ولو كان ما
+        #  عنده يوزر»:
+        #   IGNORE_STORE_ENABLED (default true) — مفتاح نظام التجاهل كاملًا.
+        self.ignore_store_enabled = os.getenv(
+            "IGNORE_STORE_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+
+        # === [MENTION-BRIDGE-KILL] إيقاف جسر التوجيه — تشخيص إنتاجي 2026-11-20 ===
+        # الجسر وجّه رسائل خاطئة لقناة الطلبات: معرفات البذور العائدة من
+        # Telethon لا تطابق معرفات Bot API لنفس الرسائل (10242 مقابل 28715)
+        # → إعادة التوجيل تلتقط رسائل قديمة عشوائية من خاص البوت وتنشرها
+        # بالقناة («لاهنتم ياشباب احد يعرف في الكتيب» و«اللفظي باقي لي
+        #  50 قسم» — رسائل أكتوبر ظهرت كأنها طلبات اليوم). التنبيه نفسه
+        # مكتفٍ (نص الطلب + أزرار التواصل) → الجسر متوقف افتراضيًا.
+        #   MENTION_BRIDGE_ENABLED (default false) — أعد تفعيله بحذر.
+        self.mention_bridge_enabled = os.getenv(
+            "MENTION_BRIDGE_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+
         # === [LINK-TASK-KILL + SEED-RACE-KILL] — طلب المُشغّل (2026-09-06) ===
         # «اشوف البوت يعيد توجيه رسائل كثيره جداً مع نفسه وهي أصلاً مو طلبات»
         # + «ابيك توقف مهمة سحب الروابط والانضمام»:
@@ -3918,6 +3940,366 @@ class ChannelGate:
 
 
 # -------------------------------------------------------------------
+# [IGNORE-BY-REPLY-v4.4.17] مخزن التجاهل بأمر الرد — طلب المُشغّل 2026-11-20
+# -------------------------------------------------------------------
+# «ارد على الرسالة انا او احد الاعضاء وقال تجاهل الرساله يتم تجاهل
+#  الرساله في المرات القادمة واذا قال تجاهل المرسل يتم تجاهل الرسل
+#  في المرات القادمة حتى لو كان الطلب حقيقي ... حتى ولو كان ما عنده يوزر».
+#
+# مساران للتشغيل:
+#   (أ) رد على تنبيه الطلب في القناة نفسها بـ«تجاهل الرسالة/تجاهل المرسل»
+#       (يستطيعه المشرفون — قناة بث).
+#   (ب) توجيه التنبيه إلى خاص البوت ثم الرد عليه بالأمر (يستطيعه كل
+#       الأعضاء — يشمل من لا يملك حق النشر في القناة).
+#
+# التخزين الدائم: جدول watchers (نمط صفوف البوابة — لا يلمسها موصّل
+# الحسابات لأن is_active=false):
+#   phone='ign:sender:<user_id>'  role='ignore_sender'
+#   phone='ign:msg:<sig32>'       role='ignore_msg'
+# و display_name يحمل JSON ميتا مضغوطًا. التحديد بالمفتاح الرقمي
+# sender_id (يعمل بلا username إطلاقًا) + بصمتَي نص (مطابقة تامة بعد
+# التطبيع + بصمة دلالية بنفس خوارزمية كبح التكرار — تلتقط إعادة
+# الصياغة بنفس الكلمات). غير قاتل في كل طبقة.
+
+
+class IgnoreStore:
+    SENDER_PREFIX = "ign:sender:"
+    MSG_PREFIX = "ign:msg:"
+    ROLE_SENDER = "ignore_sender"
+    ROLE_MSG = "ignore_msg"
+    REFRESH_S = 300  # تحديث دوري من Supabase (تزامن بين الأقسام)
+
+    def __init__(self, monitor):
+        self.monitor = monitor
+        _cfg = getattr(monitor, 'config', None)
+        self.enabled = bool(getattr(_cfg, 'ignore_store_enabled', True))
+        self.supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip('/')
+        self.supabase_key = os.getenv("SUPABASE_KEY", "").strip()
+        # uid → {'un','nm','by','ts'}
+        self.senders: Dict[int, dict] = {}
+        # username (مُطبّع lowercase) → uid
+        self.usernames: Dict[str, int] = {}
+        # بصمة دلالية (sorted-tokens md5) → meta
+        self.msg_sigs: Dict[str, dict] = {}
+        # hash النص المُطبّع → بصمة دلالية
+        self.msg_exact: Dict[str, str] = {}
+        self._http = None
+        self._task = None
+        self.actions: List[str] = []
+
+    # ---------- helpers ----------
+
+    def log(self, msg: str):
+        logging.info(f"[IGNORE-STORE] {msg}")
+
+    def warn(self, msg: str):
+        logging.warning(f"[IGNORE-STORE] {msg}")
+
+    def _record(self, text: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.actions.append(f"{stamp} {text}")
+        if len(self.actions) > 40:
+            del self.actions[:len(self.actions) - 40]
+
+    def _supa_headers(self) -> Dict[str, str]:
+        return {
+            "apikey": self.supabase_key,
+            "Authorization": f"Bearer {self.supabase_key}",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def sig_of(raw_text: str) -> str:
+        """بصمة دلالية — نفس خوارزمية كبح تكرار المُرسل (كلمات مُطبّعة
+        مرتبة → md5): نفس الكلمات بأي ترتيب/تشكيل = نفس البصمة."""
+        try:
+            return _sender_repeat_signature(raw_text) or ''
+        except Exception:
+            return ''
+
+    @staticmethod
+    def exact_of(raw_text: str) -> str:
+        """بصمة المطابقة التامة بعد التطبيع الكامل (تشكيل/همزات/لهجات)."""
+        try:
+            _canon = _text_normalize(str(raw_text or '')).canonical
+            if not _canon:
+                return ''
+            return hashlib.md5(
+                str(_canon).encode('utf-8', 'replace')).hexdigest()
+        except Exception:
+            return ''
+
+    # ---------- lifecycle ----------
+
+    async def start(self):
+        if not self.enabled:
+            self.warn("disabled (IGNORE_STORE_ENABLED != true)")
+            return
+        if not (self.supabase_url and self.supabase_key):
+            self.warn("no Supabase config — in-memory only (not durable)")
+        else:
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15))
+        await self.reload()
+        self._task = asyncio.create_task(self._refresh_loop())
+        self.log(
+            f"ACTIVE — senders={len(self.senders)} "
+            f"messages={len(self.msg_sigs)} refresh={self.REFRESH_S}s")
+
+    async def _refresh_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.REFRESH_S)
+                await self.reload()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                self.warn(f"refresh error (non-fatal): {e}")
+
+    async def reload(self):
+        """تحميل/تحديث من Supabase (استبدال ذري للخرائط)."""
+        if not self._http:
+            return
+        try:
+            async with self._http.get(
+                f"{self.supabase_url}/rest/v1/watchers"
+                f"?or=(role.eq.{self.ROLE_SENDER},role.eq.{self.ROLE_MSG})"
+                f"&select=phone,display_name,role&limit=1000",
+                headers=self._supa_headers()) as r:
+                if r.status != 200:
+                    self.warn(f"reload HTTP {r.status}")
+                    return
+                rows = await r.json()
+        except Exception as e:
+            self.warn(f"reload error: {e}")
+            return
+        _senders: Dict[int, dict] = {}
+        _usernames: Dict[str, int] = {}
+        _sigs: Dict[str, dict] = {}
+        _exact: Dict[str, str] = {}
+        for row in rows or []:
+            try:
+                phone = str(row.get('phone') or '')
+                role = str(row.get('role') or '')
+                meta = {}
+                try:
+                    meta = json_module.loads(row.get('display_name') or '{}')
+                except Exception:
+                    meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                if role == self.ROLE_SENDER and phone.startswith(self.SENDER_PREFIX):
+                    _uid = int(phone[len(self.SENDER_PREFIX):])
+                    _senders[_uid] = {
+                        'un': str(meta.get('un') or ''),
+                        'nm': str(meta.get('nm') or ''),
+                        'by': int(meta.get('by') or 0),
+                        'ts': float(meta.get('ts') or 0.0),
+                    }
+                    _un = str(meta.get('un') or '').strip().lstrip('@').lower()
+                    if len(_un) >= 4:
+                        _usernames[_un] = _uid
+                elif role == self.ROLE_MSG and phone.startswith(self.MSG_PREFIX):
+                    _sig = phone[len(self.MSG_PREFIX):]
+                    _meta = {
+                        'txt': str(meta.get('txt') or ''),
+                        'by': int(meta.get('by') or 0),
+                        'ts': float(meta.get('ts') or 0.0),
+                    }
+                    _sigs[_sig] = _meta
+                    _ex = str(meta.get('ex') or '')
+                    if _ex:
+                        _exact[_ex] = _sig
+            except Exception:
+                continue
+        self.senders = _senders
+        self.usernames = _usernames
+        self.msg_sigs = _sigs
+        self.msg_exact = _exact
+        self.log(f"reloaded: senders={len(_senders)} messages={len(_sigs)}")
+
+    # ---------- queries ----------
+
+    def is_ignored(self, sender_id, username, raw_text):
+        """يعيد (hit, reason). sender_id رقمي يعمل بلا يوزر إطلاقًا؛
+        النص يُفحص ببصمتين (تامة + دلالية)."""
+        try:
+            _sid = int(sender_id or 0)
+        except (TypeError, ValueError):
+            _sid = 0
+        if _sid > 0 and _sid in self.senders:
+            _m = self.senders[_sid]
+            return (True, f"sender id={_sid}"
+                    + (f" @{_m.get('un')}" if _m.get('un') else ''))
+        _un = str(username or '').strip().lstrip('@').lower()
+        _un = re.sub(r'[^a-z0-9_]', '', _un)
+        if len(_un) >= 4 and _un in self.usernames:
+            return (True, f"sender @{_un}")
+        if raw_text:
+            _ex = self.exact_of(raw_text)
+            if _ex and _ex in self.msg_exact:
+                return (True, f"message exact {_ex[:8]}")
+            _sg = self.sig_of(raw_text)
+            if _sg and _sg in self.msg_sigs:
+                return (True, f"message sig {_sg[:8]}")
+        return (False, '')
+
+    # ---------- mutations ----------
+
+    async def _upsert_row(self, phone: str, display: str, role: str) -> bool:
+        """إدراج/تحديث صف في watchers (دائم). يعيد True لو كُتب في Supabase."""
+        if not self._http:
+            return False
+        row = {"phone": phone, "display_name": display,
+               "session_string": "", "is_active": False, "role": role}
+        try:
+            async with self._http.post(
+                    f"{self.supabase_url}/rest/v1/watchers",
+                    json=row, headers=self._supa_headers()) as r:
+                if r.status in (200, 201):
+                    return True
+                text = await r.text()
+                if "duplicate" in text.lower() or r.status == 409:
+                    q = url_quote(phone, safe='')
+                    async with self._http.patch(
+                            f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}",
+                            json={"display_name": display, "role": role,
+                                  "is_active": False},
+                            headers=self._supa_headers()):
+                        pass
+                    return True
+                self.warn(f"upsert HTTP {r.status}: {text[:120]}")
+        except Exception as e:
+            self.warn(f"upsert error: {e}")
+        return False
+
+    async def add_sender(self, uid, username, name, by=0) -> bool:
+        """تجاهل مُرسِل (رقميًا — يعمل بلا يوزر) دائمًا."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        if uid <= 0:
+            return False
+        _un = re.sub(r'[^a-z0-9_]', '',
+                     str(username or '').strip().lstrip('@').lower())
+        if len(_un) < 4:
+            _un = ''
+        meta = {"uid": uid, "un": _un,
+                "nm": str(name or '')[:60],
+                "by": int(by or 0), "ts": time.time()}
+        self.senders[uid] = {'un': _un, 'nm': meta['nm'],
+                             'by': meta['by'], 'ts': meta['ts']}
+        if _un:
+            self.usernames[_un] = uid
+        ok = await self._upsert_row(
+            f"{self.SENDER_PREFIX}{uid}",
+            json_module.dumps(meta, ensure_ascii=False), self.ROLE_SENDER)
+        self._record(f"🔇 مرسل: {uid} {_un or meta['nm']}")
+        self.log(f"sender ignored uid={uid} un={_un or '-'} by={by} stored={ok}")
+        return ok
+
+    async def add_message(self, raw_text, by=0) -> bool:
+        """تجاهل رسالة (بصمتين: تامة + دلالية) — لن تُرسل مجددًا."""
+        _txt = str(raw_text or '').strip()
+        if not _txt:
+            return False
+        _sig = self.sig_of(_txt)
+        _ex = self.exact_of(_txt)
+        if not _sig and not _ex:
+            return False
+        meta = {"ex": _ex, "txt": _txt[:160],
+                "by": int(by or 0), "ts": time.time()}
+        ok = await self._upsert_row(
+            f"{self.MSG_PREFIX}{_sig or _ex}",
+            json_module.dumps(meta, ensure_ascii=False), self.ROLE_MSG)
+        if _sig:
+            self.msg_sigs[_sig] = {'txt': meta['txt'], 'by': meta['by'],
+                                   'ts': meta['ts']}
+        if _ex:
+            self.msg_exact[_ex] = _sig or _ex
+        self._record(f"🔇 رسالة: {(_sig or _ex)[:8]} «{_txt[:40]}»")
+        self.log(f"message ignored sig={(_sig or _ex)[:12]} by={by} stored={ok}")
+        return ok
+
+    async def remove_sender(self, uid) -> bool:
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        _m = self.senders.pop(uid, None)
+        if _m and _m.get('un'):
+            self.usernames.pop(_m['un'], None)
+        ok = await self._delete_rows(
+            f"{self.SENDER_PREFIX}{uid}")
+        self._record(f"↩️ إلغاء تجاهل مرسل: {uid}")
+        return ok
+
+    async def remove_message(self, key_prefix: str) -> int:
+        """إزالة تجاهل رسالة ببادئة البصمة (≥4 محارف). يعيد عدد المحذوفات."""
+        _p = re.sub(r'[^0-9a-f]', '', str(key_prefix or '').strip().lower())
+        if len(_p) < 4:
+            return 0
+        _hits = [s for s in list(self.msg_sigs.keys())
+                 if s.startswith(_p)]
+        if not _hits:
+            _hits = [v for v in list(self.msg_exact.values())
+                     if v.startswith(_p)]
+        _hits = list(dict.fromkeys(_hits)) or [_p]
+        _n = 0
+        for _sig in _hits:
+            self.msg_sigs.pop(_sig, None)
+            _ex_keys = [k for k, v in self.msg_exact.items() if v == _sig]
+            for k in _ex_keys:
+                self.msg_exact.pop(k, None)
+            ok = await self._delete_rows(f"{self.MSG_PREFIX}{_sig}")
+            if ok:
+                _n += 1
+        if _n:
+            self._record(f"↩️ إلغاء تجاهل رسالة: {_p} ({_n})")
+        return _n
+
+    async def _delete_rows(self, phone: str) -> bool:
+        if not self._http:
+            return False
+        try:
+            q = url_quote(phone, safe='')
+            async with self._http.delete(
+                    f"{self.supabase_url}/rest/v1/watchers?phone=eq.{q}",
+                    headers=self._supa_headers()) as r:
+                return r.status in (200, 204)
+        except Exception as e:
+            self.warn(f"delete error: {e}")
+            return False
+
+    def status_text(self) -> str:
+        lines = [
+            "🔇 نظام التجاهل بالرد",
+            f"الحالة: {'✅ مفعّل' if self.enabled else '❌ معطّل'}",
+            f"التخزين الدائم: {'✅ Supabase' if self._http else '⚠️ ذاكرة فقط'}",
+            f"مرسلون مُتجاهَلون: {len(self.senders)}",
+        ]
+        for _uid, _m in list(self.senders.items())[:15]:
+            _who = (f"@{_m.get('un')}" if _m.get('un')
+                    else (_m.get('nm') or ''))
+            lines.append(f"  • {_uid} — {_who}")
+        if len(self.senders) > 15:
+            lines.append(f"  … و{len(self.senders) - 15} آخر")
+        lines.append(f"رسائل مُتجاهَلة: {len(self.msg_sigs)}")
+        for _sig, _m in list(self.msg_sigs.items())[:10]:
+            lines.append(f"  • {_sig[:10]} — «{(_m.get('txt') or '')[:40]}»")
+        if len(self.msg_sigs) > 10:
+            lines.append(f"  … و{len(self.msg_sigs) - 10} آخر")
+        if self.actions:
+            lines.append("آخر الإجراءات:")
+            lines.extend(f"  {a}" for a in self.actions[-6:])
+        lines.append(
+            "💡 للتجاهل: رد على التنبيه بـ«تجاهل المرسل» أو «تجاهل الرسالة»"
+            " — أو وجّه التنبيه للبوت ثم رد عليه.")
+        return "\n".join(lines)
+
+
+# -------------------------------------------------------------------
 # Monitor (Multi-User)
 # -------------------------------------------------------------------
 
@@ -4205,6 +4587,30 @@ class Monitor:
             self._on_callback,
             events.CallbackQuery()
         )
+        # [IGNORE-BY-REPLY-v4.4.17] ردود التجاهل على تنبيهات الطلبات في
+        # قناة الطلبات («تجاهل الرسالة» / «تجاهل المرسل») — المالك وأي
+        # عضو يملك حق الرد هناك. incoming=True: رسائل البوت نفسه مستثناة.
+        try:
+            _ign_chats = []
+            _rtc_reg = getattr(self.config, 'requests_target_channel', 0)
+            if isinstance(_rtc_reg, int) and _rtc_reg:
+                _ign_chats.append(int(_rtc_reg))
+            elif isinstance(_rtc_reg, str) and _rtc_reg.lstrip('@').isdigit():
+                _ign_chats.append(int(_rtc_reg.lstrip('@')))
+            if (self.config.channel_id
+                    and int(self.config.channel_id) not in _ign_chats):
+                _ign_chats.append(int(self.config.channel_id))
+            if _ign_chats:
+                self.bot_client.add_event_handler(
+                    self._on_channel_ignore_reply,
+                    events.NewMessage(chats=_ign_chats, incoming=True))
+                logging.info(
+                    f"[IGNORE-BY-REPLY] channel ignore-reply handler armed "
+                    f"chats={_ign_chats}")
+        except Exception as _ign_reg_e:
+            logging.error(
+                f"[IGNORE-BY-REPLY] handler registration failed "
+                f"(non-fatal): {_ign_reg_e}")
         self._handlers_registered = True
         logging.info("Bot handlers registered (channel + private + buttons)")
 
@@ -7372,6 +7778,37 @@ class Monitor:
                 return  # سبق إرسالها لقناة الطلبات — لا تكرار (cross-account dedup)
             sent[key] = now
 
+        # === [REALTIME-GROUP-REG] سجّل المجموعة فور وصول رسالة منها ===
+        # طلب المُشغّل (2026-11-20): «هل يضيف المجموعات المراقبة الجديدة
+        # فوراً عدم التكرار». المسار كان يسجّل المجموعة فقط عند وجود
+        # روابط؛ الآن أي رسالة تصل من مجموعة تُسجّلها فورًا. لا تكرار
+        # أبدًا: chat_id UNIQUE + INSERT OR IGNORE (نفس عقد المصادر الأخرى)
+        # + مجموعة مرئية بالذاكرة تمنع أي نداء DB للمجموعات المعروفة.
+        try:
+            _reg_seen = getattr(self, '_req_reg_chats', None)
+            if not isinstance(_reg_seen, set):
+                _reg_seen = self._req_reg_chats = set()
+            _cid_reg = int(chat_id)
+            if _cid_reg and _cid_reg not in _reg_seen:
+                _gc_t = ''
+                try:
+                    _gc_obj = getattr(event, 'chat', None)
+                    _gc_t = str(getattr(_gc_obj, 'title', '') or '')
+                except Exception:
+                    pass
+                _is_new_chat = await self.prod_db.add_monitored_chat(
+                    chat_id=_cid_reg, chat_title=_gc_t, username='',
+                    link_type='group', monitored_by=str(source_phone or ''))
+                _reg_seen.add(_cid_reg)
+                if len(_reg_seen) > 20000:
+                    self._req_reg_chats = set(list(_reg_seen)[-10000:])
+                if _is_new_chat:
+                    logging.info(
+                        f"[MONITORED] ✅ New chat via request path: "
+                        f"'{_gc_t[:40]}' (id={chat_id}, by={source_phone})")
+        except Exception as _reg_e:
+            logging.debug(f"[MONITORED] request-path reg error: {_reg_e}")
+
         # === [REQUEST-FILTER v2] Kill Switch + Filter + Guards ===
         # مسار الروابط أسفلها يكمّل عمله بلا أي تأثير من هذا القسم إطلاقًا.
         #
@@ -7385,6 +7822,34 @@ class Monitor:
                 f"(skipped chat_id={chat_id} msg_id={msg_id}). Link path unaffected."
             )
             return
+
+        # === [IGNORE-BY-REPLY-v4.4.17] مرسل/نص مُتجاهَل بأمر الرد ===
+        # فحص مبكر تزامني (sender_id من الحدث + username من الكيان المخبّأ
+        # + بصمتا النص) — قبل البذرة وقبل الفلترة: توفير كامل للمعالجة.
+        # يعمل حتى لو كان المرسل بلا يوزر (المفتاح الرقمي sender_id)
+        # — طلب المُشغّل 2026-11-20 حرفيًا.
+        _ig_store = getattr(self, 'ignore_store', None)
+        if _ig_store is not None:
+            try:
+                _ig_sid = int(getattr(event, 'sender_id', 0) or 0)
+                _ig_un = _sender_username_normalized(
+                    getattr(event, 'sender', None))
+                _ig_hit, _ig_why = _ig_store.is_ignored(
+                    _ig_sid, _ig_un, raw_text)
+                if _ig_hit:
+                    logging.info(
+                        f"[REQUEST-PATH] REJECT reason=ignored_by_command "
+                        f"({_ig_why}) chat_id={chat_id} msg_id={msg_id}"
+                    )
+                    try:
+                        await self.metrics.record_skip(
+                            'request_ignored_by_command')
+                    except Exception:
+                        pass
+                    return
+            except Exception as _ig_e:
+                logging.debug(
+                    f"[IGNORE] early check error (non-fatal): {_ig_e}")
 
         # === [SENDER-BLOCK-v4.4.10] فحص مبكر تزامني — مرسل محظور ===
         # الكيان المخبأ (event.sender) قد يحمل username بالفعل بلا أي API:
@@ -7623,7 +8088,10 @@ class Monitor:
                 if _min_ent is not None else None
         except Exception:
             _min_un = None
-        if sender_id > 0 and not _min_un:
+        # [MENTION-BRIDGE-KILL] البذرة متوقفة افتراضيًا — لا تُنشأ أصلًا
+        if (sender_id > 0 and not _min_un
+                and getattr(getattr(self, 'config', None),
+                            'mention_bridge_enabled', False)):
             _seed_fn_p = getattr(self, '_mention_bridge_seed', None)
             if callable(_seed_fn_p):
                 try:
@@ -7748,6 +8216,29 @@ class Monitor:
                 pass
             await _abort_after_seeds('sender-blocked')
             return
+
+        # [IGNORE-BY-REPLY] الفحص الحاسم بعد حلّ المرسل عبر API — يلتقط
+        # username ظهر فقط في الكيان الكامل (المبكر قرأ الكيان المخبّأ).
+        _ig_store2 = getattr(self, 'ignore_store', None)
+        if _ig_store2 is not None:
+            try:
+                _ig_hit2, _ig_why2 = _ig_store2.is_ignored(
+                    int(sender_id or 0), _uname_norm, raw_text)
+                if _ig_hit2:
+                    logging.info(
+                        f"[REQUEST-PATH] REJECT reason=ignored_by_command "
+                        f"({_ig_why2}) chat_id={chat_id} msg_id={msg_id}"
+                    )
+                    try:
+                        await self.metrics.record_skip(
+                            'request_ignored_by_command')
+                    except Exception:
+                        pass
+                    await _abort_after_seeds('ignored-by-command')
+                    return
+            except Exception as _ig_e2:
+                logging.debug(
+                    f"[IGNORE] decisive check error (non-fatal): {_ig_e2}")
 
         # (2) كبح التكرار — بصمة (المُرسل × النص) خلال 12 ساعة
         _sender_key = _uname_norm or (
@@ -7977,6 +8468,17 @@ class Monitor:
                           "قد لا يستجيب للضغط (قيد تلغرام على رسائل "
                           "البوتات)</i>")
 
+        # [IGNORE-BY-REPLY] ميتا التنبيه — يُخزّن في السجل لتخدم أمر
+        # التجاهل بالرد (تجاهل المرسل/الرسالة) دون أي نداء API إضافي.
+        _alert_meta = {
+            'sender_id': int(sender_id or 0),
+            'sender_username': _uname_clean or '',
+            'sender_name': str(sender_display or '')[:80],
+            'chat_id': int(chat_id),
+            'msg_id': int(msg_id),
+            'raw_text': str(raw_text or '')[:2000],
+        }
+
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
         # getattr يُرجع None → نتخطّى الإرسال بصمت بدل AttributeError.
@@ -8017,12 +8519,13 @@ class Monitor:
             _post_send_fn = getattr(self, '_relay_and_register_request_alert', None)
             if callable(_post_send_fn):
                 await _post_send_fn(target, _bridge, sent_alert,
-                                    chat_id, msg_id, alert, dm_buttons)
+                                    chat_id, msg_id, alert, dm_buttons,
+                                    sender_meta=_alert_meta)
             else:
                 _reg_alert_fn = getattr(self, '_register_request_alert', None)
                 if callable(_reg_alert_fn):
                     _reg_alert_fn(chat_id, msg_id, target, sent_alert,
-                                  alert, dm_buttons)
+                                  alert, dm_buttons, sender_meta=_alert_meta)
 
             # === [ENTITY-RESCUE] لا جسر ولا username (خسرنا سباق الحذف) ===
             # الكيان يظل حيًا بعد حذف الرسالة: حساب الالتقاط (رأى الطالب
@@ -8067,7 +8570,8 @@ class Monitor:
                             self, '_relay_and_register_request_alert', None)
                         if callable(_psf):
                             await _psf(target, _bridge, sent_alert,
-                                       chat_id, msg_id, alert, dm_buttons)
+                                       chat_id, msg_id, alert, dm_buttons,
+                                       sender_meta=_alert_meta)
 
             # === [FAST-REQUEST] ترقية username بعد الإرسال ===
             # بذرة بلا يوزر وقت الإرسال (dm=text_mention): كيان الطالب
@@ -8120,12 +8624,13 @@ class Monitor:
                 _post_send_fn2 = getattr(self, '_relay_and_register_request_alert', None)
                 if callable(_post_send_fn2):
                     await _post_send_fn2(target, _bridge, sent_alert,
-                                         chat_id, msg_id, alert, dm_buttons)
+                                         chat_id, msg_id, alert, dm_buttons,
+                                         sender_meta=_alert_meta)
                 else:
                     _reg_alert_fn2 = getattr(self, '_register_request_alert', None)
                     if callable(_reg_alert_fn2):
                         _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
-                                       alert, dm_buttons)
+                                       alert, dm_buttons, sender_meta=_alert_meta)
                 # [PENDING-DELETE] نفس فحص ما بعد الإرسال (إعادة FloodWait:
                 # الحذف يصل غالبًا خلال انتظار الفلو — التسجيل تم للتو)
                 try:
@@ -8196,8 +8701,14 @@ class Monitor:
         """[MENTION-BRIDGE-v4.4.7] يوجّه الرسالة الأصلية من حساب الالتقاط
         إلى خاص البوت — يزرع كيان المُرسِل لدى البوت ويحفظ نسخة تنجو من
         حذف الأصل. يعيد {'seed_msg_id', 'cap_user_id', 'done': False}
-        أو None (غير قاتل)."""
+        أو None (غير قاتل).
+        [MENTION-BRIDGE-KILL 2026-11-20] متوقف افتراضيًا — تشخيص إنتاجي:
+        معرفات البذور العائدة من Telethon لا تطابق معرفات Bot API
+        → التوجيل اللاحق ينشر رسائل خاطئة من خاص البوت داخل القناة."""
         try:
+            if not getattr(getattr(self, 'config', None),
+                           'mention_bridge_enabled', False):
+                return None
             _sid = int(sender_id or 0)
             if _sid <= 0:
                 return None
@@ -8806,12 +9317,18 @@ class Monitor:
             logging.debug(f"[FAST-REQUEST] upgrade error (non-fatal): {_fu_e}")
 
     async def _relay_and_register_request_alert(self, target, bridge, sent_alert,
-                                                chat_id, msg_id, alert, dm_buttons):
+                                                chat_id, msg_id, alert, dm_buttons,
+                                                sender_meta=None):
         """[MENTION-BRIDGE-v4.4.7] بعد نجاح إرسال التنبيه: أعد توجيه نسخة
         الأصل إلى القناة (مسار التواصل المضمون) ثم سجّل التنبيه للتعليم
         عند حذف الأصل (مع حالة الجسر). يجمع الخطوتين ليعمل المساران
-        (الإرسال الأول + إعادة FloodWait) بنفس المنطق دون تكرار."""
-        if isinstance(bridge, dict):
+        (الإرسال الأول + إعادة FloodWait) بنفس المنطق دون تكرار.
+        [MENTION-BRIDGE-KILL 2026-11-20] التوجيل متوقف افتراضيًا (معرفات
+        بذور غير مطابقة → نشر رسائل خاطئة بالقناة) — التسجيل يستمر.
+        [IGNORE-BY-REPLY] sender_meta يُخزّن في السجل لأمر التجاهل بالرد."""
+        _bridge_on = bool(getattr(getattr(self, 'config', None),
+                                  'mention_bridge_enabled', False))
+        if isinstance(bridge, dict) and _bridge_on:
             try:
                 bridge['done'] = await self._mention_bridge_relay(
                     target, bridge.get('seed_msg_id'),
@@ -8822,16 +9339,19 @@ class Monitor:
             _reg_fn = getattr(self, '_register_request_alert', None)
             if callable(_reg_fn):
                 _reg_fn(chat_id, msg_id, target, sent_alert, alert,
-                        dm_buttons, relay=bridge)
+                        dm_buttons, relay=bridge, sender_meta=sender_meta)
         except Exception:
             pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
 
     def _register_request_alert(self, chat_id, msg_id, target, sent_alert,
-                                alert_html, dm_buttons, relay=None):
+                                alert_html, dm_buttons, relay=None,
+                                sender_meta=None):
         """يسجّل تنبيه طلب مُرسَلًا: (chat_id, msg_id) → معرّف رسالة
         التنبيه في قناة الطلبات، لكي يُعلّم لاحقًا عند حذف الأصل.
         [MENTION-BRIDGE-v4.4.7] يحفظ كذلك حالة جسر التوجيه (نسخة الأصل
         في خاص البوت) لإعادة المحاولة عند الحذف لو فشلت أول مرة.
+        [IGNORE-BY-REPLY-v4.4.17] يحفظ ميتا المرسل/النص (sender_meta)
+        لتخدم أمر التجاهل بالرد بلا نداء API.
         غير قاتل تمامًا: أي فشل يُهمل (التسجيل تحسيني — لا يمنع الإرسال)."""
         try:
             alert_id = getattr(sent_alert, 'id', None)
@@ -8863,6 +9383,9 @@ class Monitor:
                 'text': alert_html,
                 'buttons': dm_buttons,
                 'ts': now,
+                # [IGNORE-BY-REPLY-v4.4.17] ميتا التجاهل بالرد
+                'sender_meta': (dict(sender_meta)
+                                if isinstance(sender_meta, dict) else None),
                 # [MENTION-BRIDGE-v4.4.7] نسخة الأصل المُوجَّهة في خاص البوت
                 # (seed_msg_id + cap_user_id + done) — لإعادة المحاولة عند
                 # الحذف لو فشل التوجيل للقناة أول مرة.
@@ -8916,7 +9439,10 @@ class Monitor:
             _relay = entry.get('relay')
             _relay = _relay if isinstance(_relay, dict) else None
             _relay_done = bool(_relay and _relay.get('done'))
-            if _relay and not _relay_done:
+            # [MENTION-BRIDGE-KILL] التوجيل متوقف — لا إعادة محاولة.
+            if (_relay and not _relay_done
+                    and getattr(getattr(self, 'config', None),
+                                'mention_bridge_enabled', False)):
                 try:
                     _relay_done = await self._mention_bridge_relay(
                         entry.get('target'),
@@ -9980,6 +10506,17 @@ class Monitor:
             if not text:
                 return
 
+            # === [IGNORE-BY-REPLY-v4.4.17] مسار الأعضاء في الخاص ===
+            # وجّه تنبيه القناة إلى البوت ثم أرسل «تجاهل المرسل/الرسالة»
+            # (أو رد على التوجيه) — يجب أن يسبق حجب التحويلات أدناه لأن
+            # توجيه التنبيه نفسه رسالة مُحوَّلة.
+            try:
+                if await self._handle_private_ignore(event, text):
+                    return
+            except Exception as _pig_e:
+                logging.debug(
+                    f"[IGNORE] private path error (non-fatal): {_pig_e}")
+
             # [v4.3.8] تجاهل الرسائل المُحوَّلة بصمت — لا قائمة ترحيب:
             # التحويلات ليست مستخدمًا بشريًا يكتب للبوت (سابقًا كان جسر
             # التواصل يمرّر الرسائل هنا فيردّ البوت بقائمة الأوامر داخل
@@ -10074,6 +10611,7 @@ class Monitor:
                     '/pending_approvals',
                     '/gate_status', '/gate_allow', '/gate_remove',
                     '/gate_refresh_link',
+                    '/ignore_list', '/ignore_remove',
                 ]
 
                 if cmd in admin_commands:
@@ -10442,6 +10980,356 @@ class Monitor:
                 else:
                     await event.reply(f"❌ خطأ: {e}\n\nأعد بـ /login")
 
+    # ==================================================================
+    # [IGNORE-BY-REPLY-v4.4.17] نظام التجاهل بالرد — طلب المُشغّل 2026-11-20
+    # ==================================================================
+    # «ارد على الرسالة انا او احد الاعضاء وقال تجاهل الرساله يتم تجاهل
+    #  الرساله في المرات القادمة واذا قال تجاهل المرسل يتم تجاهل الرسل
+    #  في المرات القادمة حتى لو كان الطلب حقيقي ... حتى ولو كان ما عنده
+    #  يوزر». مساران: (أ) رد في القناة على التنبيه، (ب) توجيه التنبيه
+    #  إلى خاص البوت ثم الرد عليه — يشمل الأعضاء بلا حق النشر بالقناة.
+
+    _AR_DIAC_RE = re.compile(r'[\u064B-\u065F\u0670\u0640]')
+
+    @classmethod
+    def _ignore_normalize(cls, text: str) -> str:
+        """تطبيع عربي خفيف لأوامر التجاهل: حذف التشكيل/التطويل + توحيد
+        الهمزات + تاء مربوطة → هاء («الرسالة» = «الرساله»)."""
+        try:
+            t = cls._AR_DIAC_RE.sub('', str(text or ''))
+            t = re.sub(r'[أإآ]', 'ا', t)
+            t = t.replace('ة', 'ه')
+            return t
+        except Exception:
+            return str(text or '')
+
+    def _ignore_kind_from_text(self, text: str):
+        """'sender' | 'message' | None من نص أمر التجاهل (متسامح
+        إملائيًا: تجاهل المرسل / تجاهل الرسالة/الرساله)."""
+        try:
+            _n = self._ignore_normalize(text)
+            if 'تجاهل المرسل' in _n:
+                return 'sender'
+            if 'تجاهل الرساله' in _n or 'تجاهل الرسال' in _n:
+                return 'message'
+        except Exception:
+            pass
+        return None
+
+    async def _on_channel_ignore_reply(self, event):
+        """[IGNORE-BY-REPLY] رد على تنبيه طلب في قناة الطلبات بـ«تجاهل
+        الرسالة» أو «تجاهل المرسل». يعمل من المالك ومن أي عضو يملك حق
+        الرد في القناة (البوابة تضمن أن الأعضاء مشتركون). غير قاتل."""
+        try:
+            if not getattr(self.config, 'ignore_store_enabled', True):
+                return
+            _text = (event.raw_text or '').strip()
+            if not _text or 'تجاهل' not in _text:
+                return
+            if _text.startswith('/'):
+                return  # أوامر إدارية — ليست أوامر تجاهل
+            _kind = self._ignore_kind_from_text(_text)
+            if _kind is None:
+                return
+            if not getattr(event, 'is_reply', False):
+                return
+            _alert_id = getattr(event, 'reply_to_msg_id', None) \
+                or getattr(getattr(event, 'message', None),
+                           'reply_to_msg_id', None)
+            if not _alert_id:
+                return
+            await self._apply_ignore_command(
+                event, _kind, int(_alert_id),
+                alert_chat=getattr(event, 'chat_id', None))
+        except Exception as _ig_e:
+            logging.error(f"[IGNORE] channel reply handler error: {_ig_e}")
+
+    def _lookup_alert_meta(self, alert_id: int):
+        """[IGNORE-BY-REPLY] ميتا تنبيه مسجل من الذاكرة (بمعرف رسالة
+        القناة) — أسرع مسار (بلا API). يعيد dict أو None."""
+        try:
+            reg = getattr(self, '_request_alerts', None)
+            if not isinstance(reg, dict) or not reg:
+                return None
+            _aid = int(alert_id)
+            for (_ck, _mk), _e in reg.items():
+                if (isinstance(_e, dict)
+                        and int(_e.get('alert_id') or 0) == _aid):
+                    _meta = dict(_e.get('sender_meta') or {})
+                    _meta.setdefault('chat_id', _ck)
+                    _meta.setdefault('msg_id', _mk)
+                    if not _meta.get('raw_text'):
+                        # تسجيل قديم (قبل v4.4.17) — استخرج من HTML
+                        _meta['raw_text'] = self._alert_text_from_html(
+                            _e.get('text') or '')
+                    return _meta
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _alert_text_from_html(alert_html: str) -> str:
+        """استخراج نص الطلب من HTML التنبيه (fallback للتنبيهات المسجلة
+        قبل v4.4.17 — raw_text لم يكن يُخزَّن في السجل)."""
+        try:
+            import html as _htmlmod
+            m = re.search(r'<blockquote[^>]*>(.*?)</blockquote>',
+                          str(alert_html or ''), re.S | re.I)
+            if not m:
+                return ''
+            _t = m.group(1)
+            _t = re.sub(r'<br\s*/?>', '\n', _t, flags=re.I)
+            _t = re.sub(r'<[^>]+>', '', _t)
+            return _htmlmod.unescape(_t).strip()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _alert_text_from_plain(plain: str) -> str:
+        """استخراج نص الطلب من النص الخام لرسالة تنبيه (بين سطر
+        «نص الطلب:» و«عرض الرسالة الأصلية»)."""
+        try:
+            _t = str(plain or '')
+            _i = _t.find('نص الطلب:')
+            if _i < 0:
+                _i = _t.find('نص الطلب')
+                if _i < 0:
+                    return ''
+                _i += len('نص الطلب')
+            else:
+                _i += len('نص الطلب:')
+            _t = _t[_i:]
+            for _cut in ('عرض الرسالة', '🔗', '💡'):
+                _j = _t.find(_cut)
+                if _j >= 0:
+                    _t = _t[:_j]
+            return _t.strip().strip('\n').strip()
+        except Exception:
+            return ''
+
+    async def _fetch_alert_meta(self, alert_id: int, alert_chat):
+        """[IGNORE-BY-REPLY] اجلب ميتا التنبيه من رسالة القناة نفسها
+        (بعد إعادة تشغيل مسحت السجل): زر cbc يحمل chat_id+sender_id
+        (المفتاح الرقمي — يعمل بلا يوزر)، رأس التوجيل يحمل sender_id،
+        والنص يحمل نص الطلب. غير قاتل."""
+        _bot = getattr(self, 'bot_client', None)
+        if not _bot or not getattr(_bot, 'is_connected', lambda: False)():
+            return None
+        if not alert_chat:
+            return None
+        try:
+            _msgs = await asyncio.wait_for(
+                _bot.get_messages(alert_chat, ids=int(alert_id)), timeout=8)
+            _m = _msgs[0] if isinstance(_msgs, list) and _msgs else _msgs
+            if _m is None or getattr(_m, 'id', None) is None:
+                return None
+            meta = {'chat_id': 0, 'msg_id': 0, 'sender_id': 0,
+                    'sender_username': '', 'sender_name': '',
+                    'raw_text': ''}
+            # (1) زر 🔴 تواصل — cbc:<chat_id>:<sender_id>:<source_phone>
+            try:
+                for _row in (_m.buttons or []):
+                    for _b in _row:
+                        _d = getattr(_b, 'data', None)
+                        if (isinstance(_d, (bytes, bytearray))
+                                and bytes(_d).startswith(b'cbc:')):
+                            _parts = bytes(_d).decode(
+                                'utf-8', 'replace').split(':')
+                            if len(_parts) >= 3:
+                                meta['chat_id'] = int(_parts[1])
+                                meta['sender_id'] = int(_parts[2])
+            except Exception:
+                pass
+            # (2) رأس التوجيل (تنبيهات/توجيهات بلا أزرار): المرسل الأصلي
+            try:
+                _f = getattr(_m, 'forward', None)
+                if _f is not None and not meta['sender_id']:
+                    _fsid = int(getattr(_f, 'sender_id', 0) or 0)
+                    if not _fsid:
+                        _fi = getattr(_f, 'from_id', None)
+                        _fsid = int(getattr(_fi, 'user_id', 0) or 0)
+                    if _fsid > 0:
+                        meta['sender_id'] = _fsid
+            except Exception:
+                pass
+            # (3) النص الخام: اسم المرسل + username + نص الطلب
+            _raw = getattr(_m, 'raw_text', '') or ''
+            if _raw:
+                try:
+                    _nm = re.search(r'المرسل:?\s*([^\n]+)', _raw)
+                    if _nm:
+                        _nline = _nm.group(1).strip()
+                        _un = re.search(r'\(@([A-Za-z0-9_]{4,})\)', _nline)
+                        if _un:
+                            meta['sender_username'] = _un.group(1)
+                            _nline = re.sub(
+                                r'\s*\(@[A-Za-z0-9_]+\)', '', _nline)
+                        if not meta['sender_name']:
+                            meta['sender_name'] = _nline[:60]
+                except Exception:
+                    pass
+                meta['raw_text'] = self._alert_text_from_plain(_raw)
+            return meta if (meta['sender_id'] or meta['raw_text']) else None
+        except Exception:
+            return None
+
+    async def _apply_ignore_command(self, event, kind: str, alert_id: int,
+                                    alert_chat=None):
+        """نفّذ أمر التجاهل على تنبيه: ميتا (ذاكرة → رسالة القناة) ثم
+        كتابة دائمة في Supabase + رد تأكيد. غير قاتل في كل طبقة."""
+        _ig = getattr(self, 'ignore_store', None)
+        if _ig is None:
+            try:
+                await event.reply("⚠️ نظام التجاهل غير مهيأ.")
+            except Exception:
+                pass
+            return
+        _by = int(getattr(event, 'sender_id', 0) or 0)
+        meta = self._lookup_alert_meta(alert_id)
+        if meta is None:
+            meta = await self._fetch_alert_meta(alert_id, alert_chat)
+        if meta is None:
+            try:
+                await event.reply(
+                    "⚠️ لم أجد التنبيه الأصلي — جرّب الرد على رسالة التنبيه "
+                    "نفسها (التي فيها «نص الطلب»).")
+            except Exception:
+                pass
+            return
+        if kind == 'sender':
+            _sid = int(meta.get('sender_id') or 0)
+            if _sid <= 0:
+                try:
+                    await event.reply(
+                        "⚠️ لا يمكن تحديد المُرسِل من هذا التنبيه "
+                        "(مرسل مجهول/قناة) — لا تجاهل ممكن.")
+                except Exception:
+                    pass
+                return
+            _ok = await _ig.add_sender(
+                _sid, meta.get('sender_username') or '',
+                meta.get('sender_name') or '', by=_by)
+            _label = (meta.get('sender_name')
+                      or (f"@{meta.get('sender_username')}"
+                          if meta.get('sender_username') else '')
+                      or str(_sid))
+            try:
+                await event.reply(
+                    f"🔇 تم تجاهل المُرسِل: {_label} (id={_sid})\n"
+                    f"لن تصل طلباته مستقبلاً حتى لو بدت حقيقية."
+                    + ("" if _ok else
+                       "\n⚠️ حُفظ مؤقتًا (تعذّر الوصول للمخزن الدائم)"))
+            except Exception:
+                pass
+            logging.info(
+                f"[IGNORE] sender ignored uid={_sid} by={_by} "
+                f"alert_id={alert_id} stored={_ok}")
+        else:
+            _txt = str(meta.get('raw_text') or '')
+            if not _txt:
+                try:
+                    await event.reply(
+                        "⚠️ لم أستطع استخراج نص الطلب من التنبيه.")
+                except Exception:
+                    pass
+                return
+            _ok = await _ig.add_message(_txt, by=_by)
+            try:
+                await event.reply(
+                    "🔇 تم تجاهل هذه الرسالة — لن تُرسل مجددًا "
+                    "(نفس النص أو نفس الكلمات بأي صياغة)."
+                    + ("" if _ok else
+                       "\n⚠️ حُفظ مؤقتًا (تعذّر الوصول للمخزن الدائم)"))
+            except Exception:
+                pass
+            logging.info(
+                f"[IGNORE] message ignored by={_by} alert_id={alert_id} "
+                f"len={len(_txt)} stored={_ok}")
+
+    async def _handle_private_ignore(self, event, text: str) -> bool:
+        """[IGNORE-BY-REPLY] مسار الأعضاء عبر الخاص (2026-11-20): وجّه
+        تنبيه القناة إلى خاص البوت ثم (أ) رد على التوجيه أو (ب) أرسل
+        الأمر مباشرة بعد التوجيه. يعيد True لو عولجت الرسالة (لا تكمل
+        لمسار /start العام)."""
+        if not getattr(self.config, 'ignore_store_enabled', True):
+            return False
+        _txt = str(text or '').strip()
+        if not _txt:
+            return False
+        _msg = getattr(event, 'message', None)
+        _rtc = getattr(self.config, 'requests_target_channel', 0)
+        if isinstance(_rtc, str) and not str(_rtc).startswith('-'):
+            _rtc = getattr(self, '_requests_channel_resolved_id', 0) or 0
+        try:
+            _rtc = int(_rtc or 0)
+        except (TypeError, ValueError):
+            _rtc = 0
+        # (أ) توجيه تنبيه من القناة → خزّن سياقًا وأرشد
+        try:
+            _f = getattr(_msg, 'forward', None)
+            _f_chat = int(getattr(_f, 'chat_id', 0) or 0)
+            _f_mid = int(getattr(_f, 'channel_post', 0) or 0)
+            if _f is not None and _f_chat and _rtc \
+                    and _f_chat == _rtc and _f_mid:
+                _pend = getattr(self, '_ignore_pending', None)
+                if not isinstance(_pend, dict):
+                    _pend = self._ignore_pending = {}
+                _pend[int(getattr(event, 'sender_id', 0) or 0)] = {
+                    'alert_id': _f_mid, 'ts': time.time(),
+                    'chat': _f_chat}
+                try:
+                    await event.reply(
+                        "✅ وصل التنبيه. أرسل الآن:\n"
+                        "• تجاهل المرسل — لتجاهل كل طلباته مستقبلًا\n"
+                        "• تجاهل الرسالة — لتجاهل هذا النص مستقبلًا\n"
+                        "(أو رد على التوجيه بالأمر نفسه)")
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        # (ب) أمر تجاهل في الخاص
+        if _txt.startswith('/') or 'تجاهل' not in _txt:
+            return False
+        _kind = self._ignore_kind_from_text(_txt)
+        if _kind is None:
+            return False
+        _uid = int(getattr(event, 'sender_id', 0) or 0)
+        # رد على توجيه سابق؟
+        _alert_id = 0
+        _alert_chat = _rtc
+        try:
+            if getattr(event, 'is_reply', False):
+                _rm = await event.get_reply_message()
+                if _rm is not None:
+                    _rf = getattr(_rm, 'forward', None)
+                    _rf_chat = int(getattr(_rf, 'chat_id', 0) or 0)
+                    _rf_mid = int(getattr(_rf, 'channel_post', 0) or 0)
+                    if _rf is not None and _rf_chat == _rtc and _rf_mid:
+                        _alert_id = _rf_mid
+        except Exception:
+            _alert_id = 0
+        if not _alert_id:
+            _pend = getattr(self, '_ignore_pending', None)
+            if isinstance(_pend, dict):
+                _ctx = _pend.get(_uid)
+                if _ctx and (time.time() - float(
+                        _ctx.get('ts', 0))) < 900:
+                    _alert_id = int(_ctx.get('alert_id') or 0)
+                    _alert_chat = _ctx.get('chat') or _rtc
+                    _pend.pop(_uid, None)
+        if not _alert_id:
+            try:
+                await event.reply(
+                    "⚠️ وجّه تنبيه الطلب من القناة إليّ أولًا، ثم أرسل:\n"
+                    "• تجاهل المرسل\n• تجاهل الرسالة")
+            except Exception:
+                pass
+            return True
+        await self._apply_ignore_command(
+            event, _kind, _alert_id, alert_chat=_alert_chat)
+        return True
+
     async def _on_command(self, event):
         try:
             text = (event.message.text or "").strip()
@@ -10524,6 +11412,37 @@ class Monitor:
                 else:
                     _link = await _g.refresh_link()
                     await reply(f"🔗 الرابط المحمي الجديد:\n{_link}")
+
+            elif cmd == "/ignore_list":
+                # [IGNORE-BY-REPLY] قائمة التجاهل — المالك فقط
+                _ig = getattr(self, 'ignore_store', None)
+                await reply(_ig.status_text() if _ig
+                            else "⚠️ نظام التجاهل غير مهيأ.")
+
+            elif cmd == "/ignore_remove":
+                # [IGNORE-BY-REPLY] إلغاء تجاهل — المالك فقط
+                # /ignore_remove sender <user_id> | /ignore_remove msg <بادئة>
+                _ig = getattr(self, 'ignore_store', None)
+                if _ig is None:
+                    await reply("⚠️ نظام التجاهل غير مهيأ.")
+                elif len(parts) < 3 or parts[1] not in ("sender", "msg"):
+                    await reply(
+                        "ℹ️ الاستخدام:\n"
+                        "/ignore_remove sender <user_id>\n"
+                        "/ignore_remove msg <بادئة البصمة من /ignore_list>")
+                elif parts[1] == "sender":
+                    if not parts[2].isdigit():
+                        await reply("ℹ️ user_id يجب أن يكون رقمًا.")
+                    else:
+                        _ok = await _ig.remove_sender(int(parts[2]))
+                        await reply(
+                            ("✅ أُلغي تجاهل المرسل " if _ok
+                             else "⚠️ أُلغي محليًا ") + parts[2])
+                else:
+                    _n = await _ig.remove_message(parts[2])
+                    await reply(
+                        (f"✅ أُلغي تجاهل {_n} رسالة" if _n
+                         else "⚠️ لا مطابقة لهذه البادئة"))
 
             elif cmd == "/status":
                 # === تقرير حالة شامل ===
@@ -14320,6 +15239,15 @@ class Monitor:
         except Exception as _gate_e:
             logging.error(f"[CHANNEL-GATE] start failed (non-fatal): {_gate_e}")
 
+        # === [IGNORE-BY-REPLY-v4.4.17] مخزن التجاهل بأمر الرد ===
+        # تجاهل الرسالة/تجاهل المرسل بالرد على التنبيه — دائم في Supabase.
+        # غير قاتل: أي فشل يُسجّل ولا يوقف بقية الأنظمة.
+        try:
+            self.ignore_store = IgnoreStore(self)
+            await self.ignore_store.start()
+        except Exception as _ig_e:
+            logging.error(f"[IGNORE-STORE] start failed (non-fatal): {_ig_e}")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -16679,6 +17607,23 @@ async def api_deploy_check_handler(request):
         report["issues"].append(
             "🚨 CHANNEL_GATE not armed — requests channel membership is NOT "
             "restricted to /login subscribers (operator order 2026-11-20)."
+        )
+
+    # 7.6 [IGNORE-BY-REPLY] نظام التجاهل بالرد — يجب أن يكون مفعّلًا
+    _igs = getattr(monitor, 'ignore_store', None)
+    report["ignore_store"] = {
+        "enabled": bool(_igs and _igs.enabled),
+        "durable": bool(_igs and _igs._http),
+        "ignored_senders": len(getattr(_igs, 'senders', {}) or {}),
+        "ignored_messages": len(getattr(_igs, 'msg_sigs', {}) or {}),
+        "mention_bridge": bool(getattr(
+            getattr(monitor, 'config', None), 'mention_bridge_enabled', False)),
+    }
+    if not (_igs and _igs.enabled):
+        report["issues"].append(
+            "🚨 IGNORE_STORE not enabled — reply-based ignore "
+            "(تجاهل الرسالة/تجاهل المرسل) is NOT active (operator order "
+            "2026-11-20)."
         )
 
     # 8. Final verdict
