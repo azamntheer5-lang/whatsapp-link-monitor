@@ -11083,7 +11083,7 @@ class Monitor:
             for _r in _readers[:4]:
                 try:
                     _msgs = await asyncio.wait_for(
-                        _r.get_messages(_target, limit=60), timeout=25)
+                        _r.get_messages(_target, limit=150), timeout=25)
                     break
                 except Exception as _ge:
                     logging.info(f"[ALERT-HEAL] قارئ فشل: {_ge}")
@@ -11128,11 +11128,53 @@ class Monitor:
                     _stuck += 1
                     _m = re.search(r'tg://user\?id=(\d+)', _html)
                     if not _m:
-                        _skipped += 1
+                        # [CASE-A] تنبيه مكتمل (يوزر معروف وقت البناء — روابط
+                        # t.me تعمل) لكنه حمل ذيل «قيد التفعيل» الكاذب من
+                        # عهد خلل BTN-URL (Telethon 1.46): علامة الحذف لم
+                        # تكتشف زر «مراسلة» فكتبت الوعد الميت. الروابط سليمة
+                        # — نصحح الذيل/التلميح الكاذب فقط.
+                        _um = re.search(
+                            r'https://t\.me/([A-Za-z0-9_]{4,})', _html)
+                        _uname_a = _um.group(1) if _um else ''
+                        _new_a = _html.replace(
+                            _REQ_DELTAIL_PENDING,
+                            "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
+                            "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
+                            "في سطر «المرسل» أعلاه.")
+                        if _uname_a:
+                            _new_a = _new_a.replace(
+                                _REQ_HINT_ACTIVATING,
+                                f"للتواصل: زر «مراسلة» أدناه أو @{_uname_a} "
+                                f"في سطر المُرسِل")
+                        else:
+                            _new_a = _new_a.replace(
+                                _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
+                        if _new_a == _html:
+                            _skipped += 1
+                            logging.info(
+                                f"[ALERT-HEAL] skip msg_id={_msg.id} — نمط "
+                                f"عالق بلا روابط ميتة ولا ذيل قابل للتصحيح")
+                            continue
+                        try:
+                            await _bot_client.edit_message(
+                                _target, _msg.id, _new_a,
+                                parse_mode='html', link_preview=False)
+                            _healed += 1
+                            logging.info(
+                                f"[ALERT-HEAL] ✅ healed(case-A) msg_id={_msg.id} "
+                                f"— ذيل كاذب صُحح")
+                            await asyncio.sleep(1.5)
+                        except Exception as _ea:
+                            _skipped += 1
+                            logging.info(
+                                f"[ALERT-HEAL] case-A edit failed "
+                                f"msg_id={_msg.id}: {_ea}")
                         continue
                     _sid = int(_m.group(1))
                     if _sid <= 0:
                         _skipped += 1
+                        logging.info(
+                            f"[ALERT-HEAL] skip msg_id={_msg.id} — ايدي غير صالح")
                         continue
                     # رقم الالتقاط من زر «اقتراح رد» (cbc:chat:sender:phone)
                     _pref = ''
