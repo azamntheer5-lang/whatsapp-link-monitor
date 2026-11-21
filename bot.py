@@ -11083,7 +11083,7 @@ class Monitor:
             for _r in _readers[:4]:
                 try:
                     _msgs = await asyncio.wait_for(
-                        _r.get_messages(_target, limit=150), timeout=25)
+                        _r.get_messages(_target, limit=200), timeout=25)
                     break
                 except Exception as _ge:
                     logging.info(f"[ALERT-HEAL] قارئ فشل: {_ge}")
@@ -11281,14 +11281,25 @@ class Monitor:
             logging.warning(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
 
     async def _delayed_alert_heal(self):
-        """[ALERT-HEAL v4.5.4] تأخير الكنس حتى اتصال حسابات الالتقاط."""
+        """[ALERT-HEAL v4.5.5] كنس دوري ذاتي الشفاء: أول دورة بعد 4 دقائق
+        (اتصال حسابات الالتقاط أولًا) ثم كل 30 دقيقة — أي تنبيه يعلق
+        بوعد «قيد التفعيل» (فشل ترقية، إعادة تشغيل، سباق خسره المسار)
+        يُشفى تلقائيًا خلال ≤30 دقيقة بلا تدخل."""
         try:
             await asyncio.sleep(240)
-            await self._alert_heal_sweep()
         except asyncio.CancelledError:
-            pass
-        except Exception as _dh:
-            logging.debug(f"[ALERT-HEAL] delayed sweep error: {_dh}")
+            return
+        while True:
+            try:
+                await self._alert_heal_sweep()
+            except asyncio.CancelledError:
+                return
+            except Exception as _dh:
+                logging.debug(f"[ALERT-HEAL] sweep cycle error: {_dh}")
+            try:
+                await asyncio.sleep(1800)
+            except asyncio.CancelledError:
+                return
 
     async def _entity_rescue_edit_alert(self, sent_alert, target, sender_id,
                                         sender_display, chat_id, msg_id,
