@@ -3633,24 +3633,27 @@ class ChannelGate:
                 f"enable 'join requests' in channel settings; L2-L5 still enforce")
 
     async def _validate_invite_link(self) -> bool:
-        """[INVITE-VALIDATE v4.5.1] هل الرابط المخزّن حي ومباشر؟
+        """[INVITE-VALIDATE v4.5.1→v4.5.2] هل الرابط المخزّن حي؟
         جذر بلاغ 2026-11-21 «زر افتح في تلجرام لا يدخل القناة ولايرد»:
         الرابط المخزّن مات (ملغي/قديم) فظل البوت يوزعه والضغط عليه لا
-        يفتح القناة لأحد. التحقق عبر getChatInviteLink (يعمل على روابط
-        أنشأها البوت نفسه): فشل/ملغى/من نوع موافقة → استبدال فوري."""
+        يفتح القناة لأحد.
+        [v4.5.2] كان التحقق عبر Bot API getChatInviteLink فتبين أنه يعيد
+        404 لكل روابط هذه القناة حتى الحية المُنشأة قبل لحظة (قصر Bot API
+        للقنوات) — فيستبدل الرابط مع كل إقلاع. البديل المجرب:
+        CheckChatInvite عبر MTProto (نفس مسار _prime_entity) — الرابط
+        الحي يعيد ChatInviteAlready/ChatInvite بلا استثناء، والميت يرفع
+        InviteHashExpired → استبدال فوري عند الحاجة فقط."""
         if not self.invite_link:
             return False
         try:
-            r = await self._tg_api(
-                "getChatInviteLink", chat_id=self.channel_marked,
-                invite_link=str(self.invite_link))
-            res = r.get("result") or {}
-            if r.get("ok") and not res.get("revoked") \
-                    and not res.get("creates_join_request"):
-                return True
-            self.warn("stored invite link dead/join-request — replacing")
+            from telethon.tl.functions.messages import CheckChatInviteRequest
+            _h = str(self.invite_link).split("+")[-1].split("/")[-1]
+            await self.monitor.bot_client(CheckChatInviteRequest(hash=_h))
+            return True
         except Exception as e:
-            self.warn(f"invite validate error: {type(e).__name__} {e}")
+            self.warn(
+                f"stored invite link dead "
+                f"({type(e).__name__}) — replacing")
         return False
 
     async def _ensure_invite_link(self):
