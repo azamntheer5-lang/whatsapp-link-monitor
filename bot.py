@@ -3632,43 +3632,24 @@ class ChannelGate:
                 f"toggleJoinRequest failed ({type(e).__name__}: {e}) — operator may "
                 f"enable 'join requests' in channel settings; L2-L5 still enforce")
 
-    async def _validate_invite_link(self) -> bool:
-        """[INVITE-VALIDATE v4.5.1→v4.5.2] هل الرابط المخزّن حي؟
-        جذر بلاغ 2026-11-21 «زر افتح في تلجرام لا يدخل القناة ولايرد»:
-        الرابط المخزّن مات (ملغي/قديم) فظل البوت يوزعه والضغط عليه لا
-        يفتح القناة لأحد.
-        [v4.5.2] كان التحقق عبر Bot API getChatInviteLink فتبين أنه يعيد
-        404 لكل روابط هذه القناة حتى الحية المُنشأة قبل لحظة (قصر Bot API
-        للقنوات) — فيستبدل الرابط مع كل إقلاع. البديل المجرب:
-        CheckChatInvite عبر MTProto (نفس مسار _prime_entity) — الرابط
-        الحي يعيد ChatInviteAlready/ChatInvite بلا استثناء، والميت يرفع
-        InviteHashExpired → استبدال فوري عند الحاجة فقط."""
-        if not self.invite_link:
-            return False
-        try:
-            from telethon.tl.functions.messages import CheckChatInviteRequest
-            _h = str(self.invite_link).split("+")[-1].split("/")[-1]
-            await self.monitor.bot_client(CheckChatInviteRequest(hash=_h))
-            return True
-        except Exception as e:
-            self.warn(
-                f"stored invite link dead "
-                f"({type(e).__name__}) — replacing")
-        return False
-
     async def _ensure_invite_link(self):
         """رابط دعوة مباشر (بلا موافقة) — مخزَّن في watchers (phone=gate:link).
-        [INVITE-VALIDATE v4.5.1] عند الإقلاع: الرابط المخزّن إن كان ميتًا
-        (ملغي) أو من نوع «يتطلب موافقة» يُستبدل فورًا برابط مباشر —
-        العضوية تصير فورية عبر جلسة المراقب نفسه (ImportChatInvite =
-        دخول مباشر)، والبوابة (L2 لحظي + L3-L5 مسح دوري) تطرد غير
-        المصرّح لهم، فلا اعتماد على حدث الموافقة الذي كان يعلّق
-        الانضمام إلى الأبد («ولايرد»)."""
-        if self.invite_link and await self._validate_invite_link():
+        [INVITE-VALIDATE v4.5.1→v4.5.3] العضوية فورية عبر جلسة المراقب
+        نفسه (ImportChatInvite = دخول مباشر)، والبوابة (L2 لحظي + L3-L5
+        مسح دوري) تطرد غير المصرّح لهم — لا اعتماد على حدث الموافقة
+        الذي كان يعلّق الانضمام إلى الأبد («ولايرد»).
+        [v4.5.3 TRUST-STORED] لا يوجد تحقق إقلاعي للرابط: getChatInviteLink
+        (Bot API) يعيد 404 لكل روابط هذه القناة حتى الحية، وCheckChatInvite
+        (MTProto) ممنوع على البوتات (BotMethodInvalidError — مثبت في سجل
+        إقلاع 02:16:45)؛ أي «تحقق» كان سيستبدل الرابط مع كل إقلاع بلا
+        داعٍ. البديل: الثقة بالمخزّن (ننشئه بلا انتهاء ولا نلغيه) +
+        اكتشاف ذاتي وقت الاستخدام — ImportChatInvite بجلسة المراقب يرفع
+        InviteHashExpired لو مات الرابط → refresh_link ينشئ بديلًا فورًا
+        ويُعاد بناء الاستجابة بالرابط الجديد (مسار موجود في
+        _join_channel_with منذ v4.4.x)."""
+        if self.invite_link:
             self.layer_health["invite_link"] = "loaded"
             return
-        if self.invite_link:
-            self.invite_link = ""
         try:
             r = await self._tg_api(
                 "createChatInviteLink", chat_id=self.channel_marked,
