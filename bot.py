@@ -11072,18 +11072,29 @@ class Monitor:
             _msgs = await asyncio.wait_for(
                 _bot_client.get_messages(_target, limit=60), timeout=25)
             _healed = 0
+            _stuck = 0
+            _skipped = 0
+            logging.info(
+                f"[ALERT-HEAL] sweep starting — target={_target} "
+                f"({len(_msgs or [])} recent messages)")
             for _msg in (_msgs or []):
                 if _healed >= 10:
                     break
                 try:
                     if _msg is None or not getattr(_msg, 'entities', None):
                         continue
-                    _html = _tl_html.unparse(_msg.text or '', _msg.entities)
+                    # [ALERT-HEAL-FIX v4.5.4b] raw_text وليس text: خاصية
+                    # text تُمرر عبر parse_mode للعميل (markdown افتراضيًا)
+                    # فتنحرف إزاحات الكيانات في unparse ويُفقد التطابق.
+                    _html = _tl_html.unparse(
+                        getattr(_msg, 'raw_text', '') or '', _msg.entities)
                     if (_REQ_DELTAIL_PENDING not in _html
                             and _REQ_HINT_ACTIVATING not in _html):
                         continue
+                    _stuck += 1
                     _m = re.search(r'tg://user\?id=(\d+)', _html)
                     if not _m:
+                        _skipped += 1
                         continue
                     _sid = int(_m.group(1))
                     if _sid <= 0:
@@ -11116,6 +11127,10 @@ class Monitor:
                     if _known is None:
                         if not await self._entity_transfer_via_capture(
                                 _sid, 'الطالب', prefer_phone=_pref):
+                            _skipped += 1
+                            logging.info(
+                                f"[ALERT-HEAL] planting failed msg_id={_msg.id} "
+                                f"sender={_sid} — skipped")
                             continue
                         try:
                             _known = await asyncio.wait_for(
@@ -11123,6 +11138,7 @@ class Monitor:
                         except Exception:
                             _known = None
                         if _known is None:
+                            _skipped += 1
                             continue
                     _uname = re.sub(
                         r'[^A-Za-z0-9_]', '',
@@ -11180,154 +11196,13 @@ class Monitor:
                         f"username={('@' + _uname) if _uname else 'none'}")
                     await asyncio.sleep(1.5)
                 except Exception as _hm:
-                    logging.debug(f"[ALERT-HEAL] skip msg: {_hm}")
-            if _healed:
-                logging.info(
-                    f"[ALERT-HEAL] sweep done — {_healed} alert(s) healed")
+                    _skipped += 1
+                    logging.info(f"[ALERT-HEAL] skip msg: {_hm}")
+            logging.info(
+                f"[ALERT-HEAL] sweep done — healed={_healed} stuck_found="
+                f"{_stuck} skipped={_skipped}")
         except Exception as _hsw:
-            logging.debug(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
-
-    async def _alert_heal_sweep(self):
-        """[ALERT-HEAL v4.5.4] إصلاح رجعي محدود: التنبيهات العالقة بوعد
-        ميت («جارٍ تفعيل الايدي والاسم للنقر خلال ثوانٍ» + روابط
-        tg://user?id ميتة) لا يرقّيها أحد بعد إعادة التشغيل — السجلات
-        في الذاكرة (_request_alerts/_marked) تُمسح مع العملية. بلاغ
-        المُشغّل 2026-11-21 («ليه الايدي ما ينضغط وش ابي انا من النسخ»):
-        هذا الكنس يفي بالوعد بعد الإقلاع — آخر 60 رسالة قناة، 10
-        تعديلات كحد أقصى، تباعد 1.5ث، رقم الالتقاط من زر «اقتراح رد»
-        نفسه (cbc:chat:sender:phone)، env: ALERT_HEAL_SWEEP_ENABLED."""
-        try:
-            if str(os.environ.get(
-                    'ALERT_HEAL_SWEEP_ENABLED', 'true')).strip().lower() \
-                    not in ('1', 'true', 'yes', 'on'):
-                return
-            _bot_client = getattr(self, 'bot_client', None)
-            if not _bot_client or not _bot_client.is_connected():
-                return
-            _target = (getattr(getattr(self, 'config', None),
-                               'requests_target_channel', None)
-                       or getattr(getattr(self, 'config', None),
-                                  'channel_id', None))
-            if not _target:
-                return
-            from telethon.extensions import html as _tl_html
-            _msgs = await asyncio.wait_for(
-                _bot_client.get_messages(_target, limit=60), timeout=25)
-            _healed = 0
-            for _msg in (_msgs or []):
-                if _healed >= 10:
-                    break
-                try:
-                    if _msg is None or not getattr(_msg, 'entities', None):
-                        continue
-                    _html = _tl_html.unparse(_msg.text or '', _msg.entities)
-                    if (_REQ_DELTAIL_PENDING not in _html
-                            and _REQ_HINT_ACTIVATING not in _html):
-                        continue
-                    _m = re.search(r'tg://user\?id=(\d+)', _html)
-                    if not _m:
-                        continue
-                    _sid = int(_m.group(1))
-                    if _sid <= 0:
-                        continue
-                    # رقم الالتقاط من زر «اقتراح رد» (cbc:chat:sender:phone)
-                    _pref = ''
-                    try:
-                        for _row in (_msg.buttons or []):
-                            for _b in (_row or []):
-                                _d = (getattr(_b, 'data', None)
-                                      or getattr(getattr(_b, 'type', None),
-                                                 'data', None) or b'')
-                                if isinstance(_d, bytes) and _d.startswith(b'cbc:'):
-                                    _parts = _d.decode('utf-8', 'replace').split(':')
-                                    if len(_parts) >= 4:
-                                        _pref = _parts[3]
-                                    break
-                            if _pref:
-                                break
-                    except Exception:
-                        _pref = ''
-                    # الكيان معروف للبوت مسبقًا؟ وإلا زرعه عبر حساب الالتقاط
-                    _uname = ''
-                    _known = None
-                    try:
-                        _known = await asyncio.wait_for(
-                            _bot_client.get_entity(_sid), timeout=4)
-                    except Exception:
-                        _known = None
-                    if _known is None:
-                        if not await self._entity_transfer_via_capture(
-                                _sid, 'الطالب', prefer_phone=_pref):
-                            continue
-                        try:
-                            _known = await asyncio.wait_for(
-                                _bot_client.get_entity(_sid), timeout=5)
-                        except Exception:
-                            _known = None
-                        if _known is None:
-                            continue
-                    _uname = re.sub(
-                        r'[^A-Za-z0-9_]', '',
-                        str(getattr(_known, 'username', '') or '').lstrip('@'))
-                    if len(_uname) < 4:
-                        _uname = ''
-                    _new = _html
-                    _btn_row = None
-                    if _uname:
-                        # رابط الايدي → t.me (قابل للنقر فورًا لدى الجميع)
-                        _new = _new.replace(
-                            f'<a href="tg://user?id={_sid}">'
-                            f'<code>{_sid}</code></a>',
-                            f'<a href="https://t.me/{_uname}">'
-                            f'<code>{_sid}</code></a>', 1)
-                        # سطر المرسل: أول ذكر بنفس الايدي → (يوزر) برابط t.me
-                        _m2 = re.search(
-                            r'<a href="tg://user\?id=' + str(_sid)
-                            + r'">(.*?)</a>', _new)
-                        if _m2:
-                            _new = _new.replace(
-                                _m2.group(0),
-                                f'{_m2.group(1)} '
-                                f'<a href="https://t.me/{_uname}">'
-                                f'(@{_uname})</a>', 1)
-                        _new = _new.replace(
-                            _REQ_HINT_ACTIVATING,
-                            f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
-                            f"في سطر المُرسِل")
-                        _new = _new.replace(
-                            _REQ_DELTAIL_PENDING,
-                            "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
-                            "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
-                            "في سطر «المرسل» أعلاه.")
-                        _btn_row = [Button.url(
-                            "✉️ مراسلة", f"https://t.me/{_uname}")]
-                    else:
-                        # بلا يوزر: إعادة تقييم الذكر بعد زرع الكيان → حي
-                        _new = _new.replace(
-                            _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
-                        _new = _new.replace(
-                            _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
-                    if _new == _html:
-                        continue
-                    _merged = self._merge_alert_buttons(
-                        [[_b for _b in _row] for _row in (_msg.buttons or [])],
-                        _btn_row)
-                    await _bot_client.edit_message(
-                        _target, _msg.id, _new,
-                        parse_mode='html', link_preview=False, buttons=_merged)
-                    _healed += 1
-                    logging.info(
-                        f"[ALERT-HEAL] ✅ healed msg_id={_msg.id} "
-                        f"sender={_sid} "
-                        f"username={('@' + _uname) if _uname else 'none'}")
-                    await asyncio.sleep(1.5)
-                except Exception as _hm:
-                    logging.debug(f"[ALERT-HEAL] skip msg: {_hm}")
-            if _healed:
-                logging.info(
-                    f"[ALERT-HEAL] sweep done — {_healed} alert(s) healed")
-        except Exception as _hsw:
-            logging.debug(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
+            logging.warning(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
 
     async def _delayed_alert_heal(self):
         """[ALERT-HEAL v4.5.4] تأخير الكنس حتى اتصال حسابات الالتقاط."""
