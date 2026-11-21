@@ -1152,8 +1152,12 @@ class Config:
         # كشف الطلبات الفائتة (توقيع الطلب القوي)، نشرها متأخرًا بسقف
         # مضبوط، وتقرير هضمي للمالك. الذاكرة فقط — لا تخزين رسائل في
         # Supabase إطلاقًا (أمر المُشغّل: لا احتفاظ بالرسائل).
+        # [AUDIT-KILL v4.5.1] أمر المُشغّل 2026-11-21: «جولة التدقيق
+        # احذفها نهائياً» — كانت تعيد نشر مرفوضات صحيحة (ثرثرة/عروض)
+        # كطلبات فتلوث القناة. الافتراضي الآن false ولا تُفعّل إلا بطلب
+        # صريح لاحق عبر AUDIT_ROUNDS_ENABLED=true.
         self.audit_rounds_enabled = os.getenv(
-            "AUDIT_ROUNDS_ENABLED", "true").strip().lower() in (
+            "AUDIT_ROUNDS_ENABLED", "false").strip().lower() in (
                 "1", "true", "yes", "on")
         try:
             self.audit_round_interval_s = int(os.getenv(
@@ -1163,7 +1167,7 @@ class Config:
         self.audit_round_interval_s = max(
             300, min(86400, self.audit_round_interval_s))
         self.audit_late_publish_enabled = os.getenv(
-            "AUDIT_LATE_PUBLISH_ENABLED", "true").strip().lower() in (
+            "AUDIT_LATE_PUBLISH_ENABLED", "false").strip().lower() in (
                 "1", "true", "yes", "on")
         try:
             self.audit_late_publish_max_per_round = int(os.getenv(
@@ -3628,25 +3632,53 @@ class ChannelGate:
                 f"toggleJoinRequest failed ({type(e).__name__}: {e}) — operator may "
                 f"enable 'join requests' in channel settings; L2-L5 still enforce")
 
+    async def _validate_invite_link(self) -> bool:
+        """[INVITE-VALIDATE v4.5.1] هل الرابط المخزّن حي ومباشر؟
+        جذر بلاغ 2026-11-21 «زر افتح في تلجرام لا يدخل القناة ولايرد»:
+        الرابط المخزّن مات (ملغي/قديم) فظل البوت يوزعه والضغط عليه لا
+        يفتح القناة لأحد. التحقق عبر getChatInviteLink (يعمل على روابط
+        أنشأها البوت نفسه): فشل/ملغى/من نوع موافقة → استبدال فوري."""
+        if not self.invite_link:
+            return False
+        try:
+            r = await self._tg_api(
+                "getChatInviteLink", chat_id=self.channel_marked,
+                invite_link=str(self.invite_link))
+            res = r.get("result") or {}
+            if r.get("ok") and not res.get("revoked") \
+                    and not res.get("creates_join_request"):
+                return True
+            self.warn("stored invite link dead/join-request — replacing")
+        except Exception as e:
+            self.warn(f"invite validate error: {type(e).__name__} {e}")
+        return False
+
     async def _ensure_invite_link(self):
-        """رابط دعوة بوضع موافقة — مخزَّن في watchers (phone=gate:link)
-        فلا يُنشأ رابط جديد مع كل إقلاع."""
-        if self.invite_link:
+        """رابط دعوة مباشر (بلا موافقة) — مخزَّن في watchers (phone=gate:link).
+        [INVITE-VALIDATE v4.5.1] عند الإقلاع: الرابط المخزّن إن كان ميتًا
+        (ملغي) أو من نوع «يتطلب موافقة» يُستبدل فورًا برابط مباشر —
+        العضوية تصير فورية عبر جلسة المراقب نفسه (ImportChatInvite =
+        دخول مباشر)، والبوابة (L2 لحظي + L3-L5 مسح دوري) تطرد غير
+        المصرّح لهم، فلا اعتماد على حدث الموافقة الذي كان يعلّق
+        الانضمام إلى الأبد («ولايرد»)."""
+        if self.invite_link and await self._validate_invite_link():
             self.layer_health["invite_link"] = "loaded"
             return
+        if self.invite_link:
+            self.invite_link = ""
         try:
             r = await self._tg_api(
                 "createChatInviteLink", chat_id=self.channel_marked,
-                creates_join_request=True, name="بوابة الطلبات")
+                creates_join_request=False, name="بوابة الطلبات")
             link = ((r.get("result") or {}).get("invite_link") or "")
             if link:
                 self.invite_link = link
                 self.layer_health["invite_link"] = "created"
-                self.log(f"gated invite link created: {link}")
+                self.log(f"direct invite link created: {link}")
                 await self._store_link_row(link)
                 await self.notify_owner(
-                    f"🔗 بوابة القناة مفعّلة — رابط الدخول المحمي "
-                    f"(الموافقة تلقائية للمشتركين فقط):\n{link}")
+                    f"🔗 بوابة القناة — رابط الدخول المباشر للمشتركين "
+                    f"(غير المشتركين تطردهم البوابة تلقائيًا):\n{link}")
         except Exception as e:
             self.layer_health["invite_link"] = f"failed: {type(e).__name__}"
             self.warn(f"createChatInviteLink failed: {e}")
@@ -4198,6 +4230,22 @@ class WebJoinManager:
                     _n = type(e).__name__
                     if 'UserAlreadyParticipant' in _n:
                         return True, 'already'
+                    if 'InviteRequestSent' in _n:
+                        # [INVITE-VALIDATE v4.5.1] رابط موافقة (قديم):
+                        # الطلب قُدّم فعلاً — ليس فشلًا. صادق عليه فورًا
+                        # (المشترك مُدرج في القائمة البيضاء قبل الانضمام)
+                        # بدل انتظار الحدث الذي قد لا يصل.
+                        try:
+                            _me = await client.get_me()
+                            if gate and int(getattr(_me, 'id', 0) or 0):
+                                await gate._tg_api(
+                                    'approveChatJoinRequest',
+                                    chat_id=gate.channel_marked,
+                                    user_id=int(_me.id))
+                                return True, 'requested+approved'
+                        except Exception:
+                            pass
+                        return True, 'requested'
                     if 'FloodWait' in _n:
                         return False, 'flood'
                     if 'InviteHashExpired' in _n:
@@ -4212,6 +4260,8 @@ class WebJoinManager:
                         except Exception as e2:
                             if 'UserAlreadyParticipant' in type(e2).__name__:
                                 return True, 'already'
+                            if 'InviteRequestSent' in type(e2).__name__:
+                                return True, 'requested'
                             return False, type(e2).__name__
                     return False, _n
             except Exception as e:
