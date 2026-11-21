@@ -5453,8 +5453,8 @@ class Monitor:
         return text, buttons
 
     async def _handle_red_contact(self, event, data, presser_id):
-        """[RED-CONTACT-v4.5.0] أمر المُشغّل — تطوير 2026-11-21:
-        زر «🔴 تواصل مع المرسل» أعلى تنبيه الطلب — المشرفون فقط.
+        """[RED-CONTACT-v4.5.0 → v4.5.4-FIX] أمر المُشغّل — تطوير 2026-11-21:
+        زر «🔴 اقتراح رد ✏️» أعلى تنبيه الطلب — المشرفون فقط.
         **السلوك الجديد (طلب المُشغّل): زر محادثة/اقتراح — الضغط لا
         يُرسل شيئًا مباشرة؛ يفتح في خاص المشرف مسودة نص مقترح، يعدّلها
         (كتابة حرة أو زر اقتراح جاهز) ثم يضغط «إرسال الآن» فقط.**
@@ -5466,11 +5466,26 @@ class Monitor:
           والبوت لا «يضل يحاول» أبدًا أثناء التقييد (أكبر خطر)."""
         try:
             # --- بوابة المشرفين فقط (طلب المُشغّل الحرفي) ---
+            # [RED-CONTACT-FIX v4.5.4] self.bot_token غير معرّف على كلاس
+            # Monitor (معرّف على Config/ChannelGate فقط) — البرهان الحي
+            # 2026-11-21 04:15:01Z: AttributeError('Monitor' object has no
+            # attribute 'bot_token') → البوابة فشلت fail-closed لكل
+            # المشرفين والزر لم يفتح المسودة أبدًا منذ v4.5.0 (بلاغ
+            # المُشغّل: «الزر اقتراح رد وتعديله مازال نفس السابق»).
+            # التوكن من config (نفس BOT_TOKEN) مع fallback لبوابة القناة.
+            _rc_token = (
+                str(getattr(getattr(self, 'config', None), 'bot_token', '')
+                    or '').strip()
+                or str(getattr(getattr(self, 'channel_gate', None),
+                               'bot_token', '') or '').strip()
+            )
             _allowed = False
             try:
+                if not _rc_token:
+                    raise RuntimeError("BOT_TOKEN unavailable on Monitor")
                 async with aiohttp.ClientSession() as _s:
                     async with _s.get(
-                        f"https://api.telegram.org/bot{self.bot_token}/getChatMember",
+                        f"https://api.telegram.org/bot{_rc_token}/getChatMember",
                         params={"chat_id": int(event.chat_id),
                                 "user_id": int(presser_id)},
                         timeout=aiohttp.ClientTimeout(total=10),
@@ -5751,7 +5766,7 @@ class Monitor:
             # فقط — البوابة داخل _handle_red_contact (fail-closed).
             if data == "cbh":
                 await event.answer(
-                    "🔴 زر المحادثة: يفتح لك مسودة اقتراح في خاص البوت — "
+                    "🔴 زر «اقتراح رد»: يفتح لك مسودة في خاص البوت — "
                     "عدّل النص كما تريد (أو اختر اقتراحًا جاهزًا) ثم اضغط "
                     "«إرسال الآن» ليُرسل من رقم المراقب الملتقط لخاص "
                     "صاحب الطلب. الاستخدام: للمشرفين فقط.", alert=True)
@@ -9556,7 +9571,11 @@ class Monitor:
             _rc_sid = int(sender_id or 0)
             if _rc_sid > 0:
                 _rc_cb = f"cbc:{int(chat_id)}:{_rc_sid}:{source_phone or ''}"
-                _rc_row = [[Button.inline("🔴 تواصل مع المرسل", _rc_cb.encode('utf-8')),
+                # [RED-CONTACT-v4.5.4] التسمية الجديدة بطلب المُشغّل
+                # («اقتراح رد وتعديله مازال نفس السابق زر احمر»):
+                # الزر يفتح مسودة قابلة للتعديل في خاص البوت — لا إرسال
+                # مباشر. يبقى أحمر (هوية الخطر الأصلية بطلب 2026-09-12).
+                _rc_row = [[Button.inline("🔴 اقتراح رد ✏️", _rc_cb.encode('utf-8')),
                             Button.inline("❓", b"cbh")]]
                 dm_buttons = (_rc_row + dm_buttons) if dm_buttons else _rc_row
         except Exception:
@@ -10695,7 +10714,7 @@ class Monitor:
             if _sid > 0 and entry.get('phone'):
                 _cb = f"cbc:{entry['chat_id']}:{_sid}:{entry.get('phone') or ''}"
                 _buttons = [[
-                    Button.inline("🔴 تواصل مع المرسل", _cb.encode('utf-8')),
+                    Button.inline("🔴 اقتراح رد ✏️", _cb.encode('utf-8')),
                     Button.inline("❓", b"cbh")]]
         except Exception:
             _buttons = None
@@ -10974,6 +10993,352 @@ class Monitor:
             logging.debug(f"[ENTITY-RESCUE] transfer failed (non-fatal): {_et_e}")
             return False
 
+    @staticmethod
+    def _btn_url(b) -> str:
+        """[BTN-URL-FIX v4.5.4] رابط زر URL من كائن زر Telethon — يعمل
+        مع التخطيطين: القديم KeyboardButtonUrl.url والتخطيط الجديد في
+        Telethon 1.46 (KeyboardInlineButton.type.url — InlineButtonTypeUrl).
+        فحص getattr(_b, 'url') وحده كان يرجع '' دائمًا على 1.46 فلا
+        يُكتشف زر «مراسلة» في الأزرار المخزنة."""
+        try:
+            _u = getattr(b, 'url', None)
+            if _u:
+                return str(_u)
+            _t = getattr(b, 'type', None)
+            if _t is not None:
+                _u2 = getattr(_t, 'url', None)
+                if _u2:
+                    return str(_u2)
+        except Exception:
+            pass
+        return ''
+
+    def _merge_alert_buttons(self, existing_rows, new_row):
+        """[ID-RACE-FIX v4.5.4] دمج صف زر جديد مع أزرار التنبيه الأصلية.
+
+        تعديل التنبيه بـ buttons=[[زر مراسلة]] فقط كان يمسح reply_markup
+        كاملًا → صف الزر الأحمر «🔴 اقتراح رد» يختفي من التنبيه بعد
+        الترقية. هذا الدمج يحفظ الصفوف الأصلية ويضيف الصف الجديد إن
+        لم يوجد مكانه (زر t.me بنفس الرابط).
+
+        new_row=None → إرجاع None: تعديلٌ بلا باراميتر أزرار — تلغرام
+        يبقي الأزرار الحالية كما هي (reply_markup علم اختياري)."""
+        try:
+            if new_row is None:
+                return None
+            rows = []
+            for _r in (existing_rows or []):
+                if _r:
+                    rows.append(list(_r))
+            _new_url = ''
+            try:
+                _new_url = self._btn_url(new_row[0])
+            except Exception:
+                _new_url = ''
+            if _new_url:
+                for _r in rows:
+                    for _b in _r:
+                        if self._btn_url(_b) == _new_url:
+                            return rows or None  # موجود مسبقًا — لا تكرار
+            rows.append(list(new_row))
+            return rows or None
+        except Exception:
+            return [list(new_row)] if new_row is not None else None
+
+    async def _alert_heal_sweep(self):
+        """[ALERT-HEAL v4.5.4] إصلاح رجعي محدود: التنبيهات العالقة بوعد
+        ميت («جارٍ تفعيل الايدي والاسم للنقر خلال ثوانٍ» + روابط
+        tg://user?id ميتة) لا يرقّيها أحد بعد إعادة التشغيل — السجلات
+        في الذاكرة (_request_alerts/_marked) تُمسح مع العملية. بلاغ
+        المُشغّل 2026-11-21 («ليه الايدي ما ينضغط وش ابي انا من النسخ»):
+        هذا الكنس يفي بالوعد بعد الإقلاع — آخر 60 رسالة قناة، 10
+        تعديلات كحد أقصى، تباعد 1.5ث، رقم الالتقاط من زر «اقتراح رد»
+        نفسه (cbc:chat:sender:phone)، env: ALERT_HEAL_SWEEP_ENABLED."""
+        try:
+            if str(os.environ.get(
+                    'ALERT_HEAL_SWEEP_ENABLED', 'true')).strip().lower() \
+                    not in ('1', 'true', 'yes', 'on'):
+                return
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return
+            _target = (getattr(getattr(self, 'config', None),
+                               'requests_target_channel', None)
+                       or getattr(getattr(self, 'config', None),
+                                  'channel_id', None))
+            if not _target:
+                return
+            from telethon.extensions import html as _tl_html
+            _msgs = await asyncio.wait_for(
+                _bot_client.get_messages(_target, limit=60), timeout=25)
+            _healed = 0
+            for _msg in (_msgs or []):
+                if _healed >= 10:
+                    break
+                try:
+                    if _msg is None or not getattr(_msg, 'entities', None):
+                        continue
+                    _html = _tl_html.unparse(_msg.text or '', _msg.entities)
+                    if (_REQ_DELTAIL_PENDING not in _html
+                            and _REQ_HINT_ACTIVATING not in _html):
+                        continue
+                    _m = re.search(r'tg://user\?id=(\d+)', _html)
+                    if not _m:
+                        continue
+                    _sid = int(_m.group(1))
+                    if _sid <= 0:
+                        continue
+                    # رقم الالتقاط من زر «اقتراح رد» (cbc:chat:sender:phone)
+                    _pref = ''
+                    try:
+                        for _row in (_msg.buttons or []):
+                            for _b in (_row or []):
+                                _d = (getattr(_b, 'data', None)
+                                      or getattr(getattr(_b, 'type', None),
+                                                 'data', None) or b'')
+                                if isinstance(_d, bytes) and _d.startswith(b'cbc:'):
+                                    _parts = _d.decode('utf-8', 'replace').split(':')
+                                    if len(_parts) >= 4:
+                                        _pref = _parts[3]
+                                    break
+                            if _pref:
+                                break
+                    except Exception:
+                        _pref = ''
+                    # الكيان معروف للبوت مسبقًا؟ وإلا زرعه عبر حساب الالتقاط
+                    _uname = ''
+                    _known = None
+                    try:
+                        _known = await asyncio.wait_for(
+                            _bot_client.get_entity(_sid), timeout=4)
+                    except Exception:
+                        _known = None
+                    if _known is None:
+                        if not await self._entity_transfer_via_capture(
+                                _sid, 'الطالب', prefer_phone=_pref):
+                            continue
+                        try:
+                            _known = await asyncio.wait_for(
+                                _bot_client.get_entity(_sid), timeout=5)
+                        except Exception:
+                            _known = None
+                        if _known is None:
+                            continue
+                    _uname = re.sub(
+                        r'[^A-Za-z0-9_]', '',
+                        str(getattr(_known, 'username', '') or '').lstrip('@'))
+                    if len(_uname) < 4:
+                        _uname = ''
+                    _new = _html
+                    _btn_row = None
+                    if _uname:
+                        # رابط الايدي → t.me (قابل للنقر فورًا لدى الجميع)
+                        _new = _new.replace(
+                            f'<a href="tg://user?id={_sid}">'
+                            f'<code>{_sid}</code></a>',
+                            f'<a href="https://t.me/{_uname}">'
+                            f'<code>{_sid}</code></a>', 1)
+                        # سطر المرسل: أول ذكر بنفس الايدي → (يوزر) برابط t.me
+                        _m2 = re.search(
+                            r'<a href="tg://user\?id=' + str(_sid)
+                            + r'">(.*?)</a>', _new)
+                        if _m2:
+                            _new = _new.replace(
+                                _m2.group(0),
+                                f'{_m2.group(1)} '
+                                f'<a href="https://t.me/{_uname}">'
+                                f'(@{_uname})</a>', 1)
+                        _new = _new.replace(
+                            _REQ_HINT_ACTIVATING,
+                            f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
+                            f"في سطر المُرسِل")
+                        _new = _new.replace(
+                            _REQ_DELTAIL_PENDING,
+                            "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
+                            "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
+                            "في سطر «المرسل» أعلاه.")
+                        _btn_row = [Button.url(
+                            "✉️ مراسلة", f"https://t.me/{_uname}")]
+                    else:
+                        # بلا يوزر: إعادة تقييم الذكر بعد زرع الكيان → حي
+                        _new = _new.replace(
+                            _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
+                        _new = _new.replace(
+                            _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
+                    if _new == _html:
+                        continue
+                    _merged = self._merge_alert_buttons(
+                        [[_b for _b in _row] for _row in (_msg.buttons or [])],
+                        _btn_row)
+                    await _bot_client.edit_message(
+                        _target, _msg.id, _new,
+                        parse_mode='html', link_preview=False, buttons=_merged)
+                    _healed += 1
+                    logging.info(
+                        f"[ALERT-HEAL] ✅ healed msg_id={_msg.id} "
+                        f"sender={_sid} "
+                        f"username={('@' + _uname) if _uname else 'none'}")
+                    await asyncio.sleep(1.5)
+                except Exception as _hm:
+                    logging.debug(f"[ALERT-HEAL] skip msg: {_hm}")
+            if _healed:
+                logging.info(
+                    f"[ALERT-HEAL] sweep done — {_healed} alert(s) healed")
+        except Exception as _hsw:
+            logging.debug(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
+
+    async def _alert_heal_sweep(self):
+        """[ALERT-HEAL v4.5.4] إصلاح رجعي محدود: التنبيهات العالقة بوعد
+        ميت («جارٍ تفعيل الايدي والاسم للنقر خلال ثوانٍ» + روابط
+        tg://user?id ميتة) لا يرقّيها أحد بعد إعادة التشغيل — السجلات
+        في الذاكرة (_request_alerts/_marked) تُمسح مع العملية. بلاغ
+        المُشغّل 2026-11-21 («ليه الايدي ما ينضغط وش ابي انا من النسخ»):
+        هذا الكنس يفي بالوعد بعد الإقلاع — آخر 60 رسالة قناة، 10
+        تعديلات كحد أقصى، تباعد 1.5ث، رقم الالتقاط من زر «اقتراح رد»
+        نفسه (cbc:chat:sender:phone)، env: ALERT_HEAL_SWEEP_ENABLED."""
+        try:
+            if str(os.environ.get(
+                    'ALERT_HEAL_SWEEP_ENABLED', 'true')).strip().lower() \
+                    not in ('1', 'true', 'yes', 'on'):
+                return
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return
+            _target = (getattr(getattr(self, 'config', None),
+                               'requests_target_channel', None)
+                       or getattr(getattr(self, 'config', None),
+                                  'channel_id', None))
+            if not _target:
+                return
+            from telethon.extensions import html as _tl_html
+            _msgs = await asyncio.wait_for(
+                _bot_client.get_messages(_target, limit=60), timeout=25)
+            _healed = 0
+            for _msg in (_msgs or []):
+                if _healed >= 10:
+                    break
+                try:
+                    if _msg is None or not getattr(_msg, 'entities', None):
+                        continue
+                    _html = _tl_html.unparse(_msg.text or '', _msg.entities)
+                    if (_REQ_DELTAIL_PENDING not in _html
+                            and _REQ_HINT_ACTIVATING not in _html):
+                        continue
+                    _m = re.search(r'tg://user\?id=(\d+)', _html)
+                    if not _m:
+                        continue
+                    _sid = int(_m.group(1))
+                    if _sid <= 0:
+                        continue
+                    # رقم الالتقاط من زر «اقتراح رد» (cbc:chat:sender:phone)
+                    _pref = ''
+                    try:
+                        for _row in (_msg.buttons or []):
+                            for _b in (_row or []):
+                                _d = (getattr(_b, 'data', None)
+                                      or getattr(getattr(_b, 'type', None),
+                                                 'data', None) or b'')
+                                if isinstance(_d, bytes) and _d.startswith(b'cbc:'):
+                                    _parts = _d.decode('utf-8', 'replace').split(':')
+                                    if len(_parts) >= 4:
+                                        _pref = _parts[3]
+                                    break
+                            if _pref:
+                                break
+                    except Exception:
+                        _pref = ''
+                    # الكيان معروف للبوت مسبقًا؟ وإلا زرعه عبر حساب الالتقاط
+                    _uname = ''
+                    _known = None
+                    try:
+                        _known = await asyncio.wait_for(
+                            _bot_client.get_entity(_sid), timeout=4)
+                    except Exception:
+                        _known = None
+                    if _known is None:
+                        if not await self._entity_transfer_via_capture(
+                                _sid, 'الطالب', prefer_phone=_pref):
+                            continue
+                        try:
+                            _known = await asyncio.wait_for(
+                                _bot_client.get_entity(_sid), timeout=5)
+                        except Exception:
+                            _known = None
+                        if _known is None:
+                            continue
+                    _uname = re.sub(
+                        r'[^A-Za-z0-9_]', '',
+                        str(getattr(_known, 'username', '') or '').lstrip('@'))
+                    if len(_uname) < 4:
+                        _uname = ''
+                    _new = _html
+                    _btn_row = None
+                    if _uname:
+                        # رابط الايدي → t.me (قابل للنقر فورًا لدى الجميع)
+                        _new = _new.replace(
+                            f'<a href="tg://user?id={_sid}">'
+                            f'<code>{_sid}</code></a>',
+                            f'<a href="https://t.me/{_uname}">'
+                            f'<code>{_sid}</code></a>', 1)
+                        # سطر المرسل: أول ذكر بنفس الايدي → (يوزر) برابط t.me
+                        _m2 = re.search(
+                            r'<a href="tg://user\?id=' + str(_sid)
+                            + r'">(.*?)</a>', _new)
+                        if _m2:
+                            _new = _new.replace(
+                                _m2.group(0),
+                                f'{_m2.group(1)} '
+                                f'<a href="https://t.me/{_uname}">'
+                                f'(@{_uname})</a>', 1)
+                        _new = _new.replace(
+                            _REQ_HINT_ACTIVATING,
+                            f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
+                            f"في سطر المُرسِل")
+                        _new = _new.replace(
+                            _REQ_DELTAIL_PENDING,
+                            "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
+                            "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
+                            "في سطر «المرسل» أعلاه.")
+                        _btn_row = [Button.url(
+                            "✉️ مراسلة", f"https://t.me/{_uname}")]
+                    else:
+                        # بلا يوزر: إعادة تقييم الذكر بعد زرع الكيان → حي
+                        _new = _new.replace(
+                            _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
+                        _new = _new.replace(
+                            _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
+                    if _new == _html:
+                        continue
+                    _merged = self._merge_alert_buttons(
+                        [[_b for _b in _row] for _row in (_msg.buttons or [])],
+                        _btn_row)
+                    await _bot_client.edit_message(
+                        _target, _msg.id, _new,
+                        parse_mode='html', link_preview=False, buttons=_merged)
+                    _healed += 1
+                    logging.info(
+                        f"[ALERT-HEAL] ✅ healed msg_id={_msg.id} "
+                        f"sender={_sid} "
+                        f"username={('@' + _uname) if _uname else 'none'}")
+                    await asyncio.sleep(1.5)
+                except Exception as _hm:
+                    logging.debug(f"[ALERT-HEAL] skip msg: {_hm}")
+            if _healed:
+                logging.info(
+                    f"[ALERT-HEAL] sweep done — {_healed} alert(s) healed")
+        except Exception as _hsw:
+            logging.debug(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
+
+    async def _delayed_alert_heal(self):
+        """[ALERT-HEAL v4.5.4] تأخير الكنس حتى اتصال حسابات الالتقاط."""
+        try:
+            await asyncio.sleep(240)
+            await self._alert_heal_sweep()
+        except asyncio.CancelledError:
+            pass
+        except Exception as _dh:
+            logging.debug(f"[ALERT-HEAL] delayed sweep error: {_dh}")
+
     async def _entity_rescue_edit_alert(self, sent_alert, target, sender_id,
                                         sender_display, chat_id, msg_id,
                                         prefer_phone=''):
@@ -11088,6 +11453,20 @@ class Monitor:
                             _old_mention, _new_mention, 1)
                 except Exception:
                     pass
+                # [ID-LINK-UPGRADE v4.5.4] رابط الايدي نفسه يرقى إلى
+                # t.me — الضغط على رقم الايدي 🆔 يفتح خاص المرسل فورًا
+                # لدى كل المشتركين بلا اعتماد على زرع الكيان (بلاغ
+                # المُشغّل 2026-11-21: «ليه الايدي ما ينضغط وش ابي انا
+                # من النسخ»). no-op آمن لو تغيّرت الصيغة.
+                try:
+                    _old_id_link = (f'<a href="tg://user?id={_sid}">'
+                                    f'<code>{_sid}</code></a>')
+                    _new_id_link = (f'<a href="https://t.me/{_uname_clean}">'
+                                    f'<code>{_sid}</code></a>')
+                    _new_text = _new_text.replace(
+                        _old_id_link, _new_id_link, 1)
+                except Exception:
+                    pass
             else:
                 _new_text = _old_text.replace(
                     _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
@@ -11098,11 +11477,18 @@ class Monitor:
             if _new_text == _old_text and not _btns:
                 return  # لا تغيير — لا تعديل عبث
             # (6) عدّل التنبيه — إعادة الإرسال بنفس النص تُعيد تقييم ذكر
-            # tg://user?id والكيان الآن معروف للبوت → ذكر حقيقي حي
+            # tg://user?id والكيان الآن معروف للبوت → ذكر حقيقي حي.
+            # [ID-RACE-FIX v4.5.4] الأزرار: دمج الصفوف الأصلية (الزر
+            # الأحمر «اقتراح رد») مع صف «مراسلة» الجديد — التمرير السابق
+            # كان يمسح الصف الأحمر من التنبيه.
             try:
+                _edit_btns = self._merge_alert_buttons(
+                    (_entry or {}).get('buttons')
+                    if isinstance(_entry, dict) else None,
+                    _btns[0] if _btns else None)
                 await _bot_client.edit_message(
                     target, _alert_id, _new_text,
-                    parse_mode='html', link_preview=False, buttons=_btns)
+                    parse_mode='html', link_preview=False, buttons=_edit_btns)
             except Exception as _ed_e:
                 logging.debug(f"[ENTITY-RESCUE] edit failed (non-fatal): {_ed_e}")
                 return
@@ -11116,8 +11502,8 @@ class Monitor:
             try:
                 if _entry is not None:
                     _entry['text'] = _new_text
-                    if _btns:
-                        _entry['buttons'] = _btns
+                    if _edit_btns is not None:
+                        _entry['buttons'] = _edit_btns
             except Exception:
                 pass
         except Exception as _er_e:
@@ -11233,6 +11619,12 @@ class Monitor:
                         f"[FAST-REQUEST] activation error (non-fatal): {_af_e}")
                 return
             # (2) نص التنبيه من السجل + الترقية (سطر المرسل + التلميح)
+            # [ID-RACE-FIX v4.5.4] الحذف سبق الترقية؟ الإدخال انتقل
+            # لسجل المعلّمة (_request_alerts_marked) — المسار القديم كان
+            # يعود بصمت فتبقى روابط الايدي/الاسم ميتة وذيل «قيد التفعيل»
+            # للأبد (بلاغ المُشغّل 2026-11-21: «ليه الايدي ما ينضغط وش
+            # ابي انا من النسخ» — مثال حي: مرسل @iiwc11 حُذف أصله قبل
+            # الترقية). نفس منطق مسار بلا-username: ابحث في السجلين.
             _reg = getattr(self, '_request_alerts', None)
             _entry = None
             _old_text = ''
@@ -11240,12 +11632,31 @@ class Monitor:
                 _entry = _reg.get((int(chat_id), int(msg_id)))
                 _old_text = str((_entry or {}).get('text') or '')
             if not _old_text:
+                _regm_u = getattr(self, '_request_alerts_marked', None)
+                if isinstance(_regm_u, dict):
+                    _entry = _regm_u.get((int(chat_id), int(msg_id)))
+                    _old_text = str((_entry or {}).get('text') or '')
+            if not _old_text:
                 return
             _old_mention = (f'<a href="tg://user?id={int(sender_id or 0)}">'
                             f'{safe_sender}</a>')
             _new_mention = (f'{safe_sender} '
                             f'<a href="https://t.me/{_uname}">(@{_uname})</a>')
             _new_text = _old_text.replace(_old_mention, _new_mention)
+            # [ID-LINK-UPGRADE v4.5.4] رابط الايدي نفسه يرقى إلى t.me —
+            # الضغط على رقم الايدي 🆔 يفتح خاص المرسل فورًا لدى كل
+            # المشتركين بلا اعتماد على زرع الكيان.
+            try:
+                _sid_up = int(sender_id or 0)
+                if _sid_up > 0:
+                    _old_id_link = (f'<a href="tg://user?id={_sid_up}">'
+                                    f'<code>{_sid_up}</code></a>')
+                    _new_id_link = (f'<a href="https://t.me/{_uname}">'
+                                    f'<code>{_sid_up}</code></a>')
+                    _new_text = _new_text.replace(
+                        _old_id_link, _new_id_link, 1)
+            except Exception:
+                pass
             for _hint_old in (
                     _REQ_HINT_ACTIVATING,
                     "للتواصل: اضغط اسم المُرسِل في رسالة التوجيل أسفل هذا التنبيه",
@@ -11254,15 +11665,26 @@ class Monitor:
                 _new_text = _new_text.replace(
                     _hint_old,
                     f"للتواصل: زر «مراسلة» أدناه أو @{_uname} في سطر المُرسِل")
+            # [ID-RACE-FIX v4.5.4] رقّ ذيل علامة الحذف المعلّقة أيضًا
+            # (الحذف سبق الترقية) إلى مسار زر المراسلة الحقيقي.
+            _new_text = _new_text.replace(
+                _REQ_DELTAIL_PENDING,
+                "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+                "اضغط زر «مراسلة» أو الـ@username في سطر «المرسل» أعلاه.")
             if _new_text == _old_text:
                 return
-            _btns = [[Button.url("✉️ مراسلة", f"https://t.me/{_uname}")]]
+            # [ID-RACE-FIX v4.5.4] الأزرار: دمج الصفوف الأصلية (الزر
+            # الأحمر «اقتراح رد») مع صف «مراسلة» — التمرير السابق كان
+            # يمسح الصف الأحمر من التنبيه بعد الترقية.
+            _edit_btns_u = self._merge_alert_buttons(
+                (_entry or {}).get('buttons') if isinstance(_entry, dict) else None,
+                [Button.url("✉️ مراسلة", f"https://t.me/{_uname}")])
             # (3) عدّل التنبيه (إعادة الإرسال تُقيّم ذكر tg://user?id —
             # الكيان الآن معروف للبوت → الاسم يصير ذكرًا حيًّا أيضًا)
             try:
                 await _bot_client.edit_message(
                     target, _alert_id, _new_text,
-                    parse_mode='html', link_preview=False, buttons=_btns)
+                    parse_mode='html', link_preview=False, buttons=_edit_btns_u)
             except Exception as _up_e:
                 logging.debug(
                     f"[FAST-REQUEST] upgrade edit failed (non-fatal): {_up_e}")
@@ -11275,7 +11697,8 @@ class Monitor:
             try:
                 if _entry is not None:
                     _entry['text'] = _new_text
-                    _entry['buttons'] = _btns
+                    if _edit_btns_u is not None:
+                        _entry['buttons'] = _edit_btns_u
             except Exception:
                 pass
         except Exception as _fu_e:
@@ -11435,7 +11858,11 @@ class Monitor:
             try:
                 for _row in (entry.get('buttons') or []):
                     for _b in (_row or []):
-                        _b_url = str(getattr(_b, 'url', '') or '')
+                        # [BTN-URL-FIX v4.5.4] Telethon 1.46 يخزن رابط
+                        # الزر في type.url لا url — الفحص القديم لم يكن
+                        # يكتشف زر «مراسلة» أبدًا فكان يكتب ذيل «قيد
+                        # التفعيل» الكاذب لتنبيهات مكتملة أصلًا.
+                        _b_url = self._btn_url(_b)
                         if _b_url and ('t.me' in _b_url):
                             _has_dm_btn = True
             except Exception:
@@ -17358,6 +17785,12 @@ class Monitor:
         self._fleet_cov_day = None
         self._fleet_cov_joins = {}
         asyncio.create_task(self._fleet_coverage_loop())
+
+        # === [ALERT-HEAL v4.5.4] كنس علاجي للتنبيهات العالقة ===
+        # بعد 4 دقائق (اتصال حسابات الالتقاط أولًا): يرقّي تنبيهات
+        # «قيد التفعيل» المعلقة (روابط ايدي/اسم ميتة) — الوعد الذي
+        # كسرته إعادة التشغيل (بلاغ المُشغّل: الايدي ما ينضغط).
+        asyncio.create_task(self._delayed_alert_heal())
 
         # === STARTUP HISTORY SCAN [Req-2] ===
         # Discover groups from RECENT message history of every connected monitor
