@@ -11046,14 +11046,16 @@ class Monitor:
             return [list(new_row)] if new_row is not None else None
 
     async def _alert_heal_sweep(self):
-        """[ALERT-HEAL v4.5.4] إصلاح رجعي محدود: التنبيهات العالقة بوعد
+        """[ALERT-HEAL v4.5.4c] إصلاح رجعي محدود: التنبيهات العالقة بوعد
         ميت («جارٍ تفعيل الايدي والاسم للنقر خلال ثوانٍ» + روابط
         tg://user?id ميتة) لا يرقّيها أحد بعد إعادة التشغيل — السجلات
-        في الذاكرة (_request_alerts/_marked) تُمسح مع العملية. بلاغ
-        المُشغّل 2026-11-21 («ليه الايدي ما ينضغط وش ابي انا من النسخ»):
-        هذا الكنس يفي بالوعد بعد الإقلاع — آخر 60 رسالة قناة، 10
-        تعديلات كحد أقصى، تباعد 1.5ث، رقم الالتقاط من زر «اقتراح رد»
-        نفسه (cbc:chat:sender:phone)، env: ALERT_HEAL_SWEEP_ENABLED."""
+        في الذاكرة تُمسح مع العملية. بلاغ المُشغّل 2026-11-21 («ليه
+        الايدي ما ينضغط وش ابي انا من النسخ»). **[BOT-NO-HISTORY]**
+        بوتات تيليجرام ممنوعة من GetHistoryRequest (برهان حي 05:18:22Z:
+        The API access for bot users is restricted) — السجل يُقرأ عبر
+        حساب مراقب متصل (عضو قناة الطلبات) والتعديل يبقى عبر البوت
+        (صاحب الرسائل). آخر 60 رسالة، 10 تعديلات، تباعد 1.5ث، رقم
+        الالتقاط من زر «اقتراح رد» نفسه، env: ALERT_HEAL_SWEEP_ENABLED."""
         try:
             if str(os.environ.get(
                     'ALERT_HEAL_SWEEP_ENABLED', 'true')).strip().lower() \
@@ -11068,24 +11070,56 @@ class Monitor:
                                   'channel_id', None))
             if not _target:
                 return
+            # --- القارئ: أول حساب مراقب متصل يملك وصولًا للقناة ---
+            _uc = getattr(self, 'user_clients', None) or {}
+            _readers = [c for c in _uc.values()
+                        if c is not None and getattr(
+                            c, 'is_connected', lambda: False)()]
+            if not _readers:
+                logging.info("[ALERT-HEAL] لا حساب قارئ متصل — أُلغي الكنس")
+                return
             from telethon.extensions import html as _tl_html
-            _msgs = await asyncio.wait_for(
-                _bot_client.get_messages(_target, limit=60), timeout=25)
+            _msgs = None
+            for _r in _readers[:4]:
+                try:
+                    _msgs = await asyncio.wait_for(
+                        _r.get_messages(_target, limit=60), timeout=25)
+                    break
+                except Exception as _ge:
+                    logging.info(f"[ALERT-HEAL] قارئ فشل: {_ge}")
+                    continue
+            if not _msgs:
+                logging.info(
+                    "[ALERT-HEAL] تعذر قراءة سجل القناة من كل القراء — أُلغي")
+                return
+            # هوية البوت (نعدّل رسائله هو فقط)
+            _bot_id = 0
+            try:
+                _me = getattr(self, '_bot_identity', None)
+                if _me is None:
+                    _me = await asyncio.wait_for(
+                        _bot_client.get_me(), timeout=5)
+                    self._bot_identity = _me
+                _bot_id = int(getattr(_me, 'id', 0) or 0)
+            except Exception:
+                _bot_id = 0
             _healed = 0
             _stuck = 0
             _skipped = 0
             logging.info(
                 f"[ALERT-HEAL] sweep starting — target={_target} "
-                f"({len(_msgs or [])} recent messages)")
+                f"({len(_msgs)} رسالة عبر حساب قارئ متصل)")
             for _msg in (_msgs or []):
                 if _healed >= 10:
                     break
                 try:
                     if _msg is None or not getattr(_msg, 'entities', None):
                         continue
-                    # [ALERT-HEAL-FIX v4.5.4b] raw_text وليس text: خاصية
-                    # text تُمرر عبر parse_mode للعميل (markdown افتراضيًا)
-                    # فتنحرف إزاحات الكيانات في unparse ويُفقد التطابق.
+                    # تنبيهات البوت فقط — التعديل من غيره سيفشل أصلًا
+                    _snd = int(getattr(_msg, 'sender_id', 0) or 0)
+                    if _bot_id and _snd and _snd != _bot_id:
+                        continue
+                    # raw_text وليس text (parse_mode يشوه الإزاحات)
                     _html = _tl_html.unparse(
                         getattr(_msg, 'raw_text', '') or '', _msg.entities)
                     if (_REQ_DELTAIL_PENDING not in _html
@@ -11098,6 +11132,7 @@ class Monitor:
                         continue
                     _sid = int(_m.group(1))
                     if _sid <= 0:
+                        _skipped += 1
                         continue
                     # رقم الالتقاط من زر «اقتراح رد» (cbc:chat:sender:phone)
                     _pref = ''
@@ -11117,7 +11152,6 @@ class Monitor:
                     except Exception:
                         _pref = ''
                     # الكيان معروف للبوت مسبقًا؟ وإلا زرعه عبر حساب الالتقاط
-                    _uname = ''
                     _known = None
                     try:
                         _known = await asyncio.wait_for(
