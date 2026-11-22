@@ -19590,6 +19590,32 @@ async def api_polling_status_handler(request):
                 _blind_chats_recent = _blind_rows[:15]
         except Exception:
             pass
+        # [REQUEST-NET-v4.5.9c] لقطة الأسطول: لكل هاتف (من خريطة القرّاء
+        # + خريطة الحالة) — هل هو حي، دوره، وكم مجموعة يقرأها. هذا يكشف
+        # فورًا أي الحسابات تحتاج /login (ميت بـ0 تغطية أو منقطع) وأيها
+        # يحمل العبء. الهواتف مُقنَّعة (_redact_phone — نفس سياسة بقية
+        # النقاط: بلا DASHBOARD_API_KEY لا PII كامل).
+        _fleet_phones = []
+        try:
+            _reg2 = getattr(monitor, 'source_registry', None)
+            if _reg2 is not None:
+                _pm2 = getattr(_reg2, '_chat_to_phones', None) or {}
+                _ph2 = getattr(_reg2, '_phone_health', None) or {}
+                _roles2 = getattr(_reg2, '_phone_to_role', None) or {}
+                _reads: Dict[str, int] = {}
+                for _phs in _pm2.values():
+                    for _p in (_phs or []):
+                        _reads[_p] = _reads.get(_p, 0) + 1
+                _all_phones = set(_reads) | set(_ph2)
+                for _p in sorted(_all_phones):
+                    _fleet_phones.append({
+                        'phone': _redact_phone(_p),
+                        'role': _roles2.get(_p, 'monitor'),
+                        'connected': bool(_ph2.get(_p, False)),
+                        'reads_chats': _reads.get(_p, 0),
+                    })
+        except Exception:
+            pass
         return web.json_response({
             'polling_enabled': True,
             'polling_interval': monitor._polling_interval,
@@ -19612,6 +19638,7 @@ async def api_polling_status_handler(request):
             },
             'blind_chats_count': _blind_chats_count,
             'blind_chats_recent': _blind_chats_recent,
+            'fleet_phones': _fleet_phones,
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
