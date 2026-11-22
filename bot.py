@@ -11644,13 +11644,22 @@ class Monitor:
                 if _vhtml and not _mention_live and not _link_stored:
                     # الخادم أسقط كل الروابط — الأرقام قد تظهر مجردة
                     # (خطر الدايلر) والوعد كاذب: احتياط صادق شامل.
+                    # [v4.5.8f] الذيل أيضًا يجب أن يصير صادقًا — إبقاء
+                    # _REQ_DELTAIL_ACTIVE («اضغط الايدي… يعمل رغم حذف
+                    # الأصل») كذبة جديدة تعيد إطلاق المشغّل كل كنس
+                    # (برهان حي 10:41: 28 احتياطًا بذيل كاذب).
                     _honest_hint = (
                         "للتواصل: المُرسِل بلا username — الاسم والايدي "
                         "أعلاه قد لا يستجيبان للضغط (قيد تلغرام على "
                         "رسائل البوتات)")
+                    _honest_tail = (
+                        "🔗 الرابط أعلاه لن يفتح شيئًا — المُرسِل بلا "
+                        "username: لم يبقَ مسار تواصل تلقائي مؤكد.")
                     _honest = _REQ_POLLUTED_HINT_RE.sub(_honest_hint, _new)
                     _honest = _honest.replace(_hint_t, _honest_hint)
-                    _honest = _honest.replace(_tail_t, _REQ_DELTAIL_ACTIVE)
+                    _honest = _honest.replace(_tail_t, _honest_tail)
+                    _honest = _honest.replace(
+                        _REQ_DELTAIL_ACTIVE, _honest_tail)
                     # أعد غلاف <code> فوق رقم الايدي إن صار مجردًا
                     _honest = _honest.replace(
                         f'<a href="tg://user?id={_sid}">{_sid}</a>',
