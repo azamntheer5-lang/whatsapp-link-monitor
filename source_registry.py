@@ -570,9 +570,32 @@ class PollingScheduler:
         await asyncio.sleep(20)  # let bot finish startup
         logging.info(f"🔄 PollingScheduler started — batch={self.BATCH_SIZE}, cycle={self.CYCLE_SLEEP_S}s")
         self._running = True
+        # [REQUEST-NET-v4.5.9d] reconcile دوري (كل 60ث): أي عميل متصل يجب
+        # أن يكون حيًا في خريطة الصحة. يشفي سباق الإقلاع (حسابات وصلت
+        # READY قبل إنشاء السجل ففاتتها update_phone_status) وأي انحراف
+        # مستقبلي — بلا هذا، get_reader يستبعد القرّاء الأحياء فيتوقف
+        # الاستطلاع كليًا رغم اتصال الحسابات.
+        _last_reconcile = 0.0
 
         while self._running:
             try:
+                if time.time() - _last_reconcile >= 60:
+                    _last_reconcile = time.time()
+                    try:
+                        _clients = getattr(self.monitor, 'user_clients', None) or {}
+                        _healed = 0
+                        for _ph, _cl in list(_clients.items()):
+                            if _cl and _cl.is_connected() \
+                                    and not self.registry._phone_health.get(_ph, False):
+                                self.registry.update_phone_status(_ph, True)
+                                _healed += 1
+                        if _healed:
+                            logging.info(
+                                f"[REQUEST-NET] 🩺 RECONCILE: {_healed} connected "
+                                f"account(s) were marked dead — healed to healthy")
+                    except Exception as _rec_e:
+                        logging.debug(f"[REQUEST-NET] reconcile error: {_rec_e}")
+
                 # 1. Select due chats (oldest first — aging prevents starvation)
                 due_chats = await self.select_due_chats(limit=self.BATCH_SIZE)
                 if not due_chats:

@@ -18816,6 +18816,25 @@ class Monitor:
         # 2. أنشئ SourceRegistry + تحميل سريع من DB (موافق للـ startup)
         self.source_registry = SourceRegistry(self.prod_db, watchers)
         await self.source_registry.load_from_db()  # < 1 ثانية — لا يوقف startup
+        # [REQUEST-NET-v4.5.9d STARTUP-RECONCILE] إصلاح سباق الإقلاع: حسابات
+        # المراقبة تُطلَق قبل إنشاء السجل بـ~15ث — أي حساب وصل READY خلال
+        # تلك النافذة فاتته update_phone_status(True) (كانت `if self.source_registry`
+        # تحجبها بصمت) فيبقى «ميتًا» في خريطة الصحة للأبد → get_reader يستبعده
+        # → الاستطلاع بلا قرّاء. هنا: كل عميل متصل الآن يُعلَّم حيًا فورًا؛
+        # والجدولة الدورية (كل 60ث في PollingScheduler) تعيد نفس الشيء
+        # كشبكة أمان ذاتية الشفاء لأي انحراف مستقبلي.
+        try:
+            _rc_n = 0
+            for _rc_ph, _rc_cl in list(self.user_clients.items()):
+                if _rc_cl and _rc_cl.is_connected():
+                    self.source_registry.update_phone_status(_rc_ph, True)
+                    _rc_n += 1
+            if _rc_n:
+                logging.info(
+                    f"[REQUEST-NET] STARTUP-RECONCILE: {_rc_n} connected "
+                    f"account(s) marked healthy in registry")
+        except Exception as _rc_e:
+            logging.debug(f"[REQUEST-NET] startup reconcile error: {_rc_e}")
         # 3. ابدأ discovery في الخلفية (يحدّث reader_phones تدريجياً)
         self._registry_task = asyncio.create_task(
             self.source_registry.discover_all_sources_background(self.user_clients)
