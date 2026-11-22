@@ -19562,17 +19562,32 @@ async def api_polling_status_handler(request):
         _sched = getattr(monitor, 'polling_scheduler', None)
         # [REQUEST-NET-v4.5.9] مقاييس شبكة إنقاذ الطلبات: عدد الإطلاقات من
         # الاستطلاع، عدد الطلبات المنقذة فعلًا (اجتازت الفلترة)، وعدد
-        # المجموعات العمياء (لا قارئ حي لها إطلاقًا — طلباتها لن تُسحب
-        # لا بالأحداث ولا بالاستطلاع حتى /login حساب جديد).
+        # المجموعات العمياء **النشطة** (نشط خلال 7 أيام + لا قارئ حي لها
+        # إطلاقًا — طلباتها لن تُسحب لا بالأحداث ولا بالاستطلاع حتى /login
+        # حساب جديد). تُعرض أسماء أحدث 15 (نفس منطق تنبيه المالك) — هذا
+        # هو الإشارة القابلة للتنفيذ: «هذه المجموعات ترسل طلبات الآن ولا
+        # أحد يسحبها». (الخام الكامل — كل السجلات التاريخية لقرّاء ماتوا
+        # منذ زمن — ضجيج بلا قيمة تشغيلية، فاستُبعد.)
         _blind_chats_count = 0
+        _blind_chats_recent = []
         try:
             _reg = getattr(monitor, 'source_registry', None)
-            if _reg is not None:
+            if _reg is not None and db:
                 _pm = getattr(_reg, '_chat_to_phones', None) or {}
                 _ph = getattr(_reg, '_phone_health', None) or {}
-                _blind_chats_count = sum(
-                    1 for phs in _pm.values()
-                    if not any(_ph.get(p, False) for p in phs))
+                _cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+                cur = await conn.execute(
+                    "SELECT chat_id, chat_title, last_activity FROM monitored_chats "
+                    "WHERE should_monitor = 1 AND last_activity >= ? "
+                    "ORDER BY last_activity DESC",
+                    (_cutoff,))
+                _blind_rows = []
+                for r in await cur.fetchall():
+                    phs = _pm.get(r[0]) or []
+                    if not any(_ph.get(p, False) for p in phs):
+                        _blind_rows.append(r[1] or f'chat_{r[0]}')
+                _blind_chats_count = len(_blind_rows)
+                _blind_chats_recent = _blind_rows[:15]
         except Exception:
             pass
         return web.json_response({
@@ -19596,6 +19611,7 @@ async def api_polling_status_handler(request):
                 'catchup_pages': int(getattr(monitor, '_polling_catchup_pages', 4) or 4),
             },
             'blind_chats_count': _blind_chats_count,
+            'blind_chats_recent': _blind_chats_recent,
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
