@@ -11153,7 +11153,7 @@ class Monitor:
                 f"[ALERT-HEAL] sweep starting — target={_target} "
                 f"({len(_msgs)} رسالة عبر حساب قارئ متصل)")
             for _msg in (_msgs or []):
-                if _healed >= 20:
+                if _healed >= 40:
                     break
                 try:
                     if _msg is None or not getattr(_msg, 'entities', None):
@@ -11442,6 +11442,9 @@ class Monitor:
                 return False
             _sid = int(_idm.group(1))
             if _sid <= 0:
+                logging.info(
+                    f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — رقم "
+                    f"ايدي غير صالح ({_idm.group(1)!r})")
                 return False
             # (2) معرفة الكيان — زرع عبر حساب الالتقاط إن لزم
             _known = None
@@ -11472,12 +11475,23 @@ class Monitor:
                         f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — "
                         f"تعذر زرع كيان المرسل {_sid}")
                     return False
-                try:
-                    _known = await asyncio.wait_for(
-                        bot_client.get_entity(_sid), timeout=5)
-                except Exception:
-                    _known = None
+                # [v4.5.8d] سباق الزرع: رسالة الذكر تصل البوت وتُعالَج
+                # بشكل غير متزامن — الفحص الفوري بعدها يفشل دائمًا (برهان
+                # حي 10:11: 34 زرعًا ناجحًا وصفر التئام). انتظار قصير ثم
+                # إعادة فحص متدرجة (3 محاولات بفاصل 1.2ث).
+                _known = None
+                for _att in range(3):
+                    await asyncio.sleep(1.2)
+                    try:
+                        _known = await asyncio.wait_for(
+                            bot_client.get_entity(_sid), timeout=5)
+                        break
+                    except Exception:
+                        _known = None
                 if _known is None:
+                    logging.info(
+                        f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — "
+                        f"الكيان {_sid} لم يُعرف رغم الزرع (سباق)")
                     return False
             # (3) username ظهر الآن؟
             _uname = re.sub(
