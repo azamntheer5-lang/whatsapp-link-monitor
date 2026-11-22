@@ -95,7 +95,7 @@ def _content_word_count(clean_text: str) -> int:
 # كله في bot.py (بناء الأزرار + _handle_red_contact + فرع في
 # _on_callback). منطق القواعد هنا لم يتغير — العلامة تُحدِّث الإصدار
 # المُتحقَّق منه في /api/filter_stats.
-FILTER_VERSION = "v4.4.18"
+FILTER_VERSION = "v4.4.16"
 FILTER_MODE = "ai_intent_classifier"
 
 
@@ -179,12 +179,6 @@ REQUESTER_PHRASES: List[str] = [
     "محتاج أحد", "محتاج احد", "محتاج حد", "محتاج شخص", "محتاج واحد",
     "محتاج مدرس", "محتاج دكتور", "محتاج مختص", "محتاج متخصص", "محتاج خبير",
     "محتاج فاهم", "محتاج استاذ",
-    # [v4.5.7 FALSE-REJECT-KILL] صيغة المؤنث — طلبات واقعية مُثبتة تُرفض
-    # (إثبات حي 2026-11-22: «احد هنا تسوي تقارير؟ محتاجة تقرير تدريب...»
-    # 15 كلمة → كُتبت كـ request_too_long رغم كونها طلبًا حقيقيًا كاملًا
-    # لأن requester فاضي — «محتاجة» لا تُطابق توكن «محتاج» المطابقة التامة)
-    "محتاجة أحد", "محتاجة احد", "محتاجة حد", "محتاجة شخص", "محتاجة واحد",
-    "محتاجه أحد", "محتاجه احد", "محتاجه حد", "محتاجه شخص", "محتاجه واحد",
     "احتاج أحد", "احتاج احد", "احتاج حد", "احتاج شخص", "احتاج واحد",
     "احتاج مدرس", "احتاج دكتور", "احتاج مختص", "احتاج متخصص", "احتاج خبير",
     "احتاج فاهم", "احتاج استاذ",
@@ -246,10 +240,6 @@ EXECUTION_VERBS: List[str] = [
     "يصمم", "ينفذ", "يشتغل", "يستلم", "يتولى", "يكمل", "يراجع",
     "يساعد", "يضبط", "يشرح", "يعلم", "ينقح",
     "يرتبه", "يخلصه", "ينجزه", "يسويه", "يحله", "يكتبه", "يجهزه",
-    # [v4.5.7 FALSE-REJECT-KILL] يبرمج — «ابي احد يبرمج لي مشروع جافا» طلب
-    # حقيقي رُفض حيًّا 0.85 (برمجة في SERVICE_TERMS لكن الفعل غائب من
-    # EXECUTION_VERBS فسقط التوقيع الثلاثي) — إضافة جراحية بلا التباس
-    "يبرمج",
 ]
 
 # [v3.2.0] REMOVED "يدرس" and "يذاكر" from EXECUTION_VERBS.
@@ -323,10 +313,6 @@ SERVICE_TERMS: List[str] = [
     # assignments
     "واجب", "الواجب", "واجبات", "سكليف", "اسكليف", "assignment", "تكليف",
     "التكليف", "تكاليف",
-    # [v4.5.7 FALSE-REJECT-KILL] جمع سكليفات — «يخلص لي السكليفات هذي
-    # الفصل» طلب يمني حقيقي رُفض حيًّا (service فاضي لأن المطابقة
-    # توكن-تمام: «السكليفات» بعد نزع الـ = «سكليفات» ≠ «سكليف»)
-    "سكليفات", "اسكليفات",
     # projects
     "مشروع", "المشروع", "مشاريع", "بروجكت", "project", "مشروع تخرج",
     "مشروع جامعي", "مشروع بحثي",
@@ -463,33 +449,6 @@ ADVERTISEMENT_STRONG_SIGNALS: List[str] = [
     "مجاني", "مجانا", "هديه", "هدية", "هدية مجانية",
     "الباقة", "باقات", "اشتراك", "تقييم 5", "تقييم خمس نجوم",
     "5 نجوم", "موصى به",
-    # [AUDIT-FP-KILL v4.4.23] ترشيح مقدم خدمة + إعلان صيغة شرطية — بلاغ
-    # المُشغّل 2026-11-20 «هذول مو طلبات» (رسالتان حيّتان نُشرتا خطأً):
-    #   (1) ترشيح: «حبيت أنصحكم بشيء... عندي دكتور ممتاز جدًا... اللي
-    #       يحتاجه يعلمني» — تحمل التوقيع القوي (شخص+تنفيذ+خدمة:
-    #       دكتور/يعلم/بحث+تكاليف) لكنها ترشيح طرف مُقدِّم لا طلب طالب.
-    #   (2) إعلان شرطي: «اذا تبون حد شاطر يسوي... كلموني عالخاص» —
-    #       الرغبة للمخاطبين (تبون) لا للمرسل + دعوة مراسلته هو.
-    # كلها الآن ad_signals → تسقط «المرشح القوي» في جولات التدقيق (لا
-    # نشر متأخر لترشيح/إعلان). المسار الرئيسي لا يتأثر إطلاقًا: إشارات
-    # الإعلانات تشخيصية هناك — القرار من المصنّف القواعدي وحده.
-    "انصحكم", "انصحك", "نصيحتي",
-    "عندي دكتور", "عندي مدرس", "عندي استاذ", "عندي معلم", "عندي مختص",
-    "كلموني", "راسلوني", "تواصلوني",
-    "اذا تبون حد", "تبون حد", "اذا تبي حد",
-    # نفس بصمة إحالة التواصل في المصنّف القواعدي (شكلها المفرد) — رسالة
-    # تحمل CTA للمرسل + رغبة طرف ثالث مضمّنة («الي يبي مختص يخلص
-    # التكاليف راسلني») رُفضت كـservice_offer: الجولة لا تستأنفها.
-    "كلمني", "راسلني", "تواصل معي", "يرسل لي", "يراسلني",
-    "اللي يبيها", "اللي يبي", "الي يبي", "اللي يبغى", "الي يبغى",
-    "لمن يود", "اللي يود", "الي يود",
-    # [PROVIDER-REFERRAL-v4.4.24] بلاغ المُشغّل 2026-11-20: «عندي حد يحل
-    # لكم التكليف» نُشرت كطلب وهي إحالة ملكية — المرسل يملك المنفّذ
-    # ويعرضه. وتأكيد المُشغّل: العلامة الفارقة «اذا تبون» (العرض المشروط
-    # للمخاطبين) وليست «كلموني» وحدها. أي رسالة تحمل هذه البصمة لا
-    # تُستأنف بالنشر المتأخر من جولات التدقيق أبدًا.
-    "عندي حد", "عندي احد", "عندنا حد", "عندنا احد",
-    "اذا تبون", "اذا تبي", "لو تبون",
 ]
 
 # plural service nouns — مع plural noun يدل على عرض تجاري (أسوي بحوث/أحل واجبات)
@@ -1087,13 +1046,6 @@ def _match_exec_verbs(pairs, normalized: str) -> List[str]:
         candidates.add(t)
         if t.startswith('و') and len(t) > 1:
             candidates.add(t[1:])
-        # [v4.5.7 FALSE-REJECT-KILL] صيغة المخاطبة المؤنثة (تاء الخطاب):
-        # «احد هنا تسوي تقارير؟» — الفعل «تسوي» هو نفسه «يسوي» بصيغة
-        # التاء. التحويل الميكانيكي ت→ي يولّد المرشح المطابق، وفحص
-        # لواحق المفعول يبقى حارسًا (لا تضيف المطابقة أي حالة جديدة
-        # خارج أفعال التنفيذ المعروفة: «تكملة»→«يكملة» يرفضها اللاحق ة)
-        if t.startswith('ت') and len(t) > 2:
-            candidates.add('ي' + t[1:])
     for orig, norm in pairs:
         if not norm:
             continue
@@ -1682,16 +1634,8 @@ def chatter_guard_check(norm: str, sig: "SignalReport | None" = None) -> str:
         return 'resource_request'
 
     # [G5] إداري/جدولة/شعب (+ مواقع الحرم [v4.3.1])
-    # [v4.5.7 FALSE-REJECT-KILL] اسم خدمة أكاديمية صريح (بحث/تقرير/
-    # بوربوينت...) يعفي الرسالة: «ابي بحث قصير عن الاداره» — «الاداره»
-    # هنا موضوع الدراسة لا سؤال تسجيل، و«ابي» علامة إدارية (من مثال
-    # «ابي شعب انجليزي») لكن وجود خدمة صريحة يقلب الدلالة. إشارات
-    # service_signals من المحرك الرئيسي (بحث/تقرير/بروجكت/سكليفات...)
-    # — «ابي شعب انجليزي تكفون» لا تحمل خدمة فتبقى مرفوضة كما هي.
     has_admin = any(t in norm for t in _GUARD_ADMIN_TERMS)
-    _svc_noun = bool(sig is not None and getattr(sig, 'service_signals', None))
-    if has_admin and not _svc_noun \
-            and any(m in norm for m in _GUARD_ADMIN_MARKERS):
+    if has_admin and any(m in norm for m in _GUARD_ADMIN_MARKERS):
         return 'registration_admin'
 
     # [G6] اتجاه العرض — المرسل يملك ويُعرض («عندي كويزات اللي يبيها
@@ -1745,41 +1689,6 @@ def chatter_guard_check(norm: str, sig: "SignalReport | None" = None) -> str:
         return 'no_academic_content'
 
     return ''
-
-
-def quick_local_verdict(text: str):
-    """[AUDIT-v4.4.19] حكم محلي سريع لبذرة السباق (وضع الـAI فقط).
-
-    نفس بوابات analyze_request_v4 المحلية (relay/عدد الكلمات/إشارات/
-    حرس الدردشة) قبل مرحلة الـAI — تزامني بالكامل (ميكروثانية، صفر
-    شبكة). يُعيد (True, '') لو مرّت كل البوابات أو (False, reason).
-    فشل داخلي → (True, '') — البوابة لا تمنع البذرة أبدًا (غير قاتل).
-    """
-    try:
-        from text_normalizer import normalize as _qlv_normalize
-        if not text or not text.strip():
-            return (False, 'empty')
-        nt = _qlv_normalize(text)
-        if not nt.clean or not nt.clean.strip():
-            return (False, 'empty_after_normalize')
-        if _is_relay_wrapper(nt.canonical, text):
-            return (False, 'relay_wrapper')
-        if _content_word_count(nt.clean) > 12:
-            _sig_q = extract_signals(text)
-            _strong_q = (bool(_sig_q.requester_signals)
-                         or bool(_sig_q.person_signals)) \
-                and bool(_sig_q.execution_signals) \
-                and bool(_sig_q.service_signals)
-            if not _strong_q:
-                return (False, 'request_too_long')
-        _sig_v = extract_signals(text)
-        if not admission_allowed(_sig_v, text):
-            return (False, 'no_signals')
-        if chatter_guard_check(normalize_text(nt.clean), _sig_v):
-            return (False, 'chatter_guard')
-        return (True, '')
-    except Exception:
-        return (True, '')
 
 
 # ============================================================
@@ -1865,28 +1774,12 @@ async def analyze_request_v4(
     # طالب، بينما الطلب الحقيقي 3–12 كلمة مضمونًا. (بعد relay-wrapper
     # للحفاظ على كشف إعادة نشر البوتات الناقلة).
     if _content_word_count(nt.clean) > 12:
-        # [AUDIT-v4.4.19] إعفاء التوقيع القوي — أمر المُشغّل (2026-11-20):
-        # «تتاكد هل هناك طلبات حقيقية تم تجاوزها ... وعالج المشكله». حد
-        # الـ12 كلمة كان يرفض الطلب الحقيقي الطويل قبل أي تصنيف («ابي احد
-        # يسوي لي بحث كامل مع المراجع والتوثيق وملف بوربوينت» = 17 كلمة
-        # → رفضت رغم قبول المحرك القواعدي لها بثقة 0.96 — مثال مُثبت
-        # بالفحص المحلي). الإعفاء الجراحي: رسالة تحمل التوقيع القوي
-        # (طالب/شخص + فعل تنفيذ + خدمة) تتجاوز بوابة العدّ ويبقى القرار
-        # للمصنّف نفسه. الدردشة/الإعلانات لا تحمل التوقيع الثلاثي أبدًا
-        # (مُثبت على أمثلة إنتاج المُشغّل 2026-11-20 — كلها strong=False).
-        _sig_wc = extract_signals(text)
-        _strong_wc = (bool(_sig_wc.requester_signals)
-                      or bool(_sig_wc.person_signals)) \
-            and bool(_sig_wc.execution_signals) \
-            and bool(_sig_wc.service_signals)
-        if not _strong_wc:
-            res.reason = "request_too_long"
-            res.intent_type = "too_long"
-            res.decision_path = "word_count_gate"
-            res.confidence = 0.0
-            await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
-            return res
-        # توقيع قوي → تخطَّ البوابة — المصنّف يحسم (strong_word_pass)
+        res.reason = "request_too_long"
+        res.intent_type = "too_long"
+        res.decision_path = "word_count_gate"
+        res.confidence = 0.0
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        return res
 
     # ---- [v4.2] persistent decision dedup (chat_id, msg_id) ----
     # قرار نهائي سابق لنفس الرسالة (إعادة تسليم بين الحسابات / restart)
