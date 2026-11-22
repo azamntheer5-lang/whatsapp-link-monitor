@@ -142,6 +142,26 @@ _REQ_DELTAIL_ACTIVE = (
     "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
     "اضغط الايدي 🆔 أو اسم المُرسِل أعلاه (يعمل رغم حذف الأصل)."
 )
+# === [ALERT-HEAL-v4.5.8] بلاغ المُشغّل 2026-11-22 08:36 (تنبيه ريم، ===
+# «كلية الأعمال | IMAMU»): case-A القديم التقط أول رابط t.me في
+# التنبيه واستعمله كيوزر المُرسِل — وللمجموعات العامة أول رابط هو
+# رابط الرسالة الأصلية https://t.me/<يوزر-المجموعة>/<msg_id> فتسرّب
+# يوزر المجموعة (@IMAMUBusiness) إلى التلميح كأنه يوزر الطالبة، مع
+# وعدٍ بزر «مراسلة» غير موجود والاسم/الايدي ميتين (الخادم أسقط روابط
+# tg://user?id لأنها أُرسلت قبل زرع الكيان). الأنماط التالية تكشف
+# التلوث في الكنس التالي — التنبيه الملوث لا يحمل نص «قيد التفعيل»
+# بعد أن "شُفي" case-A زورًا.
+_REQ_POLLUTED_HINT_RE = re.compile(
+    r'للتواصل: زر «مراسلة» أدناه أو @[A-Za-z0-9_]{4,} في سطر المُرسِل')
+_REQ_POLLUTED_TAIL_RE = re.compile(
+    r'للتواصل مع المُرسِل: اضغط زر «مراسلة» أو الـ@username '
+    r'في سطر «المرسل» أعلاه\.')
+# الزخرفة الوحيدة الموثوقة لليوزر داخل التنبيه: سطر المرسل نفسه —
+# <a href="https://t.me/UNAME">(@UNAME)</a> (backreference تضمن تطابق
+# الرابط مع النص الظاهر) — رابط الرسالة الأصلية t.me/X/msg_id لا
+# يطابقها أبدًا.
+_REQ_SENDER_UNAME_RE = re.compile(
+    r'https://t\.me/([A-Za-z0-9_]{4,})">\(@\1\)</a>')
 
 # === [ID-CODE-STRIP v4.5.6] أمر المُشغّل 2026-11-22: «الايدي غير قابل
 # للنقر مع أنك أمس أصلحته» === السبب الجذري الموثّق: غلاف <code> حول رقم
@@ -11134,56 +11154,100 @@ class Monitor:
                     # raw_text وليس text (parse_mode يشوه الإزاحات)
                     _html = _tl_html.unparse(
                         getattr(_msg, 'raw_text', '') or '', _msg.entities)
+                    # [v4.5.8] التلوث: تلميح يذكر @يوزر بلا زخرفته
+                    # في سطر المرسل (case-A القديم التقط يوزر المجموعة
+                    # من رابط الرسالة الأصلية) — يُعالج حتى لو لم يبقَ
+                    # نص «قيد التفعيل» في التنبيه.
+                    _pol_m = _REQ_POLLUTED_HINT_RE.search(_html)
+                    _polluted = False
+                    if _pol_m:
+                        _pm_u = re.search(r'@([A-Za-z0-9_]{4,})',
+                                          _pol_m.group(0))
+                        _polluted = not (
+                            _pm_u and (f'(@{_pm_u.group(1)})' in _html))
                     if (_REQ_DELTAIL_PENDING not in _html
-                            and _REQ_HINT_ACTIVATING not in _html):
+                            and _REQ_HINT_ACTIVATING not in _html
+                            and not _polluted):
                         continue
                     _stuck += 1
                     _m = re.search(r'tg://user\?id=(\d+)', _html)
                     if not _m:
-                        # [CASE-A] تنبيه مكتمل (يوزر معروف وقت البناء — روابط
-                        # t.me تعمل) لكنه حمل ذيل «قيد التفعيل» الكاذب من
-                        # عهد خلل BTN-URL (Telethon 1.46): علامة الحذف لم
-                        # تكتشف زر «مراسلة» فكتبت الوعد الميت. الروابط سليمة
-                        # — نصحح الذيل/التلميح الكاذب فقط.
-                        _um = re.search(
-                            r'https://t\.me/([A-Za-z0-9_]{4,})', _html)
+                        # [CASE-A-v4.5.8] أعيدت كتابة الفرع — بلاغ المُشغّل
+                        # 2026-11-22 (تنبيه ريم): الاستخراج القديم كان يلتقط
+                        # أول رابط t.me في التنبيه، وللمجموعة العامة هذا
+                        # رابط الرسالة الأصلية t.me/<يوزر-المجموعة>/<msg_id>
+                        # فيتسرب يوزر المجموعة كأنه يوزر المُرسِل → تلميح
+                        # كاذب «زر مراسلة أو @يوزر» بلا زر ولا يوزر. المصدر
+                        # الوحيد الموثوق: زخرفة سطر المرسل (@يوزر) نفسها.
+                        _um = _REQ_SENDER_UNAME_RE.search(_html)
                         _uname_a = _um.group(1) if _um else ''
-                        _new_a = _html.replace(
-                            _REQ_DELTAIL_PENDING,
-                            "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
-                            "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
-                            "في سطر «المرسل» أعلاه.")
                         if _uname_a:
-                            _new_a = _new_a.replace(
-                                _REQ_HINT_ACTIVATING,
+                            # يوزر موثّق بسطر المرسل — ذيل BTN-URL الكاذب
+                            # فقط (السلوك الأصلي) مع فحص وجود الزر قبل
+                            # الوعد به في التلميح.
+                            _has_btn_a = False
+                            try:
+                                for _row_a in (_msg.buttons or []):
+                                    for _b_a in (_row_a or []):
+                                        if 't.me' in (self._btn_url(_b_a) or ''):
+                                            _has_btn_a = True
+                                            break
+                                    if _has_btn_a:
+                                        break
+                            except Exception:
+                                _has_btn_a = False
+                            _hint_a = (
                                 f"للتواصل: زر «مراسلة» أدناه أو @{_uname_a} "
-                                f"في سطر المُرسِل")
-                        else:
+                                f"في سطر المُرسِل" if _has_btn_a else
+                                f"للتواصل: @{_uname_a} في سطر المُرسِل أعلاه")
+                            _new_a = _html.replace(
+                                _REQ_DELTAIL_PENDING,
+                                "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
+                                "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
+                                "في سطر «المرسل» أعلاه.")
                             _new_a = _new_a.replace(
-                                _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
-                        # [ID-CODE-STRIP v4.5.6] روابط t.me حية أصلًا في
-                        # هذه الحالة — خلع <code> كي يفتح النقر بدل النسخ.
-                        _new_a = _strip_id_code(_new_a)
-                        if _new_a == _html:
-                            _skipped += 1
-                            logging.info(
-                                f"[ALERT-HEAL] skip msg_id={_msg.id} — نمط "
-                                f"عالق بلا روابط ميتة ولا ذيل قابل للتصحيح")
+                                _REQ_HINT_ACTIVATING, _hint_a)
+                            _new_a = _REQ_POLLUTED_HINT_RE.sub(
+                                _hint_a, _new_a)
+                            # [ID-CODE-STRIP v4.5.6] روابط t.me حية أصلًا في
+                            # هذه الحالة — خلع <code> كي يفتح النقر بدل النسخ.
+                            _new_a = _strip_id_code(_new_a)
+                            if _new_a == _html:
+                                _skipped += 1
+                                logging.info(
+                                    f"[ALERT-HEAL] skip msg_id={_msg.id} — نمط "
+                                    f"عالق بلا روابط ميتة ولا ذيل قابل للتصحيح")
+                                continue
+                            try:
+                                await _bot_client.edit_message(
+                                    _target, _msg.id, _new_a,
+                                    parse_mode='html', link_preview=False)
+                                _healed += 1
+                                logging.info(
+                                    f"[ALERT-HEAL] ✅ healed(case-A) msg_id={_msg.id} "
+                                    f"— ذيل كاذب صُحح")
+                                await asyncio.sleep(1.5)
+                            except Exception as _ea:
+                                _skipped += 1
+                                logging.info(
+                                    f"[ALERT-HEAL] case-A edit failed "
+                                    f"msg_id={_msg.id}: {_ea}")
                             continue
+                        # [CASE-A2-v4.5.8] بلا زخرفة يوزر: لا يوزر في
+                        # التنبيه أصلًا — إعادة بناء كاملة من رقم الايدي
+                        # 🆔 (زرع الكيان + روابط حية + نصوص صادقة).
                         try:
-                            await _bot_client.edit_message(
-                                _target, _msg.id, _new_a,
-                                parse_mode='html', link_preview=False)
+                            _did = await self._alert_heal_rebuild_no_username(
+                                _bot_client, _readers, _target, _msg, _html)
+                        except Exception as _rb_e:
+                            logging.info(
+                                f"[ALERT-HEAL] rebuild error "
+                                f"msg_id={_msg.id}: {_rb_e}")
+                            _did = False
+                        if _did:
                             _healed += 1
-                            logging.info(
-                                f"[ALERT-HEAL] ✅ healed(case-A) msg_id={_msg.id} "
-                                f"— ذيل كاذب صُحح")
-                            await asyncio.sleep(1.5)
-                        except Exception as _ea:
+                        else:
                             _skipped += 1
-                            logging.info(
-                                f"[ALERT-HEAL] case-A edit failed "
-                                f"msg_id={_msg.id}: {_ea}")
                         continue
                     _sid = int(_m.group(1))
                     if _sid <= 0:
@@ -11260,6 +11324,11 @@ class Monitor:
                             _REQ_HINT_ACTIVATING,
                             f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
                             f"في سطر المُرسِل")
+                        # [v4.5.8] تلوث قديم (case-A سابق) بنفس موضع
+                        # التلميح → يُكتب بالنص الصحيح لليوزر الحقيقي.
+                        _new = _REQ_POLLUTED_HINT_RE.sub(
+                            f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
+                            f"في سطر المُرسِل", _new)
                         _new = _new.replace(
                             _REQ_DELTAIL_PENDING,
                             "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
@@ -11273,6 +11342,24 @@ class Monitor:
                             _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
                         _new = _new.replace(
                             _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
+                        # [v4.5.8] بقايا تلوث case-A القديم → صادقة: لا
+                        # وعد بزر/يوزر ما لم يوجد زر t.me فعلي بالرسالة.
+                        _new = _REQ_POLLUTED_HINT_RE.sub(
+                            _REQ_HINT_ACTIVE, _new)
+                        _has_btn_cb = False
+                        try:
+                            for _row_cb in (_msg.buttons or []):
+                                for _b_cb in (_row_cb or []):
+                                    if 't.me' in (self._btn_url(_b_cb) or ''):
+                                        _has_btn_cb = True
+                                        break
+                                if _has_btn_cb:
+                                    break
+                        except Exception:
+                            _has_btn_cb = False
+                        if not _has_btn_cb:
+                            _new = _REQ_POLLUTED_TAIL_RE.sub(
+                                _REQ_DELTAIL_ACTIVE, _new)
                         # [ID-CODE-STRIP v4.5.6] الكيان مزروع في الكنس →
                         # الذكر يحيا بإعادة الإرسال: خلع <code>.
                         _new = _strip_id_code(_new)
@@ -11298,6 +11385,235 @@ class Monitor:
                 f"{_stuck} skipped={_skipped}")
         except Exception as _hsw:
             logging.warning(f"[ALERT-HEAL] sweep error (non-fatal): {_hsw}")
+
+    async def _alert_heal_rebuild_no_username(self, bot_client, readers,
+                                               target, msg, html):
+        """[ALERT-HEAL-v4.5.8 CASE-A2] إعادة بناء تنبيه بلا يوزر خسر
+        روابطه — بلاغ المُشغّل 2026-11-22 08:36 (تنبيه ريم/«كلية الأعمال
+        | IMAMU»): الخادم يُسقط روابط tg://user?id من رسائل البوت حين
+        أُرسلت قبل معرفة الكيان → الاسم نص ميت والايدي كودًا أعمى،
+        والتلميح/الذيل علقا بوعد «قيد التفعيل» أو لُوّثا بيوزر المجموعة
+        (case-A القديم التقطه من رابط الرسالة الأصلية). المسار:
+        (1) استخراج رقم الايدي من سطر 🆔، (2) التحقق من معرفة البوت
+        للكيان — وإلا زرعه عبر حساب الالتقاط، (3) ظهر username الآن؟
+        ترقية كاملة (روابط t.me + زر مراسلة)، (4) وإلا روابط tg://user?id
+        حية فوق الاسم/الايدي (برهان v4.5.6d: التعديل بها بعد معرفة
+        الكيان ينتج روابط حية)، (5) تلميح/ذيل صادقان بلا وعود كاذبة،
+        (6) تحقق بإعادة الجلب — إن لم تُقبل الروابط يُستبدل التلميح
+        بالنص الصادق. تعيد True عند تعديل ناجح. غير قاتل تمامًا."""
+        try:
+            # (1) رقم الايدي من سطر 🆔 (unparse يُخرج <strong> لا <b>)
+            _idm = re.search(
+                r'الايدي:?</(?:strong|b)>(?:\s|<[^>]+>)*(\d{4,})', html)
+            if not _idm:
+                _idm = re.search(r'🆔[^\n]*?(\d{5,})', html)
+            if not _idm:
+                logging.info(
+                    f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — لا رقم ايدي")
+                return False
+            _sid = int(_idm.group(1))
+            if _sid <= 0:
+                return False
+            # (2) معرفة الكيان — زرع عبر حساب الالتقاط إن لزم
+            _known = None
+            try:
+                _known = await asyncio.wait_for(
+                    bot_client.get_entity(_sid), timeout=4)
+            except Exception:
+                _known = None
+            if _known is None:
+                _pref = ''
+                try:
+                    for _row in (msg.buttons or []):
+                        for _b in (_row or []):
+                            _d = (getattr(_b, 'data', None) or b'')
+                            if isinstance(_d, bytes) and _d.startswith(b'cbc:'):
+                                _parts = _d.decode(
+                                    'utf-8', 'replace').split(':')
+                                if len(_parts) >= 4:
+                                    _pref = _parts[3]
+                                break
+                        if _pref:
+                            break
+                except Exception:
+                    _pref = ''
+                if not await self._entity_transfer_via_capture(
+                        _sid, 'الطالب', prefer_phone=_pref):
+                    logging.info(
+                        f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — "
+                        f"تعذر زرع كيان المرسل {_sid}")
+                    return False
+                try:
+                    _known = await asyncio.wait_for(
+                        bot_client.get_entity(_sid), timeout=5)
+                except Exception:
+                    _known = None
+                if _known is None:
+                    return False
+            # (3) username ظهر الآن؟
+            _uname = re.sub(
+                r'[^A-Za-z0-9_]', '',
+                str(getattr(_known, 'username', '') or '').lstrip('@'))
+            if len(_uname) < 4:
+                _uname = ''
+            _new = html
+            _btns_rb = None
+            if _uname:
+                # ترقية كاملة: روابط t.me + زر مراسلة (نمط case-B)
+                _new = _new.replace(
+                    f'<a href="tg://user?id={_sid}"><code>{_sid}</code></a>',
+                    f'<a href="https://t.me/{_uname}">{_sid}</a>', 1)
+                _m2 = re.search(
+                    r'<a href="tg://user\?id=' + str(_sid) + r'">(.*?)</a>',
+                    _new)
+                if _m2:
+                    _new = _new.replace(
+                        _m2.group(0),
+                        f'{_m2.group(1)} '
+                        f'<a href="https://t.me/{_uname}">(@{_uname})</a>', 1)
+                # [v4.5.8b] الخادم أسقط روابط التنبيه (أُرسل بلا يوزر
+                # قبل معرفة الكيان) — ابنِ رابط الايدي t.me من جديد
+                if f'<a href="https://t.me/{_uname}">{_sid}</a>' not in _new:
+                    if f'<code>{_sid}</code>' in _new:
+                        _new = _new.replace(
+                            f'<code>{_sid}</code>',
+                            f'<a href="https://t.me/{_uname}">{_sid}</a>', 1)
+                    else:
+                        _new = re.sub(
+                            r'(الايدي:?</(?:strong|b)>(?:\s|<[^>]+>)*?)'
+                            + str(_sid),
+                            lambda m: m.group(1)
+                            + f'<a href="https://t.me/{_uname}">{_sid}</a>',
+                            _new, count=1)
+                # زخرفة (@يوزر) بسطر المرسل إن غابت (لا رابط قديم)
+                if f'(@{_uname})' not in _new:
+                    _nm_u = re.search(
+                        r'(👤 <(?:strong|b)>المرسل:</(?:strong|b)> )([^\n<]+)',
+                        _new)
+                    if _nm_u and _nm_u.group(2).strip():
+                        _new = _new.replace(
+                            _nm_u.group(0),
+                            _nm_u.group(1) + _nm_u.group(2).strip()
+                            + f' <a href="https://t.me/{_uname}">'
+                              f'(@{_uname})</a>', 1)
+                _hint_t = (f"للتواصل: زر «مراسلة» أدناه أو @{_uname} "
+                           f"في سطر المُرسِل")
+                _tail_t = ("🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع "
+                           "المُرسِل: اضغط زر «مراسلة» أو الـ@username "
+                           "في سطر «المرسل» أعلاه.")
+                _rows_rb = [list(_r) for _r in (msg.buttons or []) if _r]
+                _has_dm_rb = False
+                for _r in _rows_rb:
+                    for _b in _r:
+                        if f'https://t.me/{_uname}' in (self._btn_url(_b) or ''):
+                            _has_dm_rb = True
+                            break
+                    if _has_dm_rb:
+                        break
+                if not _has_dm_rb:
+                    _rows_rb.append([Button.url(
+                        "✉️ مراسلة", f"https://t.me/{_uname}")])
+                _btns_rb = _rows_rb or None
+            else:
+                # (4) روابط tg حية فوق الاسم والايدي (الكيان معروف)
+                _link_id = f'<a href="tg://user?id={_sid}">{_sid}</a>'
+                _pat_a = (f'<a href="tg://user?id={_sid}">'
+                          f'<code>{_sid}</code></a>')
+                _pat_b = f'<code>{_sid}</code>'
+                if _pat_a in _new:
+                    _new = _new.replace(_pat_a, _link_id, 1)
+                elif _pat_b in _new:
+                    _new = _new.replace(_pat_b, _link_id, 1)
+                else:
+                    _new = re.sub(
+                        r'(الايدي:?</(?:strong|b)>(?:\s|<[^>]+>)*?)'
+                        + str(_sid),
+                        lambda m: m.group(1) + _link_id, _new, count=1)
+                # الاسم: نص مجرد → رابط tg (الموجود برابط يُعاد تقييمه
+                # بالإرسال فيحيا) — الفحص على سطر المرسل نفسه لا على
+                # كامل الرسالة (رابط الايدي بنفس المعرّف سبق أن أُضيف)
+                if not re.search(
+                        r'👤 <(?:strong|b)>المرسل:</(?:strong|b)> <a ', _new):
+                    _nm = re.search(
+                        r'(👤 <(?:strong|b)>المرسل:</(?:strong|b)> )([^\n<]+)',
+                        _new)
+                    if _nm and _nm.group(2).strip():
+                        _new = _new.replace(
+                            _nm.group(0),
+                            _nm.group(1)
+                            + f'<a href="tg://user?id={_sid}">'
+                            + _nm.group(2).strip() + '</a>', 1)
+                _hint_t = _REQ_HINT_ACTIVE
+                _tail_t = _REQ_DELTAIL_ACTIVE
+            # (5) نصوص صادقة — بقايا التلوث/التعليق تُستبدل كلها
+            _new = _REQ_POLLUTED_HINT_RE.sub(_hint_t, _new)
+            _new = _new.replace(_REQ_HINT_ACTIVATING, _hint_t)
+            _new = _new.replace(_REQ_DELTAIL_PENDING, _tail_t)
+            if not _uname:
+                # لا زر مراسلة ممكن — أي وعد به في الذيل تلوث قديم
+                _new = _REQ_POLLUTED_TAIL_RE.sub(_tail_t, _new)
+            if _new == html:
+                logging.info(
+                    f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — لا تغيير")
+                return False
+            await bot_client.edit_message(
+                target, msg.id, _new, parse_mode='html',
+                link_preview=False, buttons=_btns_rb)
+            logging.info(
+                f"[ALERT-HEAL] ✅ rebuilt(no-username) msg_id={msg.id} "
+                f"sender={_sid} "
+                f"username={('@' + _uname) if _uname else 'none'}")
+            await asyncio.sleep(1.5)
+            # (6) تحقق: أُعيد جلب الرسالة — هل قبل الخادم الروابط؟
+            try:
+                await asyncio.sleep(1.0)
+                _vreader = readers[0] if readers else None
+                _vhtml = ''
+                _vmsg = None
+                if _vreader is not None:
+                    _vmsg = await asyncio.wait_for(
+                        _vreader.get_messages(target, ids=msg.id), timeout=10)
+                if _vmsg is not None:
+                    from telethon.extensions import html as _tl_html2
+                    _vhtml = _tl_html2.unparse(
+                        getattr(_vmsg, 'raw_text', '') or '',
+                        getattr(_vmsg, 'entities', None)) or ''
+                _live = (f'tg://user?id={_sid}' in _vhtml) or bool(
+                    _uname and (f'https://t.me/{_uname}' in _vhtml))
+                if (not _live) and (_vmsg is not None):
+                    for _ve in (getattr(_vmsg, 'entities', None) or []):
+                        if int(getattr(_ve, 'user_id', 0) or 0) == _sid:
+                            _live = True
+                            break
+                if _vhtml and not _live:
+                    # الروابط لم تُقبل — النص الصادق بدل الوعد
+                    _honest_hint = (
+                        "للتواصل: المُرسِل بلا username — الاسم والايدي "
+                        "أعلاه قد لا يستجيبان للضغط (قيد تلغرام على "
+                        "رسائل البوتات)")
+                    _honest = _REQ_POLLUTED_HINT_RE.sub(_honest_hint, _new)
+                    _honest = _honest.replace(_hint_t, _honest_hint)
+                    _honest = _honest.replace(_tail_t, _REQ_DELTAIL_ACTIVE)
+                    if _honest != _new:
+                        try:
+                            await bot_client.edit_message(
+                                target, msg.id, _honest,
+                                parse_mode='html', link_preview=False)
+                            logging.info(
+                                f"[ALERT-HEAL] msg_id={msg.id} — الروابط "
+                                f"لم تُقبل، استُبدل التلميح بالنص الصادق")
+                        except Exception:
+                            pass
+                else:
+                    logging.info(
+                        f"[ALERT-HEAL] msg_id={msg.id} verified live={_live}")
+            except Exception as _vv_e:
+                logging.debug(
+                    f"[ALERT-HEAL] verify error (non-fatal): {_vv_e}")
+            return True
+        except Exception as _rb:
+            logging.warning(f"[ALERT-HEAL] rebuild error (non-fatal): {_rb}")
+            return False
 
     async def _delayed_alert_heal(self):
         """[ALERT-HEAL v4.5.5] كنس دوري ذاتي الشفاء: أول دورة بعد 4 دقائق
