@@ -11489,10 +11489,17 @@ class Monitor:
                     except Exception:
                         _known = None
                 if _known is None:
+                    # [v4.5.8e] البرهان الحي 10:22: كيانات StringSession
+                    # للبوت تُمسح مع كل إعادة نشر، ورسالة الذكر لا تحمل
+                    # access_hash أصلًا — get_entity قد يستحيل بعد أي
+                    # إقلاع. لا نعود: نتقدم بلا كيان معروف — روابط
+                    # tg://user?id تُخزَّن TextUrl على الأقل (برهان
+                    # 170/174) والتحقق اللاحق يقرر الحياة الحقيقية،
+                    # والاحتياط الصادق يوقف أي وعد كاذب.
                     logging.info(
-                        f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — "
-                        f"الكيان {_sid} لم يُعرف رغم الزرع (سباق)")
-                    return False
+                        f"[ALERT-HEAL] rebuild msg_id={msg.id} — الكيان "
+                        f"{_sid} غير معروف محليًا؛ التقدم بروابط tg "
+                        f"(التحقق الحاسم بعد التعديل)")
             # (3) username ظهر الآن؟
             _uname = re.sub(
                 r'[^A-Za-z0-9_]', '',
@@ -11607,7 +11614,12 @@ class Monitor:
                 f"sender={_sid} "
                 f"username={('@' + _uname) if _uname else 'none'}")
             await asyncio.sleep(1.5)
-            # (6) تحقق: أُعيد جلب الرسالة — هل قبل الخادم الروابط؟
+            # (6) تحقق: أُعيد جلب الرسالة — ماذا قبل الخادم فعلًا؟
+            #   MentionName(user_id) → ذكر حي لدى كل المشتركين
+            #   TextUrl(tg://user?id) → رابط مخزّن (يعمل لمن يعرف
+            #     المرسل — أفضل من لا شيء)
+            #   لا شيء فوق الأرقام → الخادم أسقطها → احتياط صادق + <code>
+            #     فوق الرقم (حماية الدايلر — درس v4.4.25)
             try:
                 await asyncio.sleep(1.0)
                 _vreader = readers[0] if readers else None
@@ -11621,15 +11633,17 @@ class Monitor:
                     _vhtml = _tl_html2.unparse(
                         getattr(_vmsg, 'raw_text', '') or '',
                         getattr(_vmsg, 'entities', None)) or ''
-                _live = (f'tg://user?id={_sid}' in _vhtml) or bool(
-                    _uname and (f'https://t.me/{_uname}' in _vhtml))
-                if (not _live) and (_vmsg is not None):
+                _mention_live = False
+                if _vmsg is not None:
                     for _ve in (getattr(_vmsg, 'entities', None) or []):
                         if int(getattr(_ve, 'user_id', 0) or 0) == _sid:
-                            _live = True
+                            _mention_live = True
                             break
-                if _vhtml and not _live:
-                    # الروابط لم تُقبل — النص الصادق بدل الوعد
+                _link_stored = (f'tg://user?id={_sid}' in _vhtml) or bool(
+                    _uname and (f'https://t.me/{_uname}' in _vhtml))
+                if _vhtml and not _mention_live and not _link_stored:
+                    # الخادم أسقط كل الروابط — الأرقام قد تظهر مجردة
+                    # (خطر الدايلر) والوعد كاذب: احتياط صادق شامل.
                     _honest_hint = (
                         "للتواصل: المُرسِل بلا username — الاسم والايدي "
                         "أعلاه قد لا يستجيبان للضغط (قيد تلغرام على "
@@ -11637,19 +11651,25 @@ class Monitor:
                     _honest = _REQ_POLLUTED_HINT_RE.sub(_honest_hint, _new)
                     _honest = _honest.replace(_hint_t, _honest_hint)
                     _honest = _honest.replace(_tail_t, _REQ_DELTAIL_ACTIVE)
+                    # أعد غلاف <code> فوق رقم الايدي إن صار مجردًا
+                    _honest = _honest.replace(
+                        f'<a href="tg://user?id={_sid}">{_sid}</a>',
+                        f'<code>{_sid}</code>')
                     if _honest != _new:
                         try:
                             await bot_client.edit_message(
                                 target, msg.id, _honest,
                                 parse_mode='html', link_preview=False)
                             logging.info(
-                                f"[ALERT-HEAL] msg_id={msg.id} — الروابط "
-                                f"لم تُقبل، استُبدل التلميح بالنص الصادق")
+                                f"[ALERT-HEAL] msg_id={msg.id} — الخادم "
+                                f"أسقط الروابط؛ احتياط صادق + <code>")
                         except Exception:
                             pass
                 else:
                     logging.info(
-                        f"[ALERT-HEAL] msg_id={msg.id} verified live={_live}")
+                        f"[ALERT-HEAL] msg_id={msg.id} verified "
+                        f"mention_live={_mention_live} "
+                        f"link_stored={_link_stored}")
             except Exception as _vv_e:
                 logging.debug(
                     f"[ALERT-HEAL] verify error (non-fatal): {_vv_e}")
