@@ -11377,7 +11377,15 @@ class Monitor:
                 _bot_id = 0
             from telethon.tl.types import (MessageEntityCode as _MEC,
                                            MessageEntityMentionName as _MEMN,
-                                           ReplyInlineMarkup as _RIM)
+                                           ReplyInlineMarkup as _RIM,
+                                           ReplyKeyboardHide as _RKH,
+                                           KeyboardButtonRow as _KBR)
+            from telethon.helpers import add_surrogate as _add_sur
+            try:
+                from telethon.tl.types import (
+                    KeyboardInlineButtonRow as _KIBR)
+            except ImportError:
+                _KIBR = _KBR  # مخطط قديم
             _stripped_btn = 0
             _stripped_code = 0
             for _msg in _msgs:
@@ -11392,13 +11400,19 @@ class Monitor:
                     # (1) نطاقات روابط الايدي الرقمية (ذكر حي أو t.me أو
                     # tg://user?id) — كيان <code> فوقها هو الذي يجعل النقر
                     # نسخًا بدل الفتح.
+                    # [v4.5.6b] إزاحات الكيانات من الخادم بوحدات UTF-16
+                    # (الإيموجي = وحدتان) بينما raw_text بايثوني — التقطيع
+                    # المباشر كان ينزاح بعد كل إيموجي فلا يُكتشف الرقم
+                    # أبدًا (برهان حي: code_الايدي=لا في كل الجولة الأولى).
+                    # الحل: التقطيع على النص المعزز بالبدائل (surrogates).
+                    _raw16 = _add_sur(_raw)
                     _id_spans = []
                     for _e in _ents:
                         _url = str(getattr(_e, 'url', '') or '')
                         if (isinstance(_e, _MEMN)
                                 or 't.me/' in _url
                                 or 'tg://user?id=' in _url):
-                            _seg = _raw[_e.offset:_e.offset + _e.length]
+                            _seg = _raw16[_e.offset:_e.offset + _e.length]
                             if _seg.isdigit():
                                 _id_spans.append(
                                     (_e.offset, _e.offset + _e.length))
@@ -11426,18 +11440,61 @@ class Monitor:
                         _kept.append(_row)
                     if not _code_changed and not _had_red:
                         continue
-                    _btns_arg = None
-                    if _had_red:
-                        _btns_arg = (_kept if _kept else _RIM(rows=[]))
                     # تعديل تمريري: النص والكيانات كما هما (بلا parse_mode)
                     # — بوتونات=None تعني «الأزرار كما هي» في تلغرام.
-                    await _bot_client.edit_message(
-                        _target, _msg.id, _raw,
-                        formatting_entities=_new_ents,
-                        link_preview=False, buttons=_btns_arg)
-                    if _had_red:
+                    # [v4.5.6b] سلسلة بدائل المسح الكامل للأزرار (الرسائل
+                    # التي صفها الوحيد هو الأحمر): rows=[] الفارغة مرفوضة
+                    # خادميًا (برهان حي 04:40Z «reply markup is invalid») —
+                    # نجرّب صفًا فارغًا واحدًا بالمخططين ثم ReplyKeyboardHide،
+                    # وإن فشل الجميع وثمة خلع كود نطبّقه وحده والأزرار
+                    # تبقى لمحاولة الجولة التالية (الكنس يعيد كل ساعة).
+                    _edit_ok = False
+                    if _had_red and _kept:
+                        await _bot_client.edit_message(
+                            _target, _msg.id, _raw,
+                            formatting_entities=_new_ents,
+                            link_preview=False, buttons=_kept)
+                        _edit_ok = True
+                    elif _had_red and not _kept:
+                        _variants = (_RIM(rows=[_KIBR(buttons=[])]),
+                                     _RIM(rows=[_KBR(buttons=[])]),
+                                     _RKH())
+                        for _clr in _variants:
+                            try:
+                                await _bot_client.edit_message(
+                                    _target, _msg.id, _raw,
+                                    formatting_entities=_new_ents,
+                                    link_preview=False, buttons=_clr)
+                                _edit_ok = True
+                                break
+                            except Exception as _clr_e:
+                                logging.info(
+                                    f"[RED-STRIP] clear-variant فشل "
+                                    f"msg_id={_msg.id}: {_clr_e}")
+                        if not _edit_ok and _code_changed:
+                            try:
+                                await _bot_client.edit_message(
+                                    _target, _msg.id, _raw,
+                                    formatting_entities=_new_ents,
+                                    link_preview=False, buttons=None)
+                                _edit_ok = True
+                                logging.info(
+                                    f"[RED-STRIP] msg_id={_msg.id} — خلع "
+                                    f"الكود وحده (مسح الأزرار الكامل رُفض،"
+                                    f" يُعاد بالجولة التالية)")
+                            except Exception as _cf:
+                                logging.info(
+                                    f"[RED-STRIP] code-only فشل "
+                                    f"msg_id={_msg.id}: {_cf}")
+                    elif _code_changed:
+                        await _bot_client.edit_message(
+                            _target, _msg.id, _raw,
+                            formatting_entities=_new_ents,
+                            link_preview=False, buttons=None)
+                        _edit_ok = True
+                    if _edit_ok and _had_red:
                         _stripped_btn += 1
-                    if _code_changed:
+                    if _edit_ok and _code_changed:
                         _stripped_code += 1
                     logging.info(
                         f"[RED-STRIP] ✅ msg_id={_msg.id} — "
