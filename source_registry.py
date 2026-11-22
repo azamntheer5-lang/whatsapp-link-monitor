@@ -490,9 +490,16 @@ class PollingScheduler:
     # (قابلة للضبط عبر POLL_TIER_*_S دون نشر جديد — لو أراد المُشغّل
     # استعادة سرعة v4.3.4: 4/12/45/240.)
     # الحماية الفعلية تبقى في RateLimiter('polling') + FloodWaitManager.
+    #
+    # [REQUEST-NET-v4.5.9] طلب المُشغّل «سرعة السحب ضعيف… ابيه يكون 🔥»:
+    # الاستطلاع صار شبكة إنقاذ للطلبات أيضًا (فوات الحدث الحي = إنقاذ
+    # خلال فترة استطلاع المجموعة بدل الضياع للأبد) — لذا فترات hot/active
+    # خُفّضت: 45→20s و120→60s (المجموعات النشطة — حيث تُرسل الطلبات
+    # فعلًا — تُنقذ خلال ≤20-60ث). cool/cold كما هي (دردشة هادئة، حماية
+    # باندويث). RateLimiter('polling') + FloodWaitManager يبقيان خط الدفاع.
     TIERS = {
-        'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '45'))},
-        'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '120'))},
+        'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '20'))},
+        'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '60'))},
         'cool':   {'max_age_min': 1440, 'poll_interval_s': float(os.getenv('POLL_TIER_COOL_S', '300'))},
         'cold':   {'max_age_min': None, 'poll_interval_s': float(os.getenv('POLL_TIER_COLD_S', '900'))},
     }

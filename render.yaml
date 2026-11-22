@@ -90,13 +90,13 @@ services:
       # إعادة تمكين AI للطلبات (اختياري): "true". ===
       - key: REQUEST_AI_ENABLED
         value: "false"
-      # === [v4.4.0 BANDWIDTH-LEAN] فترات polling أخف (بقاء على Render):
-      # الطلب يُلتقط لحظيًا عبر NewMessage؛ الـpolling شبكة أمان فقط.
-      # استعادة سرعة v4.3.4: 4 / 12 / 45 / 240 ===
+      # === [REQUEST-NET-v4.5.9] الاستطلاع صار شبكة إنقاذ للطلبات أيضًا
+      # (فات الحدث الحي = إنقاذ خلال فترة الاستطلاع بدل الضياع):
+      # hot 45→20s / active 120→60s. cool/cold كما هي (دردشة هادئة). ===
       - key: POLL_TIER_HOT_S
-        value: "45"
+        value: "20"
       - key: POLL_TIER_ACTIVE_S
-        value: "120"
+        value: "60"
       - key: POLL_TIER_COOL_S
         value: "300"
       - key: POLL_TIER_COLD_S

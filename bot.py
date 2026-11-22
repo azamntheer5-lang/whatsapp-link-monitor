@@ -40,7 +40,8 @@ import aiosqlite
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.errors import (FloodWaitError, RPCError, UserPrivacyRestrictedError,
-                             PeerFloodError)
+                             PeerFloodError, AuthKeyDuplicatedError,
+                             UnauthorizedError)
 from telethon.sessions import StringSession
 from aiohttp import web
 import json as json_module
@@ -5047,6 +5048,80 @@ class IgnoreStore:
 
 
 # -------------------------------------------------------------------
+# [REQUEST-NET-v4.5.9] غلاف رسالة الاستطلاع كحدث لمسار الطلبات
+# -------------------------------------------------------------------
+
+class _PollingEventShim:
+    """غلاف خفيف يحوّل رسالة get_messages (الاستطلاع) إلى كائن يشبه
+    حدث NewMessage بما يقرؤه _handle_request_path فقط (كل القراءات
+    getattr دفاعية هناك): chat (title/username/broadcast/megagroup)
+    + sender/sender_id + raw_text + id + get_sender().
+
+    لماذا غلاف بدل الحدث الحقيقي: رسالة الاستطلاع ليست حدثًا —
+    _handle_request_path صُمم لحدث Telethon. الغلاف يزوّد نفس الواجهة
+    بلا أي نداء API إضافي (chat metadata من صف monitored_chats،
+    get_sender يؤجَّل للطلب الداخلي الموجود أصلًا في مسار الطلبات).
+    """
+
+    __slots__ = ('_msg', '_chat_info', '_via_polling_net')
+
+    def __init__(self, msg, chat_info: dict):
+        self._msg = msg
+        self._chat_info = chat_info or {}
+        self._via_polling_net = True  # علامة إنقاذ (للعداد والمقاييس)
+
+    # --- خصائص يشبه الحدث ---
+    @property
+    def chat(self):
+        _lt = str(self._chat_info.get('link_type', 'group') or 'group')
+
+        class _ShimChat:
+            __slots__ = ('title', 'username', 'broadcast', 'megagroup')
+        c = _ShimChat()
+        c.title = self._chat_info.get('chat_title', '') or ''
+        c.username = self._chat_info.get('username', '') or ''
+        # قناة بث → مسار الطلبات يتخطاها (قاعدة groups-only نفسها)
+        c.broadcast = (_lt == 'channel')
+        c.megagroup = (_lt != 'channel')
+        return c
+
+    @property
+    def sender(self):
+        try:
+            return getattr(self._msg, 'sender', None)
+        except Exception:
+            return None
+
+    @property
+    def sender_id(self):
+        try:
+            return getattr(self._msg, 'sender_id', None)
+        except Exception:
+            return None
+
+    @property
+    def raw_text(self):
+        return getattr(self._msg, 'raw_text', None)
+
+    @property
+    def id(self):
+        return getattr(self._msg, 'id', 0)
+
+    @property
+    def is_private(self):
+        return False  # الاستطلاع للمجموعات/القنوات فقط
+
+    async def get_sender(self):
+        try:
+            _gs = getattr(self._msg, 'get_sender', None)
+            if callable(_gs):
+                return await _gs()
+        except Exception:
+            return None
+        return None
+
+
+# -------------------------------------------------------------------
 # Monitor (Multi-User)
 # -------------------------------------------------------------------
 
@@ -9188,6 +9263,18 @@ class Monitor:
             f"patterns={len(analysis.matched_patterns)} "
             f"chat_id={chat_id} msg_id={msg_id}"
         )
+        # [REQUEST-NET-v4.5.9] طلب وصل عبر شبكة إنقاذ الاستطلاع (فاتته
+        # الأحداث الحية) واجتاز الفلترة — يُنقذ بدل الضياع. عدّاد حي
+        # يُعرض في /api/polling_status لإثبات عمل الشبكة من الإنتاج.
+        if getattr(event, '_via_polling_net', False):
+            self._request_net_rescued = getattr(
+                self, '_request_net_rescued', 0) + 1
+            logging.info(
+                f"[REQUEST-NET] 🛟 RESCUED via polling net — request missed "
+                f"live events and was rescued by catch-up poll "
+                f"chat_id={chat_id} msg_id={msg_id} "
+                f"(rescued_total={self._request_net_rescued})"
+            )
 
         # --- استخراج معلومات المرسل/المجموعة (متزامن، بلا API إضافي) ---
         chat_title = ''
@@ -13261,20 +13348,44 @@ class Monitor:
                 await asyncio.sleep(self._polling_interval)
 
     async def _poll_one_chat(self, phone: str, chat: dict):
-        """يسحب آخر 3 رسائل من مجموعة واحدة ويستخرج أي روابط جديدة."""
+        """يسحب آخر 3 رسائل من مجموعة واحدة ويستخرج أي روابط جديدة.
+
+        [REQUEST-NET-v4.5.9] طلب المُشغّل (2026-11-22): «سرعة السحب ضعيف —
+        جربت أرسل طلب في أحد المجموعات ما سحبه مع أن بوت صديقي سحبه».
+        التشخيص الحي: مسار الطلبات كان يعتمد 100% على أحداث NewMessage —
+        أي فجوة (حساب مراقب ميت AuthKeyUnregistered، نافذة إعادة نشر،
+        انقطاع شبكة عابر) = الطلب ضائع للأبد، بينما الاستطلاع (شبكة
+        الأمان الموجودة أصلًا) كان يعالج الروابط فقط (والروابط متوقفة
+        أصلًا!). الآن الاستطلاع يُطلق مسار الطلبات أيضًا لكل رسالة
+        جديدة لم يرها مسار الأحداث — الفجوة تُنقذ خلال فترة استطلاع
+        المجموعة بدل الضياع. حدود عدم التكرار (بترتيب الفحص): cache
+        120s → message_claim (persistent 7d) → already_decided_db →
+        _request_sent — الرسائل التي عالجها NewMessage تُتخطى، والفائتة
+        فقط يُنقذ.
+        """
         chat_id = chat.get('chat_id')
         chat_title = chat.get('chat_title', f'chat_{chat_id}')
         if not chat_id:
             return
-        
+
         client = self.user_clients.get(phone)
         if not client or not client.is_connected():
             return
-        
+
         # آخر msg_id شفناه لهذي المجموعة
         async with self._polling_lock:
             last_msg_id = self._polling_state.get(chat_id, 0)
-        
+        # [REQUEST-NET-v4.5.9] علامة الماء تُزرَع من DB — كانت في الذاكرة
+        # فقط فتُصفَّر عند كل إعادة تشغيل → get_messages(limit=10) يرجع آخر
+        # 10 رسائل ويتخطى كل ما بين العلامة القديمة وآخر 10 (فجوة النشر
+        # تضيع بصمت). DB last_msg_id (B02) يصمد عبر إعادة التشغيل.
+        try:
+            _db_wm = int(chat.get('last_msg_id') or 0)
+        except (TypeError, ValueError):
+            _db_wm = 0
+        if _db_wm > last_msg_id:
+            last_msg_id = _db_wm
+
         try:
             # اسحب الرسائل الجديدة (id > last_msg_id) — [SPEED-v4.3.4]
             # limit قابلة للضبط (default 10) + min_id=last_msg_id = كفاءة عالية
@@ -13285,7 +13396,34 @@ class Monitor:
             )
             if not messages:
                 return  # ما فيه جديد
-            
+
+            # [REQUEST-NET] ترقيم صفحات محدود لفجوات اللحاق: get_messages
+            # يرجع أحدث N فقط — لو الفجوة أكبر من N تبقى الرسائل الأقدم
+            # ضائعة للأبد لأن العلامة تقفز للأحدث. نسحب حتى 4 صفحات إضافية
+            # (بحد أقصى ~50 رسالة/دورة) بترتيب تنازلي حتى تنفد الجديد.
+            _rn_pages = 1
+            _rn_max_pages = int(getattr(self, '_polling_catchup_pages', 4) or 4)
+            while _rn_pages <= _rn_max_pages:
+                _rn_ids = [m.id for m in messages if m]
+                if not _rn_ids or len(_rn_ids) < _pf_limit:
+                    break
+                _rn_floor = min(_rn_ids)
+                if _rn_floor <= last_msg_id:
+                    break
+                try:
+                    _rn_more = await client.get_messages(
+                        chat_id, limit=_pf_limit,
+                        min_id=last_msg_id, max_id=_rn_floor)
+                except Exception:
+                    break
+                if not _rn_more:
+                    break
+                messages = list(messages) + [m for m in _rn_more if m]
+                _rn_pages += 1
+            # المعالجة بالترتيب الزمني (الأقدم أولًا) — تنبيهات الإنقاذ
+            # المتأخر تصل بترتيبها الطبيعي في قناة الطلبات.
+            messages = sorted((m for m in messages if m), key=lambda m: m.id)
+
             # نجاح — صفّر عدّاد الإخفاقات المتتالية
             self._chat_poll_failures[chat_id] = 0
             # حدّث آخر msg_id شفناه
@@ -13333,6 +13471,25 @@ class Monitor:
                     if claim_token is None:
                         # سبق معالجتها بواسطة NewMessage أو Scanner أو حساب آخر
                         continue
+
+                # === [REQUEST-NET-v4.5.9] مسار الطلبات عبر الاستطلاع ===
+                # وصلنا إلى هنا = الرسالة لم يرها مسار الأحداث الحية إطلاقًا
+                # (cache فاتته TTL 120s + claim جديد كليًا) — أي حدث
+                # NewMessage فُقد: حساب ميت، نافذة نشر، انقطاع. نُطلق مسار
+                # الطلبات بنفس الفلترة وبواباتها؛ لو اجتازت تُنشر (متأخرة
+                # خيرٌ من ضائعة) ولو رُفضت فقرارها يُسجَّل كالمعتاد.
+                # غير قاتل تمامًا: فشل الـdispatch لا يوقف مسار الروابط.
+                try:
+                    _rn_shim = _PollingEventShim(msg, chat)
+                    _rn_disp = getattr(self, '_dispatch_request_path', None)
+                    if callable(_rn_disp):
+                        await _rn_disp(
+                            _rn_shim, msg.raw_text, chat_id, msg.id, phone)
+                        self._request_net_dispatched = getattr(
+                            self, '_request_net_dispatched', 0) + 1
+                except Exception as _rn_e:
+                    logging.debug(
+                        f"[REQUEST-NET] dispatch error (non-fatal): {_rn_e}")
 
                 # استخرج الروابط
                 # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (polling صامت).
@@ -15918,12 +16075,53 @@ class Monitor:
             if self.bot_client and self.bot_client.is_connected():
                 _role_label = ('Monitor' if str(role or 'monitor') == 'monitor'
                                else 'Joiner')
+                # [REQUEST-NET-v4.5.9] المجموعات التي فقدت تغطيتها فعلًا:
+                # هذا الهاتف كان قارئها الوحيد ولا يوجد قارئ حي آخر —
+                # طلباتها لن تصل لا بالأحداث ولا بالاستطلاع. القائمة تجعل
+                # التنبيه قابلاً للتنفيذ: المالك يعرف فورًا أي مجموعات
+                # تحتاج /login لحساب جديد (مرتّبة بآخر نشاط، أحدث 15).
+                _blind_lines = ''
+                try:
+                    reg = getattr(self, 'source_registry', None)
+                    if reg is not None:
+                        _phones_map = getattr(reg, '_chat_to_phones', None) or {}
+                        _health = getattr(reg, '_phone_health', None) or {}
+                        _blind_ids = [
+                            cid for cid, phs in _phones_map.items()
+                            if phone in phs and not any(
+                                _health.get(p, False)
+                                for p in phs if p != phone)]
+                        if _blind_ids:
+                            _mc = {}
+                            try:
+                                for c in await self.prod_db.get_monitored_chats(
+                                        limit=50000):
+                                    _mc[c.get('chat_id')] = c
+                            except Exception:
+                                pass
+                            _rows = sorted(
+                                ((str(((_mc.get(cid) or {}).get(
+                                    'last_activity')) or ''),
+                                  str(((_mc.get(cid) or {}).get(
+                                      'chat_title')) or f'chat_{cid}'))
+                                 for cid in _blind_ids),
+                                key=lambda r: r[0], reverse=True)
+                            _titles = [t for _, t in _rows[:15]]
+                            _extra = len(_rows) - len(_titles)
+                            _blind_lines = (
+                                "\n⚠️ مجموعات فقدت التغطية كليًا "
+                                "(لا قارئ حي آخر — طلباتها لن تُسحب):\n"
+                                + "\n".join(f"• {t}" for t in _titles)
+                                + (f"\n• … و{_extra} أخرى" if _extra > 0 else ""))
+                except Exception:
+                    _blind_lines = ''
                 msg = (
                     f"⚠️ *{_role_label} Account DOWN*\n"
                     f"Phone: `{phone}`\n"
                     f"Reason: `{reason}`\n"
                     f"Action: re-login or update session_string in watchers DB\n"
                     f"The account is now OFFLINE until fixed."
+                    + _blind_lines
                 )
                 try:
                     await self.bot_client.send_message(oid, msg, parse_mode='Markdown')
@@ -15964,6 +16162,9 @@ class Monitor:
         """
         phone = watcher['phone']
         backoff = 5
+        # [REQUEST-NET-v4.5.9] قيمة أولية آمنة — فرع معالجة أخطاء المفاتيح
+        # بالأسفل يستخدم role، وقد يُرمى الاستثناء قبل إسنادها داخل الحلقة.
+        role = watcher.get('role', 'monitor')
         while self._running:
             try:
                 # [REQAUDIT-3] Re-fetch watcher from DB so updated
@@ -15981,6 +16182,26 @@ class Monitor:
                     role = watcher.get('role', 'monitor')
 
                 client = self.user_clients.get(phone)
+                # [REQUEST-NET-v4.5.9] اكتشاف تغيّر الجلسة: الحلقة تعيد قراءة
+                # الجلسة من DB كل دورة (REQAUDIT-3) لكن العميل القدين
+                # (المبني على الجلسة الميتة) يبقى في user_clients للأبد —
+                # /login جديد لا يُلتقط إلا بإعادة تشغيل كاملة (موثق
+                # سابقًا: «الإصلاح الوحيد: إعادة تشغيل الخدمة»). الآن: بصمة
+                # الجلسة تُختم على العميل — تغيّرت في DB → استبدال فوري
+                # بلا إعادة تشغيل.
+                try:
+                    _sess_fp = hash(session_string or '')
+                except Exception:
+                    _sess_fp = None
+                if client is not None and _sess_fp is not None:
+                    _old_fp = getattr(client, '_rn_session_fp', None)
+                    if _old_fp is not None and _old_fp != _sess_fp:
+                        logging.info(
+                            f"[ACCOUNT] {phone} session_string CHANGED in DB "
+                            f"— replacing client (recovery WITHOUT restart)")
+                        self._cleanup_user_client(phone)
+                        client = None
+                        self._alerted_terminal_phones.discard(phone)
                 if client is None:
                     # حماية من الجلسات التالفة
                     if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
@@ -16005,6 +16226,12 @@ class Monitor:
                     self.user_clients[phone] = client
                     # [REQAUDIT-3] session recovered → clear the alert flag
                     self._alerted_terminal_phones.discard(phone)
+                    # [REQUEST-NET-v4.5.9] ختم بصمة الجلسة (لكشف تغيّرها لاحقًا)
+                    try:
+                        if _sess_fp is not None:
+                            client._rn_session_fp = _sess_fp
+                    except Exception:
+                        pass
 
                 if not client.is_connected():
                     logging.info(f"[ACCOUNT] {phone} connecting...")
@@ -16050,9 +16277,49 @@ class Monitor:
                     # === Notify SourceRegistry of phone status ===
                     if self.source_registry:
                         self.source_registry.update_phone_status(phone, True)
+                    # [REQUEST-NET-v4.5.9 RADAR] فور جاهزية الحساب (إقلاع أو
+                    # إعادة اتصال بعد انقطاع): صفّر next_poll_at لكل مجموعاته
+                    # → المجدول يسحبها في دورته التالية (~1s) — فجوة
+                    # الانقطاع/النشر تُردم خلال ثوانٍ بدل انتظار فترة
+                    # المستوى. مهمة خلفية (لا تؤخر الحلقة).
+                    try:
+                        asyncio.create_task(
+                            self._catchup_kick_chats_for_phone(phone))
+                    except Exception:
+                        pass
                     backoff = 5
                 await client.run_until_disconnected()
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
+            except (UnauthorizedError, AuthKeyDuplicatedError) as e:
+                # [REQUEST-NET-v4.5.9] جلسة ميتة (أُنهيت/مُسحت/أُبطلت/حُظر
+                # الحساب) أو مخترقة من IP آخر — البرهان الحي 11:40Z: حلقة
+                # READY→error كل ~6ث بلا نهاية (كانت تقع في فرع RPCError
+                # العام فيُعاد المحاولة كل 5ث للأبد). UnauthorizedError هو
+                # الأساس المشترك لكل حالات «أعد تسجيل الدخول»
+                # (AuthKeyUnregistered/AuthKeyInvalid/SessionRevoked/
+                # UserDeactivated…) وAuthKeyDuplicated من عائلة AuthKeyError.
+                # الجلسة الميتة لا تُحيا بإعادة المحاولة — cooldown 10
+                # دقائق + تنبيه المالك مرة واحدة (نفس بوابات الكتم في
+                # _alert_terminal_failure). الحلقة تظل تعيد قراءة الجلسة
+                # من DB كل دورة → /login جديد يُلتقط تلقائيًا (مع إصلاح
+                # استبدال العميل أعلاه).
+                _rn_why = (
+                    'auth_key_duplicated — session used under two IPs '
+                    '(another holder is alive; kill it or /login fresh)'
+                    if isinstance(e, AuthKeyDuplicatedError)
+                    else 'auth key dead/revoked — /login required')
+                try:
+                    await self._alert_terminal_failure(
+                        phone, type(e).__name__, _rn_why, role=role)
+                except Exception:
+                    pass
+                logging.error(
+                    f"[ACCOUNT] {phone} error: {type(e).__name__}: {e} "
+                    f"— cooldown 600s (no 5s retry spam; DB session "
+                    f"re-fetch continues every cycle)"
+                )
+                await asyncio.sleep(600)
+                backoff = 300
             except (RPCError, ConnectionError, OSError) as e:
                 logging.error(f"[ACCOUNT] {phone} error: {type(e).__name__}: {e}")
             except asyncio.CancelledError: raise
@@ -16078,6 +16345,41 @@ class Monitor:
             logging.info(f"[CLEANUP] Removed user_client for {phone}")
         # Also invalidate dialog cache for this phone
         self.db.invalidate_dialogs_cache(phone)
+
+    async def _catchup_kick_chats_for_phone(self, phone: str):
+        """[REQUEST-NET-v4.5.9 RADAR] ردم فوري لفجوات الانقطاع.
+
+        تُستدعى فور جاهزية حساب (إقلاع أولي أو إعادة اتصال بعد أي انقطاع/
+        خطأ/نشر): UPDATE واحد يصفّر next_poll_at لكل مجموعات هذا الهاتف
+        → PollingScheduler يسحبها في دورته التالية (~1s cycle) بدل انتظار
+        فترة المستوى (20-60s للمجموعات النشطة). أي رسالة/طلب فات الأحداث
+        الحية أثناء فجوة الانقطاع يُنقذ خلال ثوانٍ من عودة الحساب.
+
+        مطابقة الهاتف: reader_phones (عمود JSON array — LIKE على
+        "%\"<phone>\"%" آمن: أرقام الهواتف لا تحوي علامات اقتباس) أو
+        monitored_by (توافق خلفي). لا يُلمس last_activity/last_seen — تصنيف
+        المستوى يبقى دقيقًا. RateLimiter('polling') + FloodWaitManager
+        يحميان من أي اندفاع (25/min لكل حساب — الحماية المعمارية باقية).
+        غير قاتل تمامًا: أي فشل يُسجَّل debug فقط."""
+        try:
+            _now = datetime.now().isoformat()
+            conn = await self.prod_db._conn()
+            _like = f'%"{phone}"%'
+            cursor = await conn.execute(
+                """UPDATE monitored_chats
+                   SET next_poll_at = ?
+                   WHERE should_monitor = 1
+                     AND (reader_phones LIKE ? OR monitored_by = ?)""",
+                (_now, _like, phone))
+            await conn.commit()
+            _kicked = cursor.rowcount or 0
+            if _kicked:
+                logging.info(
+                    f"[REQUEST-NET] 🌩️ RADAR kick — {phone} (re)connected: "
+                    f"{_kicked} chats reset to poll-NOW "
+                    f"(disconnect gap swept within ~1s)")
+        except Exception as _ck:
+            logging.debug(f"[REQUEST-NET] radar kick error (non-fatal): {_ck}")
 
     def _get_any_user_client(self):
         """يجلب أي user_client متصل (للاستخدام في عمليات get_messages/delete_messages).
@@ -19258,6 +19560,21 @@ async def api_polling_status_handler(request):
         # [SPEED-v4.3.4] إعدادات السرعة الجديدة + حالة المهام الخلفية
         _bg_tasks = getattr(monitor, '_request_bg_tasks', None) or set()
         _sched = getattr(monitor, 'polling_scheduler', None)
+        # [REQUEST-NET-v4.5.9] مقاييس شبكة إنقاذ الطلبات: عدد الإطلاقات من
+        # الاستطلاع، عدد الطلبات المنقذة فعلًا (اجتازت الفلترة)، وعدد
+        # المجموعات العمياء (لا قارئ حي لها إطلاقًا — طلباتها لن تُسحب
+        # لا بالأحداث ولا بالاستطلاع حتى /login حساب جديد).
+        _blind_chats_count = 0
+        try:
+            _reg = getattr(monitor, 'source_registry', None)
+            if _reg is not None:
+                _pm = getattr(_reg, '_chat_to_phones', None) or {}
+                _ph = getattr(_reg, '_phone_health', None) or {}
+                _blind_chats_count = sum(
+                    1 for phs in _pm.values()
+                    if not any(_ph.get(p, False) for p in phs))
+        except Exception:
+            pass
         return web.json_response({
             'polling_enabled': True,
             'polling_interval': monitor._polling_interval,
@@ -19273,6 +19590,12 @@ async def api_polling_status_handler(request):
             'scheduler_running': scheduler_running,
             'cache_size': cache_size,
             'cache_ttl': monitor._msg_cache_ttl,
+            'request_net': {
+                'dispatched': int(getattr(monitor, '_request_net_dispatched', 0) or 0),
+                'rescued': int(getattr(monitor, '_request_net_rescued', 0) or 0),
+                'catchup_pages': int(getattr(monitor, '_polling_catchup_pages', 4) or 4),
+            },
+            'blind_chats_count': _blind_chats_count,
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
