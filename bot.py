@@ -11606,9 +11606,46 @@ class Monitor:
                 logging.info(
                     f"[ALERT-HEAL] rebuild skip msg_id={msg.id} — لا تغيير")
                 return False
-            await bot_client.edit_message(
-                target, msg.id, _new, parse_mode='html',
-                link_preview=False, buttons=_btns_rb)
+            try:
+                await bot_client.edit_message(
+                    target, msg.id, _new, parse_mode='html',
+                    link_preview=False, buttons=_btns_rb)
+            except Exception as _ed_nm:
+                # [v4.5.8g] برهان حي 11:02: رسائل أرقامها المجردة (153/
+                # 150…) — الخادم يُسقط رابط tg الميت قبل مقارنة المحتوى
+                # فيعود «لم يتغير شيء» رغم اختلاف النص المحلي، وتدور
+                # الجولة كل كنس بلا نهاية. الحل: الاحتياط الصادق فورًا —
+                # تغيير نصي حقيقي (تلميح/ذيل) يُقبل دائمًا ويستقر.
+                if 'not modified' not in str(_ed_nm).lower():
+                    raise
+                logging.info(
+                    f"[ALERT-HEAL] msg_id={msg.id} — الرابط أُسقط خادميًا "
+                    f"قبل المقارنة (not modified)؛ الاحتياط الصادق فورًا")
+                _nm_hint = (
+                    "للتواصل: المُرسِل بلا username — الاسم والايدي "
+                    "أعلاه قد لا يستجيبان للضغط (قيد تلغرام على "
+                    "رسائل البوتات)")
+                _nm_tail = (
+                    "🔗 الرابط أعلاه لن يفتح شيئًا — المُرسِل بلا "
+                    "username: لم يبقَ مسار تواصل تلقائي مؤكد.")
+                _nm_new = _REQ_POLLUTED_HINT_RE.sub(_nm_hint, _new)
+                _nm_new = _nm_new.replace(_hint_t, _nm_hint)
+                _nm_new = _nm_new.replace(_tail_t, _nm_tail)
+                _nm_new = _nm_new.replace(_REQ_DELTAIL_ACTIVE, _nm_tail)
+                _nm_new = _nm_new.replace(
+                    f'<a href="tg://user?id={_sid}">{_sid}</a>',
+                    f'<code>{_sid}</code>')
+                if _nm_new != _new:
+                    try:
+                        await bot_client.edit_message(
+                            target, msg.id, _nm_new, parse_mode='html',
+                            link_preview=False)
+                        logging.info(
+                            f"[ALERT-HEAL] ✅ honest(not-modified) "
+                            f"msg_id={msg.id}")
+                    except Exception:
+                        pass
+                return True
             logging.info(
                 f"[ALERT-HEAL] ✅ rebuilt(no-username) msg_id={msg.id} "
                 f"sender={_sid} "
