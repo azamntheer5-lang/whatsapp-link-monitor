@@ -9276,6 +9276,22 @@ class Monitor:
                 f"(rescued_total={self._request_net_rescued})"
             )
 
+        # === [TURBO-RADAR-v4.5.10] قبول = هذه المجموعة تُنتج طلبات فعلًا ===
+        # طلب المُشغّل (2026-11-22): «ابي بنفس الثانية». التشخيص الحي: الحدث
+        # الحي يلتقط خلال ~0.6-1.0s (جيد)، لكن أي فجوة أحداث (نشر/انقطاع/
+        # حساب ميت) كانت تنتظر دورة استطلاع المجموعة والاستطلاع غارق
+        # (~2500 مجموعة نشطة ضد سقف ~13 استطلاع/ث → دقائق). الآن: كل قبول
+        # يرفع مجموعته لطبقة turbo (استطلاع كل 5s لمدة 45د + إعادة استطلاع
+        # فورية الآن) → الطلب التالي في نفس المجموعة، لو فات الحدث الحي،
+        # يُنقذ خلال ≤5-7ث. طلبات الطلبة متجمعة: حيث ظهر طلب سيظهر غيره.
+        # غير حاجب إطلاقًا (dict update + مهمة خلفية للركلة الفورية).
+        try:
+            _turbo_fn = getattr(self, '_request_turbo_mark', None)
+            if callable(_turbo_fn):
+                _turbo_fn(int(chat_id))
+        except Exception as _turbo_e:
+            logging.debug(f"[TURBO-RADAR] mark error (non-fatal): {_turbo_e}")
+
         # --- استخراج معلومات المرسل/المجموعة (متزامن، بلا API إضافي) ---
         chat_title = ''
         chat_username = ''
@@ -16346,6 +16362,98 @@ class Monitor:
         # Also invalidate dialog cache for this phone
         self.db.invalidate_dialogs_cache(phone)
 
+    def _request_turbo_mark(self, chat_id: int, minutes: float = 45.0):
+        """[TURBO-RADAR-v4.5.10] ارفع المجموعة لطبقة turbo (استطلاع كل 5s).
+
+        يُستدعى فور قرار ACCEPT في مسار الطلبات (وحده — لا عند الرفض:
+        الدردشة تُنتج رفضًا كثيرًا بلا طلبات). السجل: {chat_id: expiry_ts}
+        على المونيتور؛ الجدولة (PollingScheduler.is_turbo) تقرأه عند حساب
+        next_poll_at. سقف حجم السجل (TURBO_MAX_CHATS=80) يضمن بقاء الطلب
+        الإجمالي ≤ ~16 استطلاع/ث ضمن سقف الحسابات — الطرد بالأقرب انتهاءً.
+        الركلة الفورية (next_poll_at=now) تُطلق كمهمة خلفية: أي طلب لاحق
+        في نفس المجموعة خلال الثواني القادمة تلتقطه الدورة التالية (~1s)
+        حتى لو فات الحدث الحي. غير قاتل تمامًا."""
+        try:
+            _cid = int(chat_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            reg = getattr(self, '_turbo_chats', None)
+            if not isinstance(reg, dict):
+                reg = self._turbo_chats = {}
+            now = time.time()
+            # نظّف المنتهية (رخيص: السجل صغير بسقف صارم)
+            if len(reg) > 0:
+                for _k in [k for k, v in reg.items()
+                           if not isinstance(v, (int, float)) or v <= now]:
+                    reg.pop(_k, None)
+            # سقف الحجم — طرد الأقرب انتهاءً (الأقل إثباتًا للنشاط)
+            _cap = int(getattr(self, '_TURBO_MAX_CHATS', 80) or 80)
+            if len(reg) >= _cap and _cid not in reg and reg:
+                _evict = min(reg, key=lambda k: reg[k])
+                reg.pop(_evict, None)
+            reg[_cid] = now + float(minutes) * 60.0
+            # ركلة فورية: استطلاع هذه المجموعة في الدورة القادمة (~1s)
+            try:
+                asyncio.create_task(self._turbo_kick(_cid))
+            except Exception:
+                pass  # الركلة تحسين فقط — الطبقة نفسها كافية
+            logging.info(
+                f"[TURBO-RADAR] 🚀 chat_id={_cid} turbo {minutes:.0f}m "
+                f"(set_size={len(reg)}) — rescue interval now 5s"
+            )
+        except Exception as e:
+            logging.debug(f"[TURBO-RADAR] mark error (non-fatal): {e}")
+
+    async def _turbo_kick(self, chat_id: int):
+        """[TURBO-RADAR-v4.5.10] ركلة فورية: next_poll_at=now للمجموعة.
+
+        نفس نمط RADAR kick لكن لمجموعة واحدة — تُستدعى خلفية من
+        _request_turbo_mark كي لا تحجب مسار الإرسال إطلاقًا."""
+        try:
+            await self.prod_db.update_monitored_chat(
+                int(chat_id), next_poll_at=datetime.now().isoformat())
+        except Exception as _tk_e:
+            logging.debug(f"[TURBO-RADAR] kick error (non-fatal): {_tk_e}")
+
+    async def _turbo_bootstrap(self):
+        """[TURBO-RADAR-v4.5.10] إقلاع الرادار من سجل القرارات.
+
+        آخر 24 ساعة من ACCEPTs في filter_decisions = المجموعات التي تُنتج
+        طلبات فعلًا (الأحدث أولًا حتى السقف). بدون هذا: بعد أي نشر،
+        المجموعات المنتجة تنتظر قبولًا جديدًا لتدخل التوربو — نافذة عمياء
+        في الساعة الأولى بعد الإقلاع وهي أخطر لحظة لفجوات الأحداث."""
+        try:
+            conn = await self.prod_db._conn()
+            cutoff = time.time() - 86400
+            cursor = await conn.execute(
+                """SELECT chat_id, MAX(created_at) AS m
+                   FROM filter_decisions
+                   WHERE decision='ACCEPT' AND created_at > ?
+                     AND chat_id IS NOT NULL
+                   GROUP BY chat_id
+                   ORDER BY m DESC
+                   LIMIT ?""",
+                (cutoff, int(getattr(self, '_TURBO_MAX_CHATS', 80) or 80)))
+            rows = await cursor.fetchall()
+            reg = getattr(self, '_turbo_chats', None)
+            if not isinstance(reg, dict):
+                reg = self._turbo_chats = {}
+            now = time.time()
+            for r in rows:
+                try:
+                    reg[int(r[0])] = now + 3600.0  # ساعة أولى بعد الإقلاع
+                except (TypeError, ValueError):
+                    continue
+            if reg:
+                logging.info(
+                    f"[TURBO-RADAR] 🛫 bootstrapped {len(reg)} request-"
+                    f"producing chat(s) from last-24h ACCEPTs — 5s rescue "
+                    f"interval active from boot"
+                )
+        except Exception as _tb_e:
+            logging.debug(f"[TURBO-RADAR] bootstrap error (non-fatal): {_tb_e}")
+
     async def _catchup_kick_chats_for_phone(self, phone: str):
         """[REQUEST-NET-v4.5.9 RADAR] ردم فوري لفجوات الانقطاع.
 
@@ -18846,6 +18954,10 @@ class Monitor:
         )
         self._polling_scheduler_task = asyncio.create_task(self.polling_scheduler.run())
         logging.info("🔄 PollingScheduler + SourceRegistry + MessageClaim started")
+        # [TURBO-RADAR-v4.5.10] إقلاع الرادار: آخر 24س من القبولات =
+        # المجموعات المنتجة للطلبات — طبقة 5s من أول لحظة بعد النشر
+        # (بلا انتظار قبول جديد). خلفي: لا يؤخر الإقلاع.
+        asyncio.create_task(self._turbo_bootstrap())
         # 5. ابدأ cleanup task للـ processed_messages (كل ساعة)
         self._claim_cleanup_task = asyncio.create_task(self._cleanup_processed_messages_loop())
 
@@ -19654,6 +19766,15 @@ async def api_polling_status_handler(request):
                 'dispatched': int(getattr(monitor, '_request_net_dispatched', 0) or 0),
                 'rescued': int(getattr(monitor, '_request_net_rescued', 0) or 0),
                 'catchup_pages': int(getattr(monitor, '_polling_catchup_pages', 4) or 4),
+                # [TURBO-RADAR-v4.5.10] حجم طبقة التوربو الحية الآن
+                # (مجموعات قبلت طلبات مؤخرًا — استطلاع إنقاذ كل 5s)
+                'turbo_active': (
+                    len([1 for v in (getattr(monitor, '_turbo_chats', None) or {}).values()
+                         if isinstance(v, (int, float)) and v > time.time()])),
+                'turbo_interval_s': (
+                    float((getattr(_sched, 'TIERS', None) or {}).get(
+                        'turbo', {}).get('poll_interval_s', 5))
+                    if _sched is not None else None),
             },
             'blind_chats_count': _blind_chats_count,
             'blind_chats_recent': _blind_chats_recent,

@@ -248,7 +248,11 @@ class RateLimiter:
         'get_entity':        {'max': 30,  'window': 60,   'min_delay': 2},
         'membership_check':  {'max': 20,  'window': 60,   'min_delay': 3},
         'message_send':      {'max': 20,  'window': 60,   'min_delay': 3},
-        'polling':           {'max': int(os.getenv('POLLING_RATE_PER_MIN', '40')),
+        # [TURBO-RADAR-v4.5.10] 40→60/د: طبقة التوربو (5s للمجموعات
+        # المنتجة للطلبات) تحتاج رأس سقف أكبر — get_messages بـ min_id
+        # فارغ أرخص نداء خادمي، وmin_delay 1s يبقى القيد الفعلي (سقف
+        # طبيعي 60/د للحساب الواحد — آمن تمامًا لتلغرام).
+        'polling':           {'max': int(os.getenv('POLLING_RATE_PER_MIN', '60')),
                               'window': 60,
                               'min_delay': float(os.getenv('POLLING_MIN_DELAY_S', '1'))},
         'generic':           {'max': 20,  'window': 60,   'min_delay': 3},

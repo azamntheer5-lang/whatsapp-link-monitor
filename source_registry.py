@@ -497,12 +497,38 @@ class PollingScheduler:
     # خُفّضت: 45→20s و120→60s (المجموعات النشطة — حيث تُرسل الطلبات
     # فعلًا — تُنقذ خلال ≤20-60ث). cool/cold كما هي (دردشة هادئة، حماية
     # باندويث). RateLimiter('polling') + FloodWaitManager يبقيان خط الدفاع.
+    #
+    # [TURBO-RADAR-v4.5.10] طلب المُشغّل «ابي بنفس الثانية»: التشخيص الحي
+    # كشف أن الاستطلاع غارق — ~2500 مجموعة نشطة تطلب ~42 استطلاع/ثانية
+    # مقابل سقف فعلي ~13/ث → الدورة الفعلية للمجموعة النشطة ~3.5 دقيقة
+    # وليس 20-60ث (لهذا تصل الطلباتُ المنقَذة متأخرة دقائق). الحل: توجيه
+    # ميزانية الاستطلاع إلى حيث تُولَّد الطلبات فعلًا — كل مجموعة قبلت
+    # طلبًا خلال 24س تدخل طبقة turbo (فترة 5s، نافذة 45د لكل قبول جديد
+    # + bootstrap عند الإقلاع من filter_decisions) → لو فات الحدثَ الحيَّ
+    # طلبٌ لاحق فيها يُنقَذ خلال ≤5-7ث بدل دقائق. طلبات الطلبة متجمّعة:
+    # حيث ظهر طلب اليوم سيظهر غيره قريبًا.
     TIERS = {
+        'turbo':  {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_TURBO_S', '5'))},
         'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '20'))},
         'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '60'))},
         'cool':   {'max_age_min': 1440, 'poll_interval_s': float(os.getenv('POLL_TIER_COOL_S', '300'))},
         'cold':   {'max_age_min': None, 'poll_interval_s': float(os.getenv('POLL_TIER_COLD_S', '900'))},
     }
+
+    def is_turbo(self, chat_id) -> bool:
+        """[TURBO-RADAR-v4.5.10] هل المجموعة في طبقة التوربو الآن؟
+
+        السجل يعيش على المونيتور (monitor._turbo_chats: {chat_id: expiry_ts})
+        لأن قرارات القبول تُتخذ هناك — الجدولة تقرأه هنا فقط. دفاعي
+        تمامًا: لا سجل/منتهي = ليست توربو (السلوك القديم تمامًا)."""
+        try:
+            reg = getattr(self.monitor, '_turbo_chats', None)
+            if not isinstance(reg, dict):
+                return False
+            _exp = reg.get(int(chat_id))
+            return bool(_exp) and float(_exp) > time.time()
+        except Exception:
+            return False
 
     BATCH_SIZE = int(os.getenv('POLL_BATCH_SIZE', '30'))
     BATCH_PAUSE_S = 0.3
@@ -620,8 +646,14 @@ class PollingScheduler:
                             # Rate limit check (serializes per-account ops)
                             allowed = await self.rate_limiter.acquire(reader, 'polling')
                             if not allowed:
-                                # Rate limit or FloodWait active — delay this chat
-                                await self.update_next_poll(chat_id, 'cool')
+                                # Rate limit or FloodWait active — delay this chat.
+                                # [TURBO-RADAR-v4.5.10] توربو = ضغط عكسي ناعم
+                                # (hot 20s) لا cool 300s — الرادار لا يُطفأ
+                                # لأن حسابًا واحدًا بلغ سقفه (get_reader يوازن
+                                # الحمل والدورة التالية قد تسلّم حسابًا آخر).
+                                await self.update_next_poll(
+                                    chat_id,
+                                    'hot' if self.is_turbo(chat_id) else 'cool')
                                 return
 
                             # 2c. Poll one chat (sequential per chat via lock)
@@ -644,6 +676,11 @@ class PollingScheduler:
                         except Exception:
                             last_activity = None
                         tier = self.classify_tier(last_activity)
+                        # [TURBO-RADAR-v4.5.10] طبقة التوربو تطغى على تصنيف
+                        # النشاط: مجموعة قبلت طلبًا مؤخرًا تُستطلع كل 5s —
+                        # شبكة إنقاذ شبه-لحظية لو فات الأحداثُ طلبًا فيها.
+                        if self.is_turbo(chat_id):
+                            tier = 'turbo'
                         await self.update_next_poll(chat_id, tier)
 
                 # [N09] gather(return_exceptions=True) is already set so one
