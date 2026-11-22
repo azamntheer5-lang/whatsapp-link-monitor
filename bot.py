@@ -11192,8 +11192,11 @@ class Monitor:
                             and not _active_lie):
                         # [v4.5.8-DIAG] تشخيص: تنبيه فيه 🆔 ورابط ايده
                         # ميت ومع ذلك تجاوزه الكنس كاملًا — عينة للسجل.
+                        # [v4.5.8g] الحالة المستقرة الصادقة (تلميح «قد
+                        # لا يستجيبان للضغط») متوقعة — لا تُوقَّع كل كنس.
                         if ('🆔' in (getattr(_msg, 'raw_text', '') or '')
-                                and not _REQ_ID_LINKED_RE.search(_html)):
+                                and not _REQ_ID_LINKED_RE.search(_html)
+                                and 'قد لا يستجيبان للضغط' not in _html):
                             logging.info(
                                 f"[ALERT-HEAL-DIAG] msg_id={_msg.id} تجاوز "
                                 f"بلا مطابقة — عينة: {_html[:500]!r}")
