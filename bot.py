@@ -11420,6 +11420,8 @@ class Monitor:
                     if ('🆔' in _raw) or ('الايدي:' in _raw):
                         _uname_url = ''
                         _mention_src = None
+                        _tg_user_url = ''
+                        _tg_user_uid = 0
                         for _e in _ents:
                             _url = str(getattr(_e, 'url', '') or '')
                             if (not _uname_url and _url
@@ -11432,6 +11434,13 @@ class Monitor:
                             if (_mention_src is None
                                     and isinstance(_e, _MEMN)):
                                 _mention_src = _e
+                            if (not _tg_user_url and _url
+                                    and _url.startswith('tg://user?id=')):
+                                _m_t = re.match(
+                                    r'tg://user\?id=(\d+)$', _url)
+                                if _m_t:
+                                    _tg_user_url = _url
+                                    _tg_user_uid = int(_m_t.group(1))
                         for _e in _ents:
                             if not isinstance(_e, _MEC):
                                 continue
@@ -11453,6 +11462,30 @@ class Monitor:
                                 _sub = _copy_mod.copy(_mention_src)
                                 _sub.offset = _e.offset
                                 _sub.length = _e.length
+                            elif _tg_user_url and _tg_user_uid > 0:
+                                # [v4.5.6d] المصدر الثالث: رابط tg://user
+                                # بسطر المرسل — يعمل فقط إن كان الكيان
+                                # معروفًا للبوت (وإلا رابط ميت يفتح الاتصال
+                                # — درس v4.4.25). فحص + ترقية يوزر إن ظهر.
+                                _sub = None
+                                try:
+                                    _kg = await asyncio.wait_for(
+                                        _bot_client.get_entity(
+                                            _tg_user_uid), timeout=4)
+                                except Exception:
+                                    _kg = None
+                                if _kg is not None:
+                                    _ku = re.sub(
+                                        r'[^A-Za-z0-9_]', '',
+                                        str(getattr(
+                                            _kg, 'username', '') or ''
+                                        ).lstrip('@'))
+                                    _k_url = (f'https://t.me/{_ku}'
+                                              if len(_ku) >= 4
+                                              else _tg_user_url)
+                                    _sub = _METU(
+                                        offset=_e.offset,
+                                        length=_e.length, url=_k_url)
                             if _sub is None:
                                 continue
                             _new_ents = [
