@@ -13495,17 +13495,50 @@ class Monitor:
                 # الطلبات بنفس الفلترة وبواباتها؛ لو اجتازت تُنشر (متأخرة
                 # خيرٌ من ضائعة) ولو رُفضت فقرارها يُسجَّل كالمعتاد.
                 # غير قاتل تمامًا: فشل الـdispatch لا يوقف مسار الروابط.
-                try:
-                    _rn_shim = _PollingEventShim(msg, chat)
-                    _rn_disp = getattr(self, '_dispatch_request_path', None)
-                    if callable(_rn_disp):
-                        await _rn_disp(
-                            _rn_shim, msg.raw_text, chat_id, msg.id, phone)
-                        self._request_net_dispatched = getattr(
-                            self, '_request_net_dispatched', 0) + 1
-                except Exception as _rn_e:
-                    logging.debug(
-                        f"[REQUEST-NET] dispatch error (non-fatal): {_rn_e}")
+                # === [SWEEP-GUARD-v4.5.11] حارس فيضان التاريخ ===
+                # بلاغ المُشغّل (2026-11-23): «خربت كل شي الفلتر وكل شي».
+                # الجذر الحي: بعد أي إقلاع تكون علامة الماء والـclaims
+                # فارغة (قرص مؤقت) فكانت دورة الاستطلاع الأولى تعيد
+                # معالجة آخر 10-50 رسالة من كل مجموعة (~12k+ رسالة):
+                # طلبات قديمة تُنشر مجددًا + إعلانات مزودين قديمة تجتاز
+                # الفلتر → القناة تغرق بمحتوى تاريخي (23 قرار/ثانية،
+                # ~قبول قديم كل 30 ثانية ليلًا). الإنقاذ صُمم لفجوات
+                # الأحداث الحية (ثوانٍ-دقائق) لا لإعادة بث التاريخ:
+                # أي رسالة أقدم من 15 دقيقة لا تُنشر للقناة إطلاقًا.
+                _rn_fresh = True
+                _rn_dt = getattr(msg, 'date', None)
+                if _rn_dt is not None:
+                    try:
+                        _rn_naive = _rn_dt.replace(tzinfo=None) \
+                            if getattr(_rn_dt, 'tzinfo', None) is not None \
+                            else _rn_dt
+                        if (datetime.utcnow() - _rn_naive).total_seconds() \
+                                > 900.0:
+                            _rn_fresh = False
+                    except Exception:
+                        _rn_fresh = True  # دفاعي: فشل الحساب لا يوقف الإنقاذ
+                if not _rn_fresh:
+                    self._request_net_stale_skipped = getattr(
+                        self, '_request_net_stale_skipped', 0) + 1
+                    if self._request_net_stale_skipped % 500 == 1:
+                        logging.info(
+                            f"[SWEEP-GUARD] 🛑 history re-publish blocked — "
+                            f"stale messages skipped so far: "
+                            f"{self._request_net_stale_skipped} (requests "
+                            f"channel protected from backlog flood)"
+                        )
+                else:
+                    try:
+                        _rn_shim = _PollingEventShim(msg, chat)
+                        _rn_disp = getattr(self, '_dispatch_request_path', None)
+                        if callable(_rn_disp):
+                            await _rn_disp(
+                                _rn_shim, msg.raw_text, chat_id, msg.id, phone)
+                            self._request_net_dispatched = getattr(
+                                self, '_request_net_dispatched', 0) + 1
+                    except Exception as _rn_e:
+                        logging.debug(
+                            f"[REQUEST-NET] dispatch error (non-fatal): {_rn_e}")
 
                 # استخرج الروابط
                 # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (polling صامت).
