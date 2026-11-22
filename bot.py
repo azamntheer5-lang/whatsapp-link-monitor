@@ -11168,6 +11168,13 @@ class Monitor:
                     if (_REQ_DELTAIL_PENDING not in _html
                             and _REQ_HINT_ACTIVATING not in _html
                             and not _polluted):
+                        # [v4.5.8-DIAG] تشخيص واحد: تنبيه فيه 🆔 تجاوزه
+                        # الكنس بلا أي مطابقة — سجّل عينة منه (مرة واحدة
+                        # لكل رسالة في الجولة) لكشف أي صيغة غير متوقعة.
+                        if '🆔' in (getattr(_msg, 'raw_text', '') or ''):
+                            logging.info(
+                                f"[ALERT-HEAL-DIAG] msg_id={_msg.id} تجاوز "
+                                f"بلا مطابقة — عينة: {_html[:500]!r}")
                         continue
                     _stuck += 1
                     _m = re.search(r'tg://user\?id=(\d+)', _html)
