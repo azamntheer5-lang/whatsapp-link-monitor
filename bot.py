@@ -16500,21 +16500,42 @@ class Monitor:
                 for _m in _msgs:
                     if _m is None:
                         continue
-                    _txt = getattr(_m, 'message', '') or \
-                        getattr(_m, 'raw_text', '') or ''
-                    for _mm in re.finditer(r't\.me/c/(\d+)/\d+', _txt):
-                        try:
-                            _cid = int(f"-100{_mm.group(1)}")
-                        except (TypeError, ValueError):
-                            continue
-                        # حدّث إن لم يكن موجودًا فقط (لا تطغَ على نافذة
-                        # قبول حديث أطول) + احترم السقف
-                        if reg.get(_cid, 0) < now:
-                            if _cid not in reg and len(reg) >= int(
-                                    getattr(self, '_TURBO_MAX_CHATS', 80) or 80):
+                    # [BUGFIX 14:50Z] روابط التنبيه ليست في النص الخام —
+                    # التنبيه يُرسل HTML فتُخزَّن الروابط ككيانات TextUrl
+                    # (وسيط الزر كـ buttons) لدى الخادم. اجمع المصادر كلها:
+                    # raw_text + كيانات الروابط + روابط الأزرار.
+                    _url_sources = [getattr(_m, 'raw_text', '')
+                                    or getattr(_m, 'message', '') or '']
+                    try:
+                        for _ent in (getattr(_m, 'entities', None) or []):
+                            _u = getattr(_ent, 'url', None)
+                            if _u:
+                                _url_sources.append(str(_u))
+                    except Exception:
+                        pass
+                    try:
+                        for _row in (getattr(_m, 'buttons', None) or []):
+                            for _btn in _row:
+                                _bu = getattr(_btn, 'url', None)
+                                if _bu:
+                                    _url_sources.append(str(_bu))
+                    except Exception:
+                        pass
+                    for _src in _url_sources:
+                        for _mm in re.finditer(r't\.me/c/(\d+)/\d+', _src):
+                            try:
+                                _cid = int(f"-100{_mm.group(1)}")
+                            except (TypeError, ValueError):
                                 continue
-                            reg[_cid] = now + 3600.0
-                        _found += 1
+                            # حدّث إن لم يكن موجودًا فقط (لا تطغَ على نافذة
+                            # قبول حديث أطول) + احترم السقف
+                            if reg.get(_cid, 0) < now:
+                                if _cid not in reg and len(reg) >= int(
+                                        getattr(self, '_TURBO_MAX_CHATS', 80)
+                                        or 80):
+                                    continue
+                                reg[_cid] = now + 3600.0
+                            _found += 1
                 if _found:
                     logging.info(
                         f"[TURBO-RADAR] 📡 channel-bootstrap: {_found} "
