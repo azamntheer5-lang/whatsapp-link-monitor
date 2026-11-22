@@ -143,6 +143,29 @@ _REQ_DELTAIL_ACTIVE = (
     "اضغط الايدي 🆔 أو اسم المُرسِل أعلاه (يعمل رغم حذف الأصل)."
 )
 
+# === [ID-CODE-STRIP v4.5.6] أمر المُشغّل 2026-11-22: «الايدي غير قابل
+# للنقر مع أنك أمس أصلحته» === السبب الجذري الموثّق: غلاف <code> حول رقم
+# الايدي (مضاف منذ v4.4.25 لمنع كشف الرقم كرقم هاتف) يجعل عملاء
+# تيليجرام تفسّر النقر على monospace كـ«نسخ» — الرابط/الذكر تحته حي
+# لكن النقر ينسخ بدل أن يفتح. بلاغ 11-21 («الايدي ما ينضغط وش ابي انا
+# من النسخ») وإصلاح v4.5.4 غيّرا الرابط إلى t.me لكنهما أبقيا <code>
+# فبقي النقر نسخًا. القاعدة الجديدة: الرابط الحي بلا <code> إطلاقًا
+# (t.me للمُرسل ذي اليوزر، والذكر الحي بعد زرع الكيان لمن بلا يوزر) —
+# ويبقى <code> فقط على رابط tg://user?id ميت قبل الزرع (حماية من كشف
+# الرقم كهاتف — درس v4.4.25). المسارات أدناه: البناء الأصلي، تنشيط
+# البذرة، ENTITY-RESCUE، ترقية اليوزر، كنس ALERT-HEAL، ومسحة STRIP
+# للرسائل القديمة.
+_ID_CODE_RE = re.compile(
+    r'(<a href="(?:https://t\.me/[A-Za-z0-9_]{4,}|tg://user\?id=\d+)">)'
+    r'<code>(\d{3,})</code>(</a>)')
+
+
+def _strip_id_code(html_text: str) -> str:
+    """[ID-CODE-STRIP v4.5.6] خلع <code> عن رقم الايدي داخل رابط حي
+    (t.me أو tg://user?id بعد زرع الكيان) — النقر يفتح بدل النسخ.
+    لا يمس أي <code> آخر (روابط القناة القديمة بلا <a> لا تتطابق)."""
+    return _ID_CODE_RE.sub(r'\1\2\3', html_text or '')
+
 # === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
 # نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
 # الترتيب لا يهم) خلال نافذة الـ12 ساعة → تنبيه واحد فقط. نص مختلف
@@ -9507,10 +9530,16 @@ class Monitor:
             _sid_il = int(sender_id or 0)
             if _sid_il > 0:
                 if _uname_clean:
+                    # [ID-CODE-STRIP v4.5.6] رابط t.me حي فورًا لدى الجميع
+                    # — بلا <code> كي يفتح النقر الملف بدل النسخ (الرابط
+                    # http لا يُكشف كرقم هاتف أصلًا فلا حاجة للغلاف).
                     id_line = (f'\n🆔 <b>الايدي:</b> '
                                f'<a href="https://t.me/{_uname_clean}">'
-                               f'<code>{_sid_il}</code></a>')
+                               f'{_sid_il}</a>')
                 else:
+                    # بلا يوزر: الرابط ميت حتى زرع الكيان → يبقى <code>
+                    # حمايةً من كشف الرقم كهاتف (درس v4.4.25)، والتنشيط
+                    # (بذرة/إنقاذ/كنس) يخلعه بعد أن يصير ذكرًا حيًا.
                     id_line = (f'\n🆔 <b>الايدي:</b> '
                                f'<a href="tg://user?id={_sid_il}">'
                                f'<code>{_sid_il}</code></a>')
@@ -9556,30 +9585,13 @@ class Monitor:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
 
-        # === [RED-CONTACT-v4.4.16] زر أحمر + علامة استفهام — أمر المُشغّل ===
-        # 2026-09-12: «زر احمر يشير الى الخطر وبجانبه علامة استفهام ... الاشخاص
-        # اللي يستطيعون استخدام هذا الزر هم المشرفين فقط ونص الرسالة السلام عليكم».
-        #   - الصف الأول أعلى أزرار التنبيه: [🔴 تواصل مع المرسل] [❓]
-        #   - الضغط (للمشرفين فقط — بوابة داخل _handle_red_contact) تُرسل
-        #     «السلام عليكم» حرفيًا إلى خاص صاحب الطلب من الرقم المراقب
-        #     الذي التقط الطلب (مشترك بنفس مجموعة المرسل بحكم الالتقاط).
-        #   - callback data: cbc:<chat_id>:<sender_id>:<source_phone> (≤64B)
-        #   - ❓ (cbh): نص شرح مفتوح للجميع — لا يُرسل شيئًا.
-        #   - بلا sender_id حقيقي (≤0) → لا صف إطلاقًا (لا وجهة للإرسال).
-        #   - فشل بناء الصف لا يمنع إرسال التنبيه أبدًا (نمط الكود الحالي).
-        try:
-            _rc_sid = int(sender_id or 0)
-            if _rc_sid > 0:
-                _rc_cb = f"cbc:{int(chat_id)}:{_rc_sid}:{source_phone or ''}"
-                # [RED-CONTACT-v4.5.4] التسمية الجديدة بطلب المُشغّل
-                # («اقتراح رد وتعديله مازال نفس السابق زر احمر»):
-                # الزر يفتح مسودة قابلة للتعديل في خاص البوت — لا إرسال
-                # مباشر. يبقى أحمر (هوية الخطر الأصلية بطلب 2026-09-12).
-                _rc_row = [[Button.inline("🔴 اقتراح رد ✏️", _rc_cb.encode('utf-8')),
-                            Button.inline("❓", b"cbh")]]
-                dm_buttons = (_rc_row + dm_buttons) if dm_buttons else _rc_row
-        except Exception:
-            pass  # تعذّر بناء صف الزر الأحمر → التنبيه يُرسل بلا صف (غير قاتل)
+        # === [RED-BUTTON-KILL v4.5.6] أمر المُشغّل 2026-11-22: «الزر الأحمر
+        # احذفه نهائياً — اقتراح رد» === التنبيهات الجديدة بلا صف الزر
+        # الأحمر إطلاقًا؛ يبقى وحده زر «✉️ مراسلة» لمرسلٍ معه username.
+        # المعالجات (cbc/cbh/rcsend/rcsug/rccancel) لم تُمسّ كي لا تتعطل
+        # الرسائل القديمة التي تحمل الزر، ومسحة _red_button_strip_sweep
+        # (أول دورة بعد 6 دقائق من الإقلاع) تمسح الصف من آخر 200 رسالة
+        # بالقناة — تعديل أزرار فقط بلا مس النص.
 
         # [MENTION-BRIDGE-v4.4.7] الجسر يُزرع الآن قبل بناء سطر المرسل
         # ([SEED-RACE] أعلاه) — الوقت المناسب: قبل حلّ username النهائي
@@ -11149,6 +11161,9 @@ class Monitor:
                         else:
                             _new_a = _new_a.replace(
                                 _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
+                        # [ID-CODE-STRIP v4.5.6] روابط t.me حية أصلًا في
+                        # هذه الحالة — خلع <code> كي يفتح النقر بدل النسخ.
+                        _new_a = _strip_id_code(_new_a)
                         if _new_a == _html:
                             _skipped += 1
                             logging.info(
@@ -11228,8 +11243,9 @@ class Monitor:
                         _new = _new.replace(
                             f'<a href="tg://user?id={_sid}">'
                             f'<code>{_sid}</code></a>',
+                            # [ID-CODE-STRIP v4.5.6] بلا <code> — النقر يفتح
                             f'<a href="https://t.me/{_uname}">'
-                            f'<code>{_sid}</code></a>', 1)
+                            f'{_sid}</a>', 1)
                         # سطر المرسل: أول ذكر بنفس الايدي → (يوزر) برابط t.me
                         _m2 = re.search(
                             r'<a href="tg://user\?id=' + str(_sid)
@@ -11257,6 +11273,9 @@ class Monitor:
                             _REQ_HINT_ACTIVATING, _REQ_HINT_ACTIVE)
                         _new = _new.replace(
                             _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
+                        # [ID-CODE-STRIP v4.5.6] الكيان مزروع في الكنس →
+                        # الذكر يحيا بإعادة الإرسال: خلع <code>.
+                        _new = _strip_id_code(_new)
                     if _new == _html:
                         continue
                     _merged = self._merge_alert_buttons(
@@ -11298,6 +11317,160 @@ class Monitor:
                 logging.debug(f"[ALERT-HEAL] sweep cycle error: {_dh}")
             try:
                 await asyncio.sleep(1800)
+            except asyncio.CancelledError:
+                return
+
+    async def _red_button_strip_sweep(self):
+        """[RED-BUTTON-STRIP v4.5.6] أمر المُشغّل 2026-11-22: «الزر الأحمر
+        احذفه نهائياً — اقتراح رد». مسحة على آخر 200 رسالة بوت بالقناة:
+        (1) مسح كل صف زر يحوي 🔴 أو «اقتراح رد» (معه ❓) — والأزرار الأخرى
+        (زر «مراسلة») تبقى كما هي. (2) [ID-CODE-STRIP] خلع كيان <code> عن
+        رقم الايدي داخل رابط حي — النص وكل الكيانات الأخرى (الذكر الحي
+        بـaccess hash الخاص به، الروابط، الاقتباسات) تمرّ حرفيًا بلا أي
+        إعادة تسلسل HTML — صفر خطر على الذكر الحي (درس الحفاظ على النص
+        من v4.5.4b). إعادة فحص كل ساعة: idempotent — الرسائل المعالجة
+        لا تحتاج تعديلًا مجددًا فلا يُرسل شيء. مسح كل الأزرار عند بقاء
+        صفوف فارغة عبر ReplyInlineMarkup([]) — متحقق حي 2026-11-22 عبر
+        Bot API (inline_keyboard:[] مقبول). المعالجات (cbc/cbh/rcsend/
+        rcsug/rccancel) باقية بلا تغيير للرسائل الأقدم من النافذة."""
+        try:
+            if str(os.environ.get(
+                    'RED_BUTTON_STRIP_ENABLED', 'true')).strip().lower() \
+                    not in ('1', 'true', 'yes', 'on'):
+                return
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return
+            _target = (getattr(getattr(self, 'config', None),
+                               'requests_target_channel', None)
+                       or getattr(getattr(self, 'config', None),
+                                  'channel_id', None))
+            if not _target:
+                return
+            _uc = getattr(self, 'user_clients', None) or {}
+            _readers = [c for c in _uc.values()
+                        if c is not None and getattr(
+                            c, 'is_connected', lambda: False)()]
+            if not _readers:
+                logging.info("[RED-STRIP] لا حساب قارئ متصل — أُلغيت المسحة")
+                return
+            _msgs = None
+            for _r in _readers[:4]:
+                try:
+                    _msgs = await asyncio.wait_for(
+                        _r.get_messages(_target, limit=200), timeout=25)
+                    break
+                except Exception:
+                    continue
+            if not _msgs:
+                logging.info("[RED-STRIP] تعذر قراءة سجل القناة — أُلغيت")
+                return
+            _bot_id = 0
+            try:
+                _me = getattr(self, '_bot_identity', None)
+                if _me is None:
+                    _me = await asyncio.wait_for(
+                        _bot_client.get_me(), timeout=5)
+                    self._bot_identity = _me
+                _bot_id = int(getattr(_me, 'id', 0) or 0)
+            except Exception:
+                _bot_id = 0
+            from telethon.tl.types import (MessageEntityCode as _MEC,
+                                           MessageEntityMentionName as _MEMN,
+                                           ReplyInlineMarkup as _RIM)
+            _stripped_btn = 0
+            _stripped_code = 0
+            for _msg in _msgs:
+                try:
+                    if _msg is None:
+                        continue
+                    _snd = int(getattr(_msg, 'sender_id', 0) or 0)
+                    if _bot_id and _snd and _snd != _bot_id:
+                        continue  # رسائل البوت فقط — تعديل غيرها يفشل أصلًا
+                    _raw = getattr(_msg, 'raw_text', '') or ''
+                    _ents = list(getattr(_msg, 'entities', None) or [])
+                    # (1) نطاقات روابط الايدي الرقمية (ذكر حي أو t.me أو
+                    # tg://user?id) — كيان <code> فوقها هو الذي يجعل النقر
+                    # نسخًا بدل الفتح.
+                    _id_spans = []
+                    for _e in _ents:
+                        _url = str(getattr(_e, 'url', '') or '')
+                        if (isinstance(_e, _MEMN)
+                                or 't.me/' in _url
+                                or 'tg://user?id=' in _url):
+                            _seg = _raw[_e.offset:_e.offset + _e.length]
+                            if _seg.isdigit():
+                                _id_spans.append(
+                                    (_e.offset, _e.offset + _e.length))
+                    _new_ents = [
+                        _e for _e in _ents
+                        if not (isinstance(_e, _MEC) and any(
+                            _s <= _e.offset and
+                            _e.offset + _e.length <= _t
+                            for _s, _t in _id_spans))]
+                    _code_changed = len(_new_ents) != len(_ents)
+                    if _code_changed and not _new_ents:
+                        # احتياط بلا أثر عملي: رسالة كياناتها كلها كود
+                        # ايدي — لا نجرّب تعديلًا بلا كيانات إطلاقًا.
+                        _new_ents = _ents
+                        _code_changed = False
+                    # (2) صفوف الزر الأحمر (الزر + ❓ في نفس الصف)
+                    _rows = [list(_r) for _r in (_msg.buttons or []) if _r]
+                    _kept, _had_red = [], False
+                    for _row in _rows:
+                        _row_txt = ' '.join(
+                            str(getattr(_b, 'text', '') or '') for _b in _row)
+                        if ('🔴' in _row_txt) or ('اقتراح رد' in _row_txt):
+                            _had_red = True
+                            continue  # الصف كله يُمسح
+                        _kept.append(_row)
+                    if not _code_changed and not _had_red:
+                        continue
+                    _btns_arg = None
+                    if _had_red:
+                        _btns_arg = (_kept if _kept else _RIM(rows=[]))
+                    # تعديل تمريري: النص والكيانات كما هما (بلا parse_mode)
+                    # — بوتونات=None تعني «الأزرار كما هي» في تلغرام.
+                    await _bot_client.edit_message(
+                        _target, _msg.id, _raw,
+                        formatting_entities=_new_ents,
+                        link_preview=False, buttons=_btns_arg)
+                    if _had_red:
+                        _stripped_btn += 1
+                    if _code_changed:
+                        _stripped_code += 1
+                    logging.info(
+                        f"[RED-STRIP] ✅ msg_id={_msg.id} — "
+                        f"زر_أحمر={'مُسح' if _had_red else 'لا'} "
+                        f"code_الايدي={'خُلع' if _code_changed else 'لا'}")
+                    await asyncio.sleep(1.5)
+                except Exception as _se:
+                    logging.info(
+                        f"[RED-STRIP] skip msg_id="
+                        f"{getattr(_msg, 'id', '?')}: {_se}")
+            logging.info(
+                f"[RED-STRIP] sweep done — btn_stripped={_stripped_btn} "
+                f"code_stripped={_stripped_code} scanned={len(_msgs)}")
+        except Exception as _rbs:
+            logging.warning(f"[RED-STRIP] sweep error (non-fatal): {_rbs}")
+
+    async def _delayed_red_button_strip(self):
+        """[RED-BUTTON-STRIP v4.5.6] الجدولة: أول مسحة بعد 6 دقائق من
+        الإقلاع (بعد كنس ALERT-HEAL الأول بدقيقتين) ثم إعادة فحص كل
+        ساعة — بلا أي تعديل إن لم يبق شيء للمسح."""
+        try:
+            await asyncio.sleep(360)
+        except asyncio.CancelledError:
+            return
+        while True:
+            try:
+                await self._red_button_strip_sweep()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 return
 
@@ -11423,8 +11596,9 @@ class Monitor:
                 try:
                     _old_id_link = (f'<a href="tg://user?id={_sid}">'
                                     f'<code>{_sid}</code></a>')
+                    # [ID-CODE-STRIP v4.5.6] بلا <code> — النقر يفتح
                     _new_id_link = (f'<a href="https://t.me/{_uname_clean}">'
-                                    f'<code>{_sid}</code></a>')
+                                    f'{_sid}</a>')
                     _new_text = _new_text.replace(
                         _old_id_link, _new_id_link, 1)
                 except Exception:
@@ -11436,6 +11610,10 @@ class Monitor:
                 # المعلّقة إلى المسار الحي — الايدي/الاسم يعملان الآن
                 _new_text = _new_text.replace(
                     _REQ_DELTAIL_PENDING, _REQ_DELTAIL_ACTIVE)
+                # [ID-CODE-STRIP v4.5.6] الكيان معروف للبوت الآن (زرعه
+                # الإنقاذ) → الذكر سيحيا بإعادة الإرسال: خلع <code> كي
+                # يفتح النقر الملف بدل النسخ.
+                _new_text = _strip_id_code(_new_text)
             if _new_text == _old_text and not _btns:
                 return  # لا تغيير — لا تعديل عبث
             # (6) عدّل التنبيه — إعادة الإرسال بنفس النص تُعيد تقييم ذكر
@@ -11558,6 +11736,9 @@ class Monitor:
                                             _REQ_HINT_ACTIVE)
                     _new_a = _new_a.replace(_REQ_DELTAIL_PENDING,
                                             _REQ_DELTAIL_ACTIVE)
+                    # [ID-CODE-STRIP v4.5.6] الكيان مزروع الآن → الذكر حي:
+                    # خلع <code> عن رقم الايدي كي يفتح النقر الملف بدل النسخ.
+                    _new_a = _strip_id_code(_new_a)
                     if _new_a == _old_a:
                         return  # لا تلميح تفعيل — عُدّل مسبقًا/تنسيق قديم
                     try:
@@ -11613,8 +11794,9 @@ class Monitor:
                 if _sid_up > 0:
                     _old_id_link = (f'<a href="tg://user?id={_sid_up}">'
                                     f'<code>{_sid_up}</code></a>')
+                    # [ID-CODE-STRIP v4.5.6] بلا <code> — النقر يفتح
                     _new_id_link = (f'<a href="https://t.me/{_uname}">'
-                                    f'<code>{_sid_up}</code></a>')
+                                    f'{_sid_up}</a>')
                     _new_text = _new_text.replace(
                         _old_id_link, _new_id_link, 1)
             except Exception:
@@ -17753,6 +17935,10 @@ class Monitor:
         # «قيد التفعيل» المعلقة (روابط ايدي/اسم ميتة) — الوعد الذي
         # كسرته إعادة التشغيل (بلاغ المُشغّل: الايدي ما ينضغط).
         asyncio.create_task(self._delayed_alert_heal())
+
+        # === [RED-BUTTON-STRIP v4.5.6] مسح صف الزر الأحمر نهائيًا من
+        # رسائل القناة القديمة + خلع <code> عن روابط الايدي الحية ===
+        asyncio.create_task(self._delayed_red_button_strip())
 
         # === STARTUP HISTORY SCAN [Req-2] ===
         # Discover groups from RECENT message history of every connected monitor
