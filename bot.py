@@ -16422,7 +16422,10 @@ class Monitor:
         آخر 24 ساعة من ACCEPTs في filter_decisions = المجموعات التي تُنتج
         طلبات فعلًا (الأحدث أولًا حتى السقف). بدون هذا: بعد أي نشر،
         المجموعات المنتجة تنتظر قبولًا جديدًا لتدخل التوربو — نافذة عمياء
-        في الساعة الأولى بعد الإقلاع وهي أخطر لحظة لفجوات الأحداث."""
+        في الساعة الأولى بعد الإقلاع وهي أخطر لحظة لفجوات الأحداث.
+        ملاحظة بنية تحتية: القرص مؤقت على الخدمة الحالية (يُمسح مع كل
+        نشر) — هذا المصدر يعمل فورًا لو رُبط قرص دائم؛ Channel-bootstrap
+        (الأنفلوجة أدناه) هو المصدر الصامد للنشر على البنية الحالية."""
         try:
             conn = await self.prod_db._conn()
             cutoff = time.time() - 86400
@@ -16453,6 +16456,80 @@ class Monitor:
                 )
         except Exception as _tb_e:
             logging.debug(f"[TURBO-RADAR] bootstrap error (non-fatal): {_tb_e}")
+
+    async def _turbo_bootstrap_channel(self):
+        """[TURBO-RADAR-v4.5.10b] إقلاع الرادار من قناة الطلبات نفسها.
+
+        المصدر الصامد للنشر: آخر ~150 تنبيهًا في القناة يحمل كلٌّ منها رابط
+        المجموعة (t.me/c/<id>/<msg> للمجموعات الخاصة) → استخراج معرفات
+        المجموعات المنتجة للطلبات مباشرة من إنتاجنا الخاص. بلا اعتماد على
+        أي قرص: النشر يمسح الملفات لكن القناة تبقى. نمط القراءة نفسه
+        المُتحقق حيًا في _red_button_strip_sweep (حساب User متصل يقرأ سجل
+        القناة). إعادة محاولة خلفية: حسابات المراقبة قد لا تكون متصلة
+        بعد في اللحظات الأولى بعد الإقلاع."""
+        _target = getattr(getattr(self, 'config', None),
+                          'requests_target_channel', 0)
+        if not _target:
+            return
+        for _attempt in range(4):
+            try:
+                await asyncio.sleep(120 if _attempt == 0 else 60)
+                if not getattr(self, '_running', True):
+                    return
+                _uc = getattr(self, 'user_clients', None) or {}
+                _readers = [c for c in _uc.values()
+                            if c is not None and getattr(
+                                c, 'is_connected', lambda: False)()]
+                if not _readers:
+                    continue
+                _msgs = None
+                for _r in _readers[:4]:
+                    try:
+                        _msgs = await asyncio.wait_for(
+                            _r.get_messages(_target, limit=150), timeout=25)
+                        break
+                    except Exception:
+                        continue
+                if not _msgs:
+                    continue
+                reg = getattr(self, '_turbo_chats', None)
+                if not isinstance(reg, dict):
+                    reg = self._turbo_chats = {}
+                now = time.time()
+                _found = 0
+                for _m in _msgs:
+                    if _m is None:
+                        continue
+                    _txt = getattr(_m, 'message', '') or \
+                        getattr(_m, 'raw_text', '') or ''
+                    for _mm in re.finditer(r't\.me/c/(\d+)/\d+', _txt):
+                        try:
+                            _cid = int(f"-100{_mm.group(1)}")
+                        except (TypeError, ValueError):
+                            continue
+                        # حدّث إن لم يكن موجودًا فقط (لا تطغَ على نافذة
+                        # قبول حديث أطول) + احترم السقف
+                        if reg.get(_cid, 0) < now:
+                            if _cid not in reg and len(reg) >= int(
+                                    getattr(self, '_TURBO_MAX_CHATS', 80) or 80):
+                                continue
+                            reg[_cid] = now + 3600.0
+                        _found += 1
+                if _found:
+                    logging.info(
+                        f"[TURBO-RADAR] 📡 channel-bootstrap: {_found} "
+                        f"mention(s) parsed from recent alerts — "
+                        f"turbo set={len(reg)} (5s rescue interval armed "
+                        f"from boot, deploy-proof)"
+                    )
+                    return  # نجح — لا مزيد من المحاولات
+            except asyncio.CancelledError:
+                return
+            except Exception as _cb_e:
+                logging.debug(
+                    f"[TURBO-RADAR] channel-bootstrap error "
+                    f"(non-fatal, attempt {_attempt + 1}): {_cb_e}")
+                continue
 
     async def _catchup_kick_chats_for_phone(self, phone: str):
         """[REQUEST-NET-v4.5.9 RADAR] ردم فوري لفجوات الانقطاع.
@@ -18958,6 +19035,10 @@ class Monitor:
         # المجموعات المنتجة للطلبات — طبقة 5s من أول لحظة بعد النشر
         # (بلا انتظار قبول جديد). خلفي: لا يؤخر الإقلاع.
         asyncio.create_task(self._turbo_bootstrap())
+        # [TURBO-RADAR-v4.5.10b] المصدر الصامد للنشر: استخراج المجموعات
+        # المنتجة من روابط التنبيهات نفسها في القناة (القرص مؤقت، القناة
+        # باقية). ينتظر ~120ث اتصال الحسابات ثم يعيد المحاولة.
+        asyncio.create_task(self._turbo_bootstrap_channel())
         # 5. ابدأ cleanup task للـ processed_messages (كل ساعة)
         self._claim_cleanup_task = asyncio.create_task(self._cleanup_processed_messages_loop())
 
