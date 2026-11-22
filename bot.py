@@ -11377,6 +11377,7 @@ class Monitor:
                 _bot_id = 0
             from telethon.tl.types import (MessageEntityCode as _MEC,
                                            MessageEntityMentionName as _MEMN,
+                                           MessageEntityTextUrl as _METU,
                                            ReplyInlineMarkup as _RIM,
                                            ReplyKeyboardHide as _RKH,
                                            KeyboardButtonRow as _KBR)
@@ -11400,34 +11401,65 @@ class Monitor:
                     # (1) نطاقات روابط الايدي الرقمية (ذكر حي أو t.me أو
                     # tg://user?id) — كيان <code> فوقها هو الذي يجعل النقر
                     # نسخًا بدل الفتح.
-                    # [v4.5.6b] إزاحات الكيانات من الخادم بوحدات UTF-16
-                    # (الإيموجي = وحدتان) بينما raw_text بايثوني — التقطيع
-                    # المباشر كان ينزاح بعد كل إيموجي فلا يُكتشف الرقم
-                    # أبدًا (برهان حي: code_الايدي=لا في كل الجولة الأولى).
-                    # الحل: التقطيع على النص المعزز بالبدائل (surrogates).
+                    # [v4.5.6c] اكتشاف حاسم (برهان حي عبر Bot API
+                    # 2026-11-22: كيانا text_link+code على نفس النطاق
+                    # يخزن الخادم منهما الكود فقط ويرمي الرابط!) — أي
+                    # تنبيه أُرسل منذ v4.4.25 بغلاف <code> حول رقم الايدي
+                    # وصل القناة والايدي فيه نص monospace أعمى بلا أي
+                    # رابط (هذا هو جذر «الايدي غير قابل للنقر» حرفيًا —
+                    # إصلاح v4.5.4 للرابط لم يكن له أثر لأن الرابط لم
+                    # يصل الخادم أصلًا). إعادة البناء: كود-الرقم داخل
+                    # تنبيه 🆔 يستبدل كيان رابط حقيقي — رابط t.me إن وُجد
+                    # يوزر بالرسالة نفسها، أو نسخ كيان ذكر المرسل الحي
+                    # (user_id+access_hash) فوق نطاق الرقم — بلا أي تغيير
+                    # في النص. التقطيع بوحدات UTF-16 (إزاحات الخادم) عبر
+                    # النص المعزز بالبدائل.
                     _raw16 = _add_sur(_raw)
-                    _id_spans = []
-                    for _e in _ents:
-                        _url = str(getattr(_e, 'url', '') or '')
-                        if (isinstance(_e, _MEMN)
-                                or 't.me/' in _url
-                                or 'tg://user?id=' in _url):
-                            _seg = _raw16[_e.offset:_e.offset + _e.length]
-                            if _seg.isdigit():
-                                _id_spans.append(
-                                    (_e.offset, _e.offset + _e.length))
-                    _new_ents = [
-                        _e for _e in _ents
-                        if not (isinstance(_e, _MEC) and any(
-                            _s <= _e.offset and
-                            _e.offset + _e.length <= _t
-                            for _s, _t in _id_spans))]
-                    _code_changed = len(_new_ents) != len(_ents)
-                    if _code_changed and not _new_ents:
-                        # احتياط بلا أثر عملي: رسالة كياناتها كلها كود
-                        # ايدي — لا نجرّب تعديلًا بلا كيانات إطلاقًا.
-                        _new_ents = _ents
-                        _code_changed = False
+                    _new_ents = list(_ents)
+                    _rebuilt = 0
+                    if ('🆔' in _raw) or ('الايدي:' in _raw):
+                        _uname_url = ''
+                        _mention_src = None
+                        for _e in _ents:
+                            _url = str(getattr(_e, 'url', '') or '')
+                            if (not _uname_url and _url
+                                    and _url.startswith('https://t.me/')):
+                                _m_u = re.match(
+                                    r'https://t\.me/([A-Za-z0-9_]{4,})$',
+                                    _url)
+                                if _m_u:
+                                    _uname_url = _url
+                            if (_mention_src is None
+                                    and isinstance(_e, _MEMN)):
+                                _mention_src = _e
+                        for _e in _ents:
+                            if not isinstance(_e, _MEC):
+                                continue
+                            _seg = _raw16[
+                                _e.offset:_e.offset + _e.length]
+                            if len(_seg) < 5 or not _seg.isdigit():
+                                continue
+                            _sub = None
+                            if _uname_url:
+                                _sub = _METU(
+                                    offset=_e.offset, length=_e.length,
+                                    url=_uname_url)
+                            elif _mention_src is not None:
+                                # نسخة من كيان ذكر المرسل نفسه بإزاحة
+                                # نطاق الرقم — copy.copy يعمل مع كل مخططات
+                                # الطبقة (القديمة تحمل access_hash
+                                # والجديدة بلا) بلا معرفة حقولها.
+                                import copy as _copy_mod
+                                _sub = _copy_mod.copy(_mention_src)
+                                _sub.offset = _e.offset
+                                _sub.length = _e.length
+                            if _sub is None:
+                                continue
+                            _new_ents = [
+                                _x for _x in _new_ents if _x is not _e]
+                            _new_ents.append(_sub)
+                            _rebuilt += 1
+                    _code_changed = _rebuilt > 0
                     # (2) صفوف الزر الأحمر (الزر + ❓ في نفس الصف)
                     _rows = [list(_r) for _r in (_msg.buttons or []) if _r]
                     _kept, _had_red = [], False
@@ -11499,7 +11531,7 @@ class Monitor:
                     logging.info(
                         f"[RED-STRIP] ✅ msg_id={_msg.id} — "
                         f"زر_أحمر={'مُسح' if _had_red else 'لا'} "
-                        f"code_الايدي={'خُلع' if _code_changed else 'لا'}")
+                        f"رابط_الايدي={'أُعيد بناؤه' if _code_changed else 'لا'}")
                     await asyncio.sleep(1.5)
                 except Exception as _se:
                     logging.info(
@@ -11507,7 +11539,7 @@ class Monitor:
                         f"{getattr(_msg, 'id', '?')}: {_se}")
             logging.info(
                 f"[RED-STRIP] sweep done — btn_stripped={_stripped_btn} "
-                f"code_stripped={_stripped_code} scanned={len(_msgs)}")
+                f"id_links_rebuilt={_stripped_code} scanned={len(_msgs)}")
         except Exception as _rbs:
             logging.warning(f"[RED-STRIP] sweep error (non-fatal): {_rbs}")
 
