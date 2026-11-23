@@ -1034,8 +1034,13 @@ class Config:
         #  50 قسم» — رسائل أكتوبر ظهرت كأنها طلبات اليوم). التنبيه نفسه
         # مكتفٍ (نص الطلب + أزرار التواصل) → الجسر متوقف افتراضيًا.
         #   MENTION_BRIDGE_ENABLED (default false) — أعد تفعيله بحذر.
+        # [MENTION-BRIDGE-SAFE v4.5.14] أعيد التفعيل الافتراضي: الريلاي
+        # الجديد ببوابة أمان صارمة (مطابقة أصل التوجيل + النص حرفيًا
+        # قبل أي نشر — انظر _mention_bridge_relay) يجعل حادثة 2026-11-20
+        # (نشر رسائل خاطئة بمعرفات غير متطابقة) مستحيلة. عطّله بضبط
+        # MENTION_BRIDGE_ENABLED=false عند الحاجة.
         self.mention_bridge_enabled = os.getenv(
-            "MENTION_BRIDGE_ENABLED", "false").strip().lower() in (
+            "MENTION_BRIDGE_ENABLED", "true").strip().lower() in (
             "1", "true", "yes", "on")
 
         # === [LINK-TASK-KILL + SEED-RACE-KILL] — طلب المُشغّل (2026-09-06) ===
@@ -10057,7 +10062,8 @@ class Monitor:
                     pass
                 _bridge = None
             if isinstance(_bridge, dict):
-                # سجّل حالة الجسر (بلا توجيل قناة — relay معطل دائمًا)
+                # سجّل حالة الجسر + الريلاي الآمن (مهمة خلفية — بوابة
+                # الأمان: الأصل + النص حرفيًا قبل أي نشر)
                 _psf = getattr(
                     self, '_relay_and_register_request_alert', None)
                 if callable(_psf):
@@ -10338,27 +10344,95 @@ class Monitor:
                 f"msg_id={msg_id}): {e}")
             return None
 
-    async def _mention_bridge_relay(self, target, seed_msg_id, cap_user_id):
-        """[MENTION-BRIDGE-v4.4.7] البوت يعيد توجيه نسخة الأصل من خاصِه
-        إلى قناة الطلبات — رأس «مُحوَّل من: الطالب» قابل للنقر دائمًا
-        لدى كل المشتركين (كائن المستخدم مضمّن في التوجيل). يعيد True
-        عند النجاح. غير قاتل."""
+    async def _mention_bridge_relay(self, target, seed_msg_id, cap_user_id,
+                                    expected_sender_id=0, expected_text='',
+                                    reply_to_msg_id=0):
+        """[MENTION-BRIDGE-SAFE v4.5.14] البوت يعيد توجيه نسخة الأصل من
+        خاصِه إلى قناة الطلبات — رأس «مُحوَّل من: الطالب» قابل للنقر
+        دائمًا لدى كل المشتركين (كائن المستخدم مضمّن في بنية التوجيل
+        نفسها — لا يعتمد على معرفة العارض) → يفتح ملف الطالب بضغطة
+        واحدة حتى بلا username. يعيد True عند النجاح. غير قاتل.
+        ★ بوابة الأمان (إغلاق حادثة 2026-11-20 نهائيًا): الخلل القديم
+        كان توجيل «معرّف بذرة» من فضاء حساب الالتقاط — لا يطابق فضاء
+        عميل البوت لنفس الرسالة → نشر رسائل قديمة عشوائية. الجديد: لا
+        استخدام لمعرّف البذرة إطلاقًا (يبقى للسجل فقط)؛ البوت يجلب
+        رسائله الخاصة (نفس فضاء المعرفات بالكامل) ويطابق بالمحتوى:
+        أصل التوجيل يجب أن يكون المرسل المتوقع نفسه + النص مطابق
+        حرفيًا. أي عدم تطابق = إجهاض فوري بلا أي نشر. التوجيل كرد
+        على بطاقة التنبيه (reply_to) حيث يُقبل، وإلا رسالة مستقلة
+        تليها مباشرة."""
         try:
-            if not seed_msg_id or not cap_user_id:
+            if not cap_user_id:
                 return False
             _bot_client = getattr(self, 'bot_client', None)
             if not _bot_client or not _bot_client.is_connected():
                 return False
             from telethon.tl.types import PeerUser as _BridgePeerUser
-            _fwd = await asyncio.wait_for(
-                _bot_client.forward_messages(
-                    target, int(seed_msg_id),
-                    from_peer=_BridgePeerUser(int(cap_user_id))),
-                timeout=10)
+            _peer = _BridgePeerUser(int(cap_user_id))
+            _exp_sid = int(expected_sender_id or 0)
+            _exp_txt = str(expected_text or '').strip()
+            if _exp_sid <= 0 or not _exp_txt:
+                # بلا معايير مطابقة كافية → لا توجيل على العمياء أبدًا
+                # (الاستدعاء القديم بلا expected_* يُرفض صراحة).
+                logging.warning(
+                    "[MENTION-BRIDGE] relay abort — missing expected "
+                    "sender/text for the safety gate")
+                return False
+            # (1) [SAFETY-GATE] جلب + مطابقة بالمحتوى لا بالمعرف
+            _seed_copy = None
+            try:
+                _hist = await asyncio.wait_for(
+                    _bot_client.get_messages(_peer, limit=50), timeout=10)
+                for _m in (_hist or []):
+                    if _m is None:
+                        continue
+                    _fwd_h = getattr(_m, 'fwd_from', None)
+                    _orig_p = getattr(_fwd_h, 'from_id', None)
+                    _orig_uid = int(getattr(_orig_p, 'user_id', 0) or 0) \
+                        if _orig_p is not None else 0
+                    if _orig_uid != _exp_sid:
+                        continue
+                    if str(getattr(_m, 'raw_text', '') or '').strip() \
+                            != _exp_txt:
+                        continue
+                    _seed_copy = _m
+                    break
+            except Exception as _gate_e:
+                logging.warning(
+                    f"[MENTION-BRIDGE] relay gate fetch failed: {_gate_e}")
+                return False
+            if _seed_copy is None:
+                logging.warning(
+                    f"[MENTION-BRIDGE] relay abort — no matching seed copy "
+                    f"in bot PM (cap={cap_user_id} sender={_exp_sid} "
+                    f"text_len={len(_exp_txt)})")
+                return False
+            # (2) التوجيل — برسالة جلبها البوت بنفسه (معرّف من فضائه هو)
+            #     كرد على بطاقة التنبيه حيث يُقبل.
+            _reply_to = int(reply_to_msg_id or 0) or None
+            _fwd = None
+            try:
+                _fwd = await asyncio.wait_for(
+                    _bot_client.forward_messages(
+                        target, int(_seed_copy.id), from_peer=_peer,
+                        reply_to=_reply_to),
+                    timeout=12)
+            except Exception as _rt_e:
+                if not _reply_to:
+                    raise
+                logging.info(
+                    f"[MENTION-BRIDGE] reply_to={_reply_to} rejected "
+                    f"({type(_rt_e).__name__}) — standalone retry")
+                _fwd = await asyncio.wait_for(
+                    _bot_client.forward_messages(
+                        target, int(_seed_copy.id), from_peer=_peer),
+                    timeout=12)
             _ok = _fwd is not None
             logging.info(
                 f"[MENTION-BRIDGE] {'✅' if _ok else '❌'} relayed to {target} "
-                f"seed_msg_id={seed_msg_id} cap_user_id={cap_user_id}"
+                f"seed_msg_id={_seed_copy.id} cap_user_id={cap_user_id} "
+                f"reply_to={_reply_to or '-'} origin={_exp_sid} "
+                f"text_len={len(_exp_txt)}"
             )
             return bool(_ok)
         except Exception as e:
@@ -10366,7 +10440,142 @@ class Monitor:
                 f"[MENTION-BRIDGE] relay failed (non-fatal): {e}")
             return False
 
-    # ------------------------------------------------------------------
+    async def _bridge_rescue_one_shot(self):
+        """[BRIDGE-RESCUE v4.5.14] إنقاذ لمرة واحدة (أمر المُشغّل
+        2026-11-23 — التنبيه 723): تنبيه عالق بلا مسار تواصل (مرسل
+        بلا username والخادم يجرّد روابط tg://user من رسائل البوتات)
+        بينما البذرة — نسخة الأصل المُوجَّلة لخاص البوت — ما تزال حية
+        هناك. يوجّلها للقناة عبر بوابة الأمان نفسها كرد على بطاقة
+        التنبيه.
+        env: BRIDGE_RESCUE="alert_id:phone" (حساب الالتقاط الذي زرع
+        البذرة — يُزرع كيانه لدى البوت أولًا كي يرى خاصه به).
+        Idempotent: لو توجد رسالة ترد على التنبيه نفسه → تخطٍّ صامت.
+        غير قاتل تمامًا."""
+        try:
+            _spec = str(os.getenv('BRIDGE_RESCUE', '') or '').strip()
+            if not _spec:
+                try:
+                    with open('bridge_rescue.txt', 'r', encoding='utf-8') \
+                            as _brf:
+                        _spec = _brf.read().strip()
+                except Exception:
+                    _spec = ''
+            if not _spec or ':' not in _spec:
+                return
+            try:
+                _aid_s, _phone = _spec.split(':', 1)
+                _aid = int(_aid_s.strip())
+            except Exception:
+                logging.warning(
+                    f"[BRIDGE-RESCUE] bad spec {_spec!r} — expected "
+                    f"'alert_id:phone'")
+                return
+            await asyncio.sleep(300)  # اكتمال الإقلاع واتصال الحسابات
+            _target = (getattr(getattr(self, 'config', None),
+                               'requests_target_channel', 0)
+                       or getattr(getattr(self, 'config', None),
+                                  'channel_id', 0))
+            if not _target:
+                logging.warning("[BRIDGE-RESCUE] no target channel")
+                return
+            _uc = getattr(self, 'user_clients', None) or {}
+            _readers = [c for c in _uc.values()
+                        if c is not None and getattr(
+                            c, 'is_connected', lambda: False)()]
+            if not _readers:
+                logging.warning("[BRIDGE-RESCUE] no connected readers")
+                return
+            # (1) اجلب بطاقة التنبيه من القناة
+            _alert = None
+            for _r in _readers[:3]:
+                try:
+                    _alert = await asyncio.wait_for(
+                        _r.get_messages(_target, ids=_aid), timeout=12)
+                    if _alert is not None:
+                        break
+                except Exception:
+                    continue
+            if _alert is None:
+                logging.warning(
+                    f"[BRIDGE-RESCUE] alert {_aid} not found in channel")
+                return
+            _raw = str(getattr(_alert, 'raw_text', '') or '')
+            _sid_m = re.search(r'🆔\s*الايدي:?\s*(\d+)', _raw)
+            _txt_m = re.search(r'💬\s*نص الطلب:\s*\n(.*?)\s*\n🔗',
+                               _raw, re.DOTALL)
+            if not _sid_m or not _txt_m:
+                logging.warning(
+                    f"[BRIDGE-RESCUE] cannot parse alert {_aid} "
+                    f"(sender/text)")
+                return
+            _sid = int(_sid_m.group(1))
+            _txt = _txt_m.group(1).strip()
+            # (2) Idempotent: رد موجود على التنبيه → مُوجَّل سابقًا
+            try:
+                _after = [m async for m in _readers[0].iter_messages(
+                    _target, limit=12, min_id=_aid)]
+                for _am in _after:
+                    if int(getattr(_am, 'reply_to_msg_id', 0) or 0) == _aid:
+                        logging.info(
+                            f"[BRIDGE-RESCUE] alert {_aid} already has a "
+                            f"reply — skip")
+                        return
+            except Exception:
+                pass
+            # (3) حسابات الالتقاط المرشحة: من الموصف (فواصل commas)
+            # أو كل الحسابات المتصلة — كل مرشح: زرع كيانه لدى البوت
+            # (كي يرى خاصه به) ثم الريلاي عبر بوابة الأمان.
+            _phones = [p.strip() for p in _phone.split(',') if p.strip()]
+            if not _phones:
+                _phones = [ph for ph, c in _uc.items()
+                           if c is not None and getattr(
+                               c, 'is_connected', lambda: False)()][:10]
+            _cap_ids = getattr(self, '_bridge_cap_ids', None)
+            if not isinstance(_cap_ids, dict):
+                _cap_ids = {}
+                try:
+                    self._bridge_cap_ids = _cap_ids
+                except Exception:
+                    pass
+            _ok = False
+            for _ph in _phones:
+                _cap = _uc.get(_ph)
+                if _cap is None or not getattr(
+                        _cap, 'is_connected', lambda: False)():
+                    continue
+                _cap_id = _cap_ids.get(_ph)
+                if not _cap_id:
+                    try:
+                        _cap_me = await asyncio.wait_for(
+                            _cap.get_me(), timeout=6)
+                        _cap_id = int(getattr(_cap_me, 'id', 0) or 0)
+                        if _cap_id > 0:
+                            _cap_ids[_ph] = _cap_id
+                    except Exception:
+                        _cap_id = 0
+                if not _cap_id or _cap_id <= 0:
+                    continue
+                try:
+                    await self._entity_transfer_via_capture(
+                        _sid, 'الإنقاذ', prefer_phone=_ph)
+                except Exception:
+                    pass  # الزرع تحسيني — محاولة التوجيل تبقى
+                # (4) الريلاي عبر بوابة الأمان نفسها
+                try:
+                    _ok = await self._mention_bridge_relay(
+                        _target, 0, _cap_id,
+                        expected_sender_id=_sid,
+                        expected_text=_txt,
+                        reply_to_msg_id=_aid)
+                except Exception:
+                    _ok = False
+                if _ok:
+                    break
+            logging.info(
+                f"[BRIDGE-RESCUE] alert {_aid} sender={_sid} "
+                f"phones={_phones} → {'✅ relayed' if _ok else '❌ failed'}")
+        except Exception as _rs_e:
+            logging.warning(f"[BRIDGE-RESCUE] error (non-fatal): {_rs_e}")
     # [SEED-RACE] بذرة الجسر المبكرة — تسبق حذف بوتات الحماية
     # ------------------------------------------------------------------
     # بلاغ المُشغّل (2026-09-06 05:23 — طلب Rewa Ali المحذوف): «اليوزر
@@ -12699,22 +12908,14 @@ class Monitor:
     async def _relay_and_register_request_alert(self, target, bridge, sent_alert,
                                                 chat_id, msg_id, alert, dm_buttons,
                                                 sender_meta=None):
-        """[MENTION-BRIDGE-v4.4.7] بعد نجاح إرسال التنبيه: أعد توجيه نسخة
-        الأصل إلى القناة (مسار التواصل المضمون) ثم سجّل التنبيه للتعليم
-        عند حذف الأصل (مع حالة الجسر). يجمع الخطوتين ليعمل المساران
-        (الإرسال الأول + إعادة FloodWait) بنفس المنطق دون تكرار.
-        [MENTION-BRIDGE-KILL 2026-11-20] التوجيل متوقف افتراضيًا (معرفات
-        بذور غير مطابقة → نشر رسائل خاطئة بالقناة) — التسجيل يستمر.
+        """[MENTION-BRIDGE-v4.4.7→SAFE v4.5.14] بعد نجاح إرسال التنبيه:
+        سجّل التنبيه فورًا (سباق الحذف — التسجيل لا ينتظر شيئًا) ثم
+        أطلق الريلاي الآمن مهمةً خلفية (لا يعطّل مسار السرعة أبدًا):
+        إعادة توجيه نسخة الأصل من خاص البوت إلى القناة عبر بوابة
+        الأمان (الأصل + النص حرفيًا) — رأس «مُحوَّل من: الطالب» قابل
+        للنقر بضغطة واحدة لدى كل المشتركين حتى بلا username.
         [IGNORE-BY-REPLY] sender_meta يُخزّن في السجل لأمر التجاهل بالرد."""
-        _bridge_on = bool(getattr(getattr(self, 'config', None),
-                                  'mention_bridge_enabled', False))
-        if isinstance(bridge, dict) and _bridge_on:
-            try:
-                bridge['done'] = await self._mention_bridge_relay(
-                    target, bridge.get('seed_msg_id'),
-                    bridge.get('cap_user_id'))
-            except Exception:
-                bridge['done'] = False
+        # (1) التسجيل أولًا — فوري (لا ينتظر الريلاي)
         try:
             _reg_fn = getattr(self, '_register_request_alert', None)
             if callable(_reg_fn):
@@ -12722,6 +12923,31 @@ class Monitor:
                         dm_buttons, relay=bridge, sender_meta=sender_meta)
         except Exception:
             pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
+
+        # (2) [RELAY-SAFE v4.5.14] الريلاي مهمة خلفية ببوابة الأمان
+        _bridge_on = bool(getattr(getattr(self, 'config', None),
+                                  'mention_bridge_enabled', False))
+        if isinstance(bridge, dict) and _bridge_on and not bridge.get('done'):
+            _meta = sender_meta if isinstance(sender_meta, dict) else {}
+            _alert_id = int(getattr(sent_alert, 'id', 0) or 0)
+            _sid_r = int(_meta.get('sender_id', 0) or 0)
+            _txt_r = str(_meta.get('raw_text', '') or '')
+            if _sid_r > 0 and _txt_r:
+                async def _bg_relay_task():
+                    try:
+                        bridge['done'] = await self._mention_bridge_relay(
+                            target, bridge.get('seed_msg_id'),
+                            bridge.get('cap_user_id'),
+                            expected_sender_id=_sid_r,
+                            expected_text=_txt_r,
+                            reply_to_msg_id=_alert_id)
+                    except Exception as _bg_e:
+                        logging.warning(
+                            f"[MENTION-BRIDGE] bg relay error: {_bg_e}")
+                try:
+                    asyncio.create_task(_bg_relay_task())
+                except Exception:
+                    pass
 
     def _register_request_alert(self, chat_id, msg_id, target, sent_alert,
                                 alert_html, dm_buttons, relay=None,
@@ -12819,15 +13045,32 @@ class Monitor:
             _relay = entry.get('relay')
             _relay = _relay if isinstance(_relay, dict) else None
             _relay_done = bool(_relay and _relay.get('done'))
-            # [MENTION-BRIDGE-KILL] التوجيل متوقف — لا إعادة محاولة.
+            # [MENTION-BRIDGE-SAFE v4.5.14] حالة جسر التوجيل: النسخة
+            # المُوجَّهة في خاص البوت تنجو من حذف الأصل — لو فشل توجيلها
+            # للقناة أول مرة (خطأ عابر)، أعد المحاولة الآن عبر بوابة
+            # الأمان نفسها (الأصل + النص حرفيًا): بعد الحذف تصبح هذه
+            # النسخة مسار التواصل الوحيد الباقي للطالب.
+            _relay = entry.get('relay')
+            _relay = _relay if isinstance(_relay, dict) else None
+            _relay_done = bool(_relay and _relay.get('done'))
             if (_relay and not _relay_done
                     and getattr(getattr(self, 'config', None),
                                 'mention_bridge_enabled', False)):
+                _meta_r = entry.get('sender_meta')
+                _meta_r = _meta_r if isinstance(_meta_r, dict) else {}
                 try:
                     _relay_done = await self._mention_bridge_relay(
                         entry.get('target'),
                         _relay.get('seed_msg_id'),
-                        _relay.get('cap_user_id'))
+                        _relay.get('cap_user_id'),
+                        expected_sender_id=int(
+                            _meta_r.get('sender_id', 0) or 0),
+                        expected_text=str(
+                            _meta_r.get('raw_text', '') or ''),
+                        reply_to_msg_id=int(
+                            entry.get('alert_id', 0) or 0))
+                    if _relay and _relay_done:
+                        _relay['done'] = True
                 except Exception:
                     _relay_done = False
             marked = (
@@ -19257,6 +19500,12 @@ class Monitor:
         # «قيد التفعيل» المعلقة (روابط ايدي/اسم ميتة) — الوعد الذي
         # كسرته إعادة التشغيل (بلاغ المُشغّل: الايدي ما ينضغط).
         asyncio.create_task(self._delayed_alert_heal())
+
+        # === [BRIDGE-RESCUE v4.5.14] إنقاذ لمرة واحدة لتوجيل بذرة عالقة ===
+        # env BRIDGE_RESCUE="alert_id:phone" — تنبيه بلا مسار تواصل
+        # (مرسل بلا username) والبذرة في خاص البوت: تُوجَّل عبر بوابة
+        # الأمان نفسها كرد على بطاقة التنبيه.
+        asyncio.create_task(self._bridge_rescue_one_shot())
 
         # === [RED-BUTTON-STRIP v4.5.6] مسح صف الزر الأحمر نهائيًا من
         # رسائل القناة القديمة + خلع <code> عن روابط الايدي الحية ===
