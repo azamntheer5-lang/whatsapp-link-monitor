@@ -5688,6 +5688,9 @@ class Monitor:
                  Button.inline("🔍 تحقق النظام", b"verify")],
                 [Button.inline("🗄️ فحص SQLite", b"sqlite_check"),
                  Button.inline("📊 حالة الفدائيين", b"join_status")],
+                # [AUTOREPLY-READY v4.5.16] لوحة الرد التلقائي — زر مباشر
+                # بدل كتابة /autoreply_status يدويًا (طلب المُشغّل «ابي تضبطه»)
+                [Button.inline("💬 الرد التلقائي", b"autoreply_panel")],
                 [Button.inline("❓ المساعدة", b"help")],
             ]
         else:
@@ -6223,6 +6226,19 @@ class Monitor:
                     monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
                     joiners = [w for w in watchers if w.get('role') == 'joiner']
                     backups = [w for w in watchers if w.get('role') == 'backup']
+                    # [AUTOREPLY-READY v4.5.16] إظهار حسابات الرد التلقائي
+                    # في تقرير الحالة الرئيسي — كانت غير مرئية إطلاقًا.
+                    autoreplies = [w for w in watchers if w.get('role') == 'autoreply']
+                    ar_conn = 0
+                    for w in autoreplies:
+                        _ac = self.user_clients.get(w['phone'])
+                        try:
+                            if _ac is not None and _ac.is_connected():
+                                ar_conn += 1
+                        except Exception:
+                            pass
+                    ar_state = "✅ يعمل" if (ar_conn > 0 and getattr(
+                        getattr(self, 'autoreply', None), 'enabled', False)) else "🔴 لا يوجد حساب متصل"
 
                     # عدد المتصلين فعلياً
                     connected_count = sum(1 for c in self.user_clients.values() if c and c.is_connected())
@@ -6271,8 +6287,10 @@ class Monitor:
                         f"   👁️ مراقبين: {len(monitors)}\n"
                         f"   🚀 فدائيين: {len(joiners)}\n"
                         f"   🔄 احتياط: {len(backups)}\n"
+                        f"   💬 رد تلقائي: {len(autoreplies)} (متصل {ar_conn})\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔗 متصل فعلياً: {connected_count}/{len(watchers)}\n"
+                        f"💬 الرد التلقائي: {ar_state}\n"
                     )
                     if disconnected:
                         status_msg += f"❌ غير متصل: {', '.join(disconnected)}\n"
@@ -6298,6 +6316,35 @@ class Monitor:
                 except Exception as e:
                     logging.error(f"[STATUS] Error: {e}", exc_info=True)
                     await event.answer(f"❌ خطأ: {e}")
+                return
+
+            if data == "autoreply_panel":
+                # === [AUTOREPLY-READY v4.5.16] لوحة الرد التلقائي ===
+                # طلب المُشغّل (2026-11-23): «باقي حسابات الرد التلقائي
+                # ابي تضبطه» — زر واحد في القائمة الرئيسية يعرض الحالة
+                # الكاملة (الحسابات + الاتصال + العدادات) مع زر إضافة
+                # حساب جديد مباشرة. (login_start مقيد بالمالك أصلًا.)
+                try:
+                    await event.answer()
+                    _ar = getattr(self, 'autoreply', None)
+                    if _ar is None:
+                        body = "ℹ️ محرك الرد التلقائي غير مهيأ."
+                    else:
+                        body = await _ar.status_report()
+                    if _ar is not None and not _ar.enabled:
+                        body = "⏸️ محرك الرد التلقائي معطّل (enabled=false)\n\n" + body
+                    await event.edit(
+                        body,
+                        buttons=[
+                            [Button.inline("➕ إضافة حساب رد تلقائي", b"login_start")],
+                            [Button.inline("🔙 القائمة الرئيسية", b"main_menu")],
+                        ])
+                except Exception as e:
+                    logging.error(f"[AUTOREPLY-PANEL] error: {e}")
+                    try:
+                        await event.answer("❌ خطأ في اللوحة", alert=True)
+                    except Exception:
+                        pass
                 return
 
             if data == "my_stats":
@@ -16834,9 +16881,12 @@ class Monitor:
                             f"[ACCOUNT] handlers=registered (request + link capture)"
                         )
                     else:
+                        # [AUTOREPLY-READY v4.5.16] كان يطبع role=joiner
+                        # حرفيًا لأي دور غير المراقب — الدور الفعلي الآن
+                        # (joiner / autoreply / backup) لتصحيح الجنائية.
                         logging.info(
                             f"[ACCOUNT] {phone} STATUS=READY\n"
-                            f"[ACCOUNT] role=joiner\n"
+                            f"[ACCOUNT] role={role}\n"
                             f"[ACCOUNT] handlers=registered (request + link capture — NEW)"
                         )
                     # === Notify SourceRegistry of phone status ===

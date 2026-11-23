@@ -87,6 +87,8 @@ class AutoReplyEngine:
         self._contacted: Dict[int, datetime] = {}
         # round-robin
         self._rr = 0
+        # [AUTOREPLY-READY v4.5.16] آخر تذكير للمُشغّل بغياب الحسابات
+        self._noacc_last_remind: Optional[datetime] = None
         # يوم العدادات الحالي (YYYY-MM-DD)
         self._day = datetime.now().strftime('%Y-%m-%d')
         # --- إحصاءات (ذاكرة فقط — تُقرأ من /autoreply_status) ---
@@ -283,6 +285,10 @@ class AutoReplyEngine:
                 logger.info(
                     "[AUTOREPLY] no connected autoreply accounts — skipping "
                     f"uid={sid} (manual 🔴 button remains)")
+                # [AUTOREPLY-READY v4.5.16] تذكير مُخنَّق للمُشغّل —
+                # نظام صامت = نظام ميت: المُشغّل يعرف أن التحيات
+                # لا تُرسل ومَنْ يضيف الحساب. مرة كل 6 ساعات كحد أقصى.
+                await self._remind_owner_no_accounts()
                 return False
 
             text = self.pick_greeting(raw_text)
@@ -393,6 +399,51 @@ class AutoReplyEngine:
         except Exception as e:
             logger.warning(f"[AUTOREPLY] greet error (non-fatal): {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # [AUTOREPLY-READY v4.5.16] تذكير المُشغّل بغياب حسابات الرد
+    #
+    # حين تصل طلبات جديدة ولا يوجد أي حساب رد متصل، يظل النظام صامتًا
+    # في السجلات فقط (skip_no_accounts) — المُشغّل لا يقرأ السجلات.
+    # هذا التذكير يصل خاص المالك مرة كل AUTOREPLY_NOACC_REMIND_H ساعة
+    # (افتراضي 6، و 0 = تعطيل) بخطوات الإضافة الحرفية. غير قاتل.
+    # ------------------------------------------------------------------
+
+    async def _remind_owner_no_accounts(self):
+        try:
+            hours = max(0, _env_int('AUTOREPLY_NOACC_REMIND_H', 6))
+            if hours <= 0:
+                return
+            now = datetime.now()
+            last = self._noacc_last_remind
+            if last and (now - last) < timedelta(hours=hours):
+                return
+            self._noacc_last_remind = now
+            _m = self._m
+            _bc = getattr(_m, 'bot_client', None)
+            oid = getattr(getattr(_m, 'config', None), 'owner_id', None)
+            if (not _bc or not _bc.is_connected() or not oid):
+                return
+            await _bc.send_message(
+                int(oid),
+                "⚠️ الرد التلقائي متوقف — لا يوجد حساب رد متصل\n\n"
+                "وصلت طلبات جديدة الآن ولا يوجد حساب يرسل التحية الأولى "
+                "(زر 🔴 التواصل اليدوي يبقى شغالًا في قناة الطلبات).\n\n"
+                "➕ إضافة حساب رد (مرة واحدة لكل حساب):\n"
+                "1. أرسل /login للبوت\n"
+                "2. اختر «💬 حساب رد تلقائي (Auto-Reply)»\n"
+                "3. أرسل رقم الحساب بالصيغة الدولية (+966...)\n"
+                "4. أرسل كود تيليجرام الذي يصله الحساب\n\n"
+                "بعد الاتصال يبدأ الرد فورًا — تحية أولى لكل طلب "
+                "جديد خلال ثوانٍ، وحدود الأمان: 25 تحية/يوم للحساب، "
+                "فاصل ≥ 4 دقائق، وتحية واحدة لكل عميل في 24 ساعة.\n\n"
+                "هذا التذكير مرة كل 6 ساعات فقط.",
+                link_preview=False)
+            logger.info(
+                "[AUTOREPLY] owner reminded: no autoreply accounts "
+                f"connected (next remind ≥ {hours}h)")
+        except Exception as e:
+            logger.debug(f"[AUTOREPLY] no-acc remind failed: {e}")
 
     # ------------------------------------------------------------------
     # [FLOOD-SAFE v4.5] تنبيه فوري للفريق في قناة الطلبات عند تقييد حساب
