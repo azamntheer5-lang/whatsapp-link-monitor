@@ -10347,20 +10347,20 @@ class Monitor:
     async def _mention_bridge_relay(self, target, seed_msg_id, cap_user_id,
                                     expected_sender_id=0, expected_text='',
                                     reply_to_msg_id=0):
-        """[MENTION-BRIDGE-SAFE v4.5.14] البوت يعيد توجيه نسخة الأصل من
+        """[MENTION-BRIDGE-SAFE v4.5.14b] البوت يعيد توجيه نسخة الأصل من
         خاصِه إلى قناة الطلبات — رأس «مُحوَّل من: الطالب» قابل للنقر
         دائمًا لدى كل المشتركين (كائن المستخدم مضمّن في بنية التوجيل
         نفسها — لا يعتمد على معرفة العارض) → يفتح ملف الطالب بضغطة
         واحدة حتى بلا username. يعيد True عند النجاح. غير قاتل.
-        ★ بوابة الأمان (إغلاق حادثة 2026-11-20 نهائيًا): الخلل القديم
-        كان توجيل «معرّف بذرة» من فضاء حساب الالتقاط — لا يطابق فضاء
-        عميل البوت لنفس الرسالة → نشر رسائل قديمة عشوائية. الجديد: لا
-        استخدام لمعرّف البذرة إطلاقًا (يبقى للسجل فقط)؛ البوت يجلب
-        رسائله الخاصة (نفس فضاء المعرفات بالكامل) ويطابق بالمحتوى:
-        أصل التوجيل يجب أن يكون المرسل المتوقع نفسه + النص مطابق
-        حرفيًا. أي عدم تطابق = إجهاض فوري بلا أي نشر. التوجيل كرد
-        على بطاقة التنبيه (reply_to) حيث يُقبل، وإلا رسالة مستقلة
-        تليها مباشرة."""
+        ★ [SEED-INDEX] برهان حي 04:21:35Z: حسابات البوتات ممنوعة من
+        GetHistoryRequest (قراءة سجل الخاص) — فالبحث بالمحتوى عبر
+        السجل مستحيل أصلًا. البديل الجذري: البوت يستقبل كل بذرة تحديثًا
+        حيًا يحمل معرّفها بفضاء البوت نفسه — معالج الخاص (SEED-INDEX)
+        يفهرسها لحظة الاستلام بالمفتاح (أصل التوجيل + النص) → الريلاي
+        يوجّل معرّفًا استلمه البوت بنفسه: لا سباق معرفات أصلًا (إغلاق
+        نهائي لحادثة 2026-11-20: الخلل القديم كان توجيل معرّف بفضاء
+        حساب الالتقاط). المطابقة مضمومة وقت الاستلام — أي عدم تطابق =
+        لا إدخال في الفهرس = لا توجيل."""
         try:
             if not cap_user_id:
                 return False
@@ -10368,7 +10368,6 @@ class Monitor:
             if not _bot_client or not _bot_client.is_connected():
                 return False
             from telethon.tl.types import PeerUser as _BridgePeerUser
-            _peer = _BridgePeerUser(int(cap_user_id))
             _exp_sid = int(expected_sender_id or 0)
             _exp_txt = str(expected_text or '').strip()
             if _exp_sid <= 0 or not _exp_txt:
@@ -10378,43 +10377,38 @@ class Monitor:
                     "[MENTION-BRIDGE] relay abort — missing expected "
                     "sender/text for the safety gate")
                 return False
-            # (1) [SAFETY-GATE] جلب + مطابقة بالمحتوى لا بالمعرف
-            _seed_copy = None
-            try:
-                _hist = await asyncio.wait_for(
-                    _bot_client.get_messages(_peer, limit=50), timeout=10)
-                for _m in (_hist or []):
-                    if _m is None:
-                        continue
-                    _fwd_h = getattr(_m, 'fwd_from', None)
-                    _orig_p = getattr(_fwd_h, 'from_id', None)
-                    _orig_uid = int(getattr(_orig_p, 'user_id', 0) or 0) \
-                        if _orig_p is not None else 0
-                    if _orig_uid != _exp_sid:
-                        continue
-                    if str(getattr(_m, 'raw_text', '') or '').strip() \
-                            != _exp_txt:
-                        continue
-                    _seed_copy = _m
-                    break
-            except Exception as _gate_e:
+            # (1) [SAFETY-GATE v2 — SEED-INDEX] البحث في فهرس البذور
+            # (معرّفات بفضاء البوت نفسه) — مع مهلة قصيرة: التحديث قد
+            # يسبق الريلاي بأجزاء من الثانية.
+            _entry_i = None
+            for _wait_i in range(3):
+                _reg_i = getattr(self, '_bot_seed_index', None)
+                if isinstance(_reg_i, dict):
+                    _entry_i = _reg_i.get((_exp_sid, _exp_txt))
+                    if _entry_i is not None:
+                        break
+                await asyncio.sleep(1.2)
+            if _entry_i is None:
                 logging.warning(
-                    f"[MENTION-BRIDGE] relay gate fetch failed: {_gate_e}")
+                    f"[MENTION-BRIDGE] relay abort — seed not indexed in "
+                    f"bot PM (sender={_exp_sid} text_len={len(_exp_txt)})")
                 return False
-            if _seed_copy is None:
+            _bot_msg_id = int(_entry_i.get('bot_msg_id', 0) or 0)
+            _cap_id_i = int(_entry_i.get('cap_user_id', 0) or 0) \
+                or int(cap_user_id)
+            if _bot_msg_id <= 0 or _cap_id_i <= 0:
                 logging.warning(
-                    f"[MENTION-BRIDGE] relay abort — no matching seed copy "
-                    f"in bot PM (cap={cap_user_id} sender={_exp_sid} "
-                    f"text_len={len(_exp_txt)})")
+                    "[MENTION-BRIDGE] relay abort — bad index entry")
                 return False
-            # (2) التوجيل — برسالة جلبها البوت بنفسه (معرّف من فضائه هو)
-            #     كرد على بطاقة التنبيه حيث يُقبل.
+            # (2) التوجيل — بمعرّف استلمه البوت بنفسه (فضاؤه هو) كرد
+            # على بطاقة التنبيه حيث يُقبل، وإلا رسالة مستقلة تليها.
+            _peer = _BridgePeerUser(_cap_id_i)
             _reply_to = int(reply_to_msg_id or 0) or None
             _fwd = None
             try:
                 _fwd = await asyncio.wait_for(
                     _bot_client.forward_messages(
-                        target, int(_seed_copy.id), from_peer=_peer,
+                        target, _bot_msg_id, from_peer=_peer,
                         reply_to=_reply_to),
                     timeout=12)
             except Exception as _rt_e:
@@ -10425,12 +10419,12 @@ class Monitor:
                     f"({type(_rt_e).__name__}) — standalone retry")
                 _fwd = await asyncio.wait_for(
                     _bot_client.forward_messages(
-                        target, int(_seed_copy.id), from_peer=_peer),
+                        target, _bot_msg_id, from_peer=_peer),
                     timeout=12)
             _ok = _fwd is not None
             logging.info(
                 f"[MENTION-BRIDGE] {'✅' if _ok else '❌'} relayed to {target} "
-                f"seed_msg_id={_seed_copy.id} cap_user_id={cap_user_id} "
+                f"bot_msg_id={_bot_msg_id} cap_user_id={_cap_id_i} "
                 f"reply_to={_reply_to or '-'} origin={_exp_sid} "
                 f"text_len={len(_exp_txt)}"
             )
@@ -10463,12 +10457,15 @@ class Monitor:
             if not _spec or ':' not in _spec:
                 return
             try:
-                _aid_s, _phone = _spec.split(':', 1)
-                _aid = int(_aid_s.strip())
+                _parts = _spec.split(':')
+                _aid = int(_parts[0].strip())
+                _phone = _parts[-1] if len(_parts) > 1 else ''
+                _orig_chat_s = _parts[1].strip() if len(_parts) > 2 else '0'
+                _orig_msg_s = _parts[2].strip() if len(_parts) > 3 else '0'
             except Exception:
                 logging.warning(
                     f"[BRIDGE-RESCUE] bad spec {_spec!r} — expected "
-                    f"'alert_id:phone'")
+                    f"'alert_id[:chat:msg]:phone,phone'")
                 return
             await asyncio.sleep(300)  # اكتمال الإقلاع واتصال الحسابات
             _target = (getattr(getattr(self, 'config', None),
@@ -10525,52 +10522,43 @@ class Monitor:
             # (3) حسابات الالتقاط المرشحة: من الموصف (فواصل commas)
             # أو كل الحسابات المتصلة — كل مرشح: زرع كيانه لدى البوت
             # (كي يرى خاصه به) ثم الريلاي عبر بوابة الأمان.
+            # (3) حسابات الالتقاط المرشحة: من الموصف (فواصل commas)
+            # أو كل الحسابات المتصلة — لكل مرشح: إعادة زرع بذرة طازجة
+            # (توجيل الأصل الأصلي من المجموعة إلى خاص البوت — يُفهرس
+            # لحظة الاستلام بفضاء البوت) ثم الريلاي عبر الفهرس.
             _phones = [p.strip() for p in _phone.split(',') if p.strip()]
             if not _phones:
                 _phones = [ph for ph, c in _uc.items()
                            if c is not None and getattr(
                                c, 'is_connected', lambda: False)()][:10]
-            _cap_ids = getattr(self, '_bridge_cap_ids', None)
-            if not isinstance(_cap_ids, dict):
-                _cap_ids = {}
-                try:
-                    self._bridge_cap_ids = _cap_ids
-                except Exception:
-                    pass
             _ok = False
             for _ph in _phones:
-                _cap = _uc.get(_ph)
-                if _cap is None or not getattr(
-                        _cap, 'is_connected', lambda: False)():
-                    continue
-                _cap_id = _cap_ids.get(_ph)
-                if not _cap_id:
+                if _ok:
+                    break
+                # (3أ) إعادة الزرع: توجيل الأصل إلى خاص البوت
+                _orig_chat = int(_orig_chat_s or 0)
+                _orig_msg = int(_orig_msg_s or 0)
+                if _orig_chat and _orig_msg:
                     try:
-                        _cap_me = await asyncio.wait_for(
-                            _cap.get_me(), timeout=6)
-                        _cap_id = int(getattr(_cap_me, 'id', 0) or 0)
-                        if _cap_id > 0:
-                            _cap_ids[_ph] = _cap_id
-                    except Exception:
-                        _cap_id = 0
-                if not _cap_id or _cap_id <= 0:
-                    continue
-                try:
-                    await self._entity_transfer_via_capture(
-                        _sid, 'الإنقاذ', prefer_phone=_ph)
-                except Exception:
-                    pass  # الزرع تحسيني — محاولة التوجيل تبقى
-                # (4) الريلاي عبر بوابة الأمان نفسها
+                        _seed_fn = getattr(
+                            self, '_mention_bridge_seed', None)
+                        if callable(_seed_fn):
+                            await asyncio.wait_for(
+                                _seed_fn(_orig_chat, _orig_msg, _ph, _sid),
+                                timeout=15)
+                    except Exception as _sp_e:
+                        logging.info(
+                            f"[BRIDGE-RESCUE] re-seed via {_ph} failed "
+                            f"(non-fatal): {_sp_e}")
+                # (3ب) الريلاي عبر بوابة الأمان (الفهرس)
                 try:
                     _ok = await self._mention_bridge_relay(
-                        _target, 0, _cap_id,
+                        _target, 0, 1,
                         expected_sender_id=_sid,
                         expected_text=_txt,
                         reply_to_msg_id=_aid)
                 except Exception:
                     _ok = False
-                if _ok:
-                    break
             logging.info(
                 f"[BRIDGE-RESCUE] alert {_aid} sender={_sid} "
                 f"phones={_phones} → {'✅ relayed' if _ok else '❌ failed'}")
@@ -14289,6 +14277,53 @@ class Monitor:
     async def _on_private_message(self, event):
         """معالج رسائل الدردشة الخاصة مع البوت - يدعم /start و /login"""
         try:
+            # [SEED-INDEX v4.5.14b] فهرس بذور الجسر: البوت لا يستطيع
+            # قراءة سجل خاصه (قيد منصة: GetHistory ممنوع لحسابات البوتات
+            # — برهان حي 04:21:35Z)، لكنه يستقبل كل بذرة تحديثًا حيًا
+            # يحمل معرّفها بفضاء البوت نفسه. الفهرس (أصل التوجيل + النص →
+            # المعرّف + حساب الالتقاط) هو أساس بوابة الأمان للريلاي —
+            # مطابقة مضمونة وقت الاستلام، لا سباق معرفات أصلًا.
+            try:
+                _fwd_idx = getattr(event.message, 'fwd_from', None)
+                if _fwd_idx is not None:
+                    _orig_peer_idx = getattr(_fwd_idx, 'from_id', None)
+                    _orig_uid_idx = int(
+                        getattr(_orig_peer_idx, 'user_id', 0) or 0) \
+                        if _orig_peer_idx is not None else 0
+                    _txt_idx = str(
+                        getattr(event.message, 'raw_text', '') or '').strip()
+                    if _orig_uid_idx > 0 and _txt_idx:
+                        _reg_idx = getattr(self, '_bot_seed_index', None)
+                        if not isinstance(_reg_idx, dict):
+                            _reg_idx = {}
+                            try:
+                                self._bot_seed_index = _reg_idx
+                            except Exception:
+                                pass
+                        if isinstance(_reg_idx, dict):
+                            _reg_idx[(_orig_uid_idx, _txt_idx)] = {
+                                'bot_msg_id': int(
+                                    getattr(event.message, 'id', 0) or 0),
+                                'cap_user_id': int(
+                                    event.sender_id or 0),
+                                'ts': time.time(),
+                            }
+                            if len(_reg_idx) > 500:
+                                _old = sorted(
+                                    _reg_idx.items(),
+                                    key=lambda kv: kv[1].get('ts', 0))
+                                for _k_idx, _ in _old[:len(_reg_idx) - 400]:
+                                    del _reg_idx[_k_idx]
+                            _bmid_idx = int(
+                                getattr(event.message, "id", 0) or 0)
+                            logging.info(
+                                f"[SEED-INDEX] bot PM seed indexed: "
+                                f"origin={_orig_uid_idx} "
+                                f"text_len={len(_txt_idx)} "
+                                f"bot_msg_id={_bmid_idx}")
+            except Exception as _idx_e:
+                logging.debug(f"[SEED-INDEX] error (non-fatal): {_idx_e}")
+
             text = (event.message.text or "").strip()
             if not text:
                 return
