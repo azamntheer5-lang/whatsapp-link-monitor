@@ -9130,9 +9130,10 @@ class Monitor:
                             stats['oldest_first_seen'] = min_dt.date().isoformat()
 
                     # ---------- (3) BACKFILL (عصر ما قبل المرآة) ----------
-                    if not remote and stats.get('table_ok') is not False:
-                        # المرآة فارغة/الجدول غائب والجدول المحلي حديث
-                        # البناء → حاول شفاء التواريخ من أرشيف links
+                    # يعمل حين لا تقدم المرآة أي تاريخ: الجدول غائب (404)
+                    # أو فارغ تمامًا — كلاهما يعني «لا مصدر دائم للتواريخ»
+                    # → نشفيها من أرشيف links. محاولات ≤3 لهذه العملية.
+                    if not remote:
                         attempts = getattr(self, '_chat_backfill_attempts', 0)
                         if attempts < 3:
                             self._chat_backfill_attempts = attempts + 1
