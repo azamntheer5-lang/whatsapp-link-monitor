@@ -48,6 +48,12 @@ def make_fake_monitor():
     """Minimal Monitor-like namespace with account-safety state."""
     fm = types.SimpleNamespace(
         _alerted_terminal_phones=set(),
+        # [ALERTS-v4.4.20] needed by _alert_terminal_failure's dead-at-boot
+        # gate (was missing since v4.4.20 — test_11 crashed before reaching
+        # its assertions) + [SESSION-GUARD v1.0] dead-session registry.
+        _connected_once_phones=set(),
+        _terminal_dead_phones={},
+        channel_gate=None,
         user_clients={},
         config=types.SimpleNamespace(owner_id=12345),
         bot_client=None,  # no real bot client — alerts will skip Telegram send

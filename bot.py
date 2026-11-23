@@ -3475,6 +3475,12 @@ class ChannelGate:
       L4 مسح المستخدمين المعروفين (getChatMember): شبكة أمان أخيرة.
       L5 مشرفون غير مصرّحين (getChatAdministrators): تنبيه المالك —
          البوت بلا حق Promote فلا يستطيع عزل مشرف عيّنه المالك يدويًا.
+      L6 [SESSION-GUARD v1.0] حارس الجلسات الحية (أمر المُشغّل 2026-11-23):
+         مشترك أنهى جلسته من إعدادات تيليجرام (UnauthorizedError /
+         not_authorized) → شطب وصوله + طرده فورًا؛ ومسح دوري يطرد أي
+         مشترك بجلسة ميتة («حتى اذا سجل كمراقب وبعد ذلك قام بانها
+         الجلسه بالبوت يتم طرده»). /gate_allow اليدوي بلا رقم غير
+         مرتبط بجلسة → لا يمسّه الحارس. /login جديد يعيد الوصول.
 
     كل عمليات الحظر/الموافقة/الروابط عبر Bot API HTTP — تعمل بأي
     user_id بلا entity cache. طلبات mtproto (toggle/getAdminLog)
@@ -3515,6 +3521,13 @@ class ChannelGate:
         self._banned_by_us: Dict[int, float] = {}
         self._admin_alerts: Dict[int, float] = {}
         self._layer_last_warn: Dict[str, float] = {}
+        # [SESSION-GUARD v1.0] (أمر المُشغّل 2026-11-23): «اي مستخدم ينهي
+        # او يقوم بانهاء الجلسات من اعدادات تيليجرام ينهي الجلسه بالبوت
+        # ابي البوت يطردة فوراً من القناه ويطرد اي شخص في القناه غير
+        # مراقب ... وحتى اذا سجل كمراقب وبعد ذلك قام بانهاء الجلسه
+        # بالبوت يتم طرده».
+        self.uid_phone: Dict[int, str] = {}        # uid → هاتف المشترك
+        self._dead_revoked: Dict[int, float] = {}  # uid → آخر طرد (كتم DM)
         self.layer_health: Dict[str, str] = {
             "toggle_join_request": "pending",
             "invite_link": "pending",
@@ -3523,6 +3536,7 @@ class ChannelGate:
             "admin_log": "pending",
             "probe": "idle",
             "admins_probe": "pending",
+            "session_guard": "pending",
         }
 
     # ---------- helpers ----------
@@ -3761,6 +3775,12 @@ class ChannelGate:
                         uid = p[len(self.GATE_PREFIX):]
                         if p.startswith(self.GATE_PREFIX) and uid.isdigit():
                             self.whitelist[int(uid)] = row.get("display_name") or ""
+                            # [SESSION-GUARD v1.0] ربط uid↔هاتف من عنوان
+                            # المشترك «الاسم (+9665...)» — يحكم من أنهى جلسته.
+                            _ph = self._phone_from_label(
+                                row.get("display_name") or "")
+                            if _ph:
+                                self.uid_phone[int(uid)] = _ph
                     self.log(f"whitelist loaded: {len(self.whitelist)} subscriber(s)")
                 else:
                     self.warn(f"whitelist load failed: HTTP {r.status}")
@@ -3789,6 +3809,16 @@ class ChannelGate:
             return False
         _label = f"{name or 'مشترك'}{' (' + phone + ')' if phone else ''}"
         self.whitelist[uid] = _label
+        if phone:
+            # [SESSION-GUARD v1.0] ربط الحارس + منح وصول = جلسة حية الآن
+            # → امسح أي علامة موت طرفي قديمة للرقم (re-login يُحيي فورًا).
+            self.uid_phone[uid] = str(phone)
+            try:
+                _dead = getattr(self.monitor, '_terminal_dead_phones', None)
+                if _dead:
+                    _dead.pop(str(phone), None)
+            except Exception:
+                pass
         if not (self.supabase_url and self.supabase_key and self._http):
             self.warn("whitelist_add: no Supabase — in-memory only")
             return False
@@ -3839,6 +3869,131 @@ class ChannelGate:
             self.warn(f"whitelist_remove error: {e}")
             return False
 
+    # ---------- [SESSION-GUARD v1.0] حارس الجلسات الحية ----------
+
+    @staticmethod
+    def _phone_from_label(label: str) -> str:
+        """رقم هاتف المراقب من عنوان المشترك — التنسيق «الاسم (+9665...)».
+        الإضافة اليدوية /gate_allow بلا رقم تُرجع "" (لا يربطها الحارس)."""
+        try:
+            m = re.search(r'\(\s*(\+?\d[\d\s\-]{4,20})\s*\)\s*$',
+                          str(label or ''))
+            if m:
+                return re.sub(r'[\s\-]+', '', m.group(1))
+        except Exception:
+            pass
+        return ""
+
+    def _uid_for_phone(self, phone: str) -> int:
+        """uid المشترك المرتبط بهاتف المراقب (خريطة حية أو تحليل العناوين)."""
+        if not phone:
+            return 0
+        _ph = str(phone)
+        for uid, ph in self.uid_phone.items():
+            if ph == _ph:
+                return int(uid)
+        for uid, label in self.whitelist.items():
+            if self._phone_from_label(label) == _ph:
+                return int(uid)
+        return 0
+
+    def _subscriber_session_dead(self, uid: int) -> bool:
+        """مشترك بجلسة مراقب ماتت طرفيًا؟ (سجل _terminal_dead_phones).
+        بلا ربط رقم (إضافة يدوية) → False — fail-open للمضافين يدويًا."""
+        try:
+            _uid = int(uid)
+            phone = self.uid_phone.get(_uid) or self._phone_from_label(
+                self.whitelist.get(_uid, ""))
+        except (TypeError, ValueError):
+            return False
+        if not phone:
+            return False
+        dead = getattr(self.monitor, '_terminal_dead_phones', None)
+        if not dead:
+            return False
+        return phone in dead
+
+    async def on_watcher_session_dead(self, phone: str,
+                                      reason: str = 'session_terminated') -> str:
+        """[SESSION-GUARD] جلسة مراقب ماتت طرفيًا (أنهى مالكها الجلسات من
+        إعدادات تيليجرام → UnauthorizedError/not_authorized) → شطب وصوله
+        + طرده من القناة فورًا. المالك/البوت/الإضافات اليدوية: لا يمسّهم."""
+        try:
+            if not self.enabled or not self.channel_marked:
+                return 'disabled'
+            _ph = str(phone or '').strip()
+            if not _ph:
+                return 'no_phone'
+            uid = self._uid_for_phone(_ph)
+            if not uid:
+                # سباق الإقلاع: account-loop قد يسبق تحميل القائمة →
+                # إعادة محاولة مؤجلة (10/30/60ث)، والمسح الدوري (L6)
+                # شبكة أخيرة.
+                try:
+                    asyncio.create_task(
+                        self._retry_dead_resolution(_ph, reason))
+                except Exception:
+                    pass
+                return 'retry_scheduled'
+            return await self._revoke_and_ban(uid, _ph, reason)
+        except Exception as e:
+            self.warn(f"on_watcher_session_dead error: {type(e).__name__} {e}")
+            return 'error'
+
+    async def _retry_dead_resolution(self, phone: str, reason: str):
+        """إعادة حل uid المشترك الميت بعد تأخير (تحميل القائمة المتأخر)."""
+        for delay in (10, 30, 60):
+            try:
+                await asyncio.sleep(delay)
+                _dead = getattr(
+                    self.monitor, '_terminal_dead_phones', None) or {}
+                if str(phone) not in _dead:
+                    return  # عاد حيًا (إعادة دخول) — لا شيء لنفعله
+                uid = self._uid_for_phone(phone)
+                if uid:
+                    await self._revoke_and_ban(uid, str(phone), reason)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+        self._layer_warn(
+            'session_guard',
+            f'dead session {phone} ({reason}) has no subscriber row — '
+            f'not a gate subscriber (nothing to revoke)')
+
+    async def _revoke_and_ban(self, uid: int, phone: str,
+                              reason: str) -> str:
+        """شطب وصول مشترك ميت الجلسة + طرده من القناة فورًا (idempotent).
+        فشل الحظر → seen_users يضمن أن المسح الدوري (L4) يعيد المحاولة."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return 'invalid_uid'
+        if self.bot_id and uid == self.bot_id:
+            return 'skip_bot'
+        if self.owner_id and uid == int(self.owner_id):
+            return 'skip_owner'
+        _label = self.whitelist.get(uid) or ""
+        self.uid_phone.pop(uid, None)
+        await self.whitelist_remove(uid)  # Supabase + الذاكرة + seen_users
+        r = await self._tg_api("banChatMember", chat_id=self.channel_marked,
+                               user_id=uid, until_date=0)
+        ok = bool(r.get("ok"))
+        self.layer_health["session_guard"] = "live"
+        self._record(
+            f"{'🚫 إنهاء جلسة → طرد' if ok else '⚠️ طرد فشل (المسح يكمل)'}: "
+            f"{uid} {_label} — {reason}")
+        now = time.time()
+        if now - self._dead_revoked.get(uid, 0) > 1800:
+            self._dead_revoked[uid] = now
+            await self.notify_owner(
+                f"🚫 حارس الجلسات: طرد مشترك أنهى جلسته\n"
+                f"👤 المستخدم: {uid}\n📞 الرقم: {phone or '؟'}\n"
+                f"السبب: {reason}\n"
+                f"📌 العضوية للحسابات الحية فقط — /login جديد يعيد الوصول")
+        return 'banned' if ok else 'ban_failed'
+
     # ---------- authorization core ----------
 
     def is_authorized(self, uid) -> bool:
@@ -3850,7 +4005,14 @@ class ChannelGate:
             return True
         if self.owner_id and uid == int(self.owner_id):
             return True
-        return uid in self.whitelist
+        if uid not in self.whitelist:
+            return False
+        # [SESSION-GUARD v1.0] مشترك أنهى جلسته (ماتت طرفيًا) = غير مراقب
+        # → لا وصول: «حتى اذا سجل كمراقب وبعد ذلك قام بانها الجلسه
+        # بالبوت يتم طرده».
+        if self._subscriber_session_dead(uid):
+            return False
+        return True
 
     async def probe(self, uid: int):
         """حالة العضوية عبر getChatMember (None = ليس عضوًا)."""
@@ -3999,6 +4161,7 @@ class ChannelGate:
                 await self._admin_log_sweep()
                 await self._probe_sweep()
                 await self._admin_sweep_once()
+                await self._subscriber_liveness_audit()
             except Exception as e:
                 self.warn(f"sweep cycle error: {type(e).__name__} {e}")
             await asyncio.sleep(self.sweep_s)
@@ -4065,6 +4228,33 @@ class ChannelGate:
                 await self.notify_owner(
                     f"⚠️ بوابة القناة: مشرف غير مشترك ({uid}) — البوت لا يملك "
                     f"حق Promote فعزله يدويًا أو /gate_allow {uid}")
+
+    async def _subscriber_liveness_audit(self):
+        """L6 — [SESSION-GUARD v1.0] شبكة أمان دورية: مشترك بجلسة مراقب
+        ميتة لا يبقى في القناة. الجلسة قد تموت أثناء توقف الخدمة أو
+        يفلت الحارس الفوري (فشل حظر مؤقت) — هنا يُعاد الفرض كل دورة
+        مسح: «ويطرد اي شخص في القناه غير مراقب» بمعنى «مراقب بجلسة حية»."""
+        try:
+            checked = 0
+            evicted = 0
+            for uid in list(self.whitelist.keys()):
+                if self.owner_id and uid == int(self.owner_id):
+                    continue
+                if self.bot_id and uid == self.bot_id:
+                    continue
+                checked += 1
+                if self._subscriber_session_dead(uid):
+                    _phone = self.uid_phone.get(uid) or \
+                        self._phone_from_label(self.whitelist.get(uid, ""))
+                    res = await self._revoke_and_ban(
+                        uid, _phone, 'audit:session-dead')
+                    if res == 'banned':
+                        evicted += 1
+            self.layer_health["session_guard"] = (
+                f"ok ({checked} checked, {evicted} evicted)")
+        except Exception as e:
+            self._layer_warn("session_guard",
+                             f"audit error: {type(e).__name__} {e}")
 
     # ---------- login integration ----------
 
@@ -5167,6 +5357,11 @@ class Monitor:
         # حقيقي يستحق العلم الفوري). الحسابات الميتة منذ الإقلاع (معروفة
         # للمالك) = سجل فقط — هذا هو مصدر التكرار المزعج بعد كل نشر.
         self._connected_once_phones: Set[str] = set()
+        # [SESSION-GUARD v1.0] هواتف ماتت جلستها طرفيًا (أنهى مالكها
+        # الجلسات من إعدادات تيليجرام / أُبطل المفتاح) — بوابة القناة
+        # (ChannelGate) تقرؤها لتطرد المشترك غير الحي فورًا (أمر المُشغّل
+        # 2026-11-23). تُمسح عند READY (اتصال ناجح) وعند منح وصول جديد.
+        self._terminal_dead_phones: Dict[str, float] = {}
         # Live fleet health snapshot — updated by _joiner_fleet_health_loop
         # (60s cycle) and read by /ready, /api/joined_groups, and the
         # _joiner_worker fleet backoff gate. Keys:
@@ -16183,6 +16378,23 @@ class Monitor:
         except Exception as e:
             logging.warning(f"[ACCOUNT] {phone} alert send failed: {e}")
 
+    def _mark_session_dead(self, phone: str, reason: str):
+        """[SESSION-GUARD v1.0] جلسة مراقب ماتت طرفيًا → سجّل الرقم +
+        اطلب من بوابة القناة طرده فورًا (مهمة خلفية — لا تعطّل حلقة
+        الحساب ولا تعطل التنبيه الطرفي أعلاه)."""
+        try:
+            self._terminal_dead_phones[str(phone)] = time.time()
+        except Exception:
+            pass
+        gate = getattr(self, 'channel_gate', None)
+        if gate is None:
+            return
+        try:
+            asyncio.create_task(
+                gate.on_watcher_session_dead(str(phone), reason))
+        except Exception:
+            pass
+
     async def _run_user_client(self, watcher):
         """تشغيل user_client — المراقبون والفدائيون كلاهما يستمعان للرسائل الآن
 
@@ -16291,6 +16503,11 @@ class Monitor:
                         await self._alert_terminal_failure(
                             phone, 'not_authorized', 're-login required',
                             role=role)
+                        # [SESSION-GUARD v1.0] جلسة ميتة (أُنهيت من إعدادات
+                        # تيليجرام أو أُبطل المفتاح) — يغطي «سجل كمراقب ثم
+                        # أنهى الجلسة» حتى لو ماتت والخدمة متوقفة ثم أُعيد
+                        # تشغيلها: عند الإقلاع يُكشف الموت هنا → طرد فوري.
+                        self._mark_session_dead(phone, 'not_authorized')
                         self._cleanup_user_client(phone)
                         await asyncio.sleep(3600)
                         continue
@@ -16309,6 +16526,13 @@ class Monitor:
                     # هو ما يستحق إزعاج المالك).
                     try:
                         self._connected_once_phones.add(phone)
+                    except Exception:
+                        pass
+                    # [SESSION-GUARD v1.0] الجلسة عادت حية (اتصال ناجح /
+                    # إعادة دخول) — أزل علامة الموت الطرفي حتى لا يطرده
+                    # مسح البوابة بخبر قديم.
+                    try:
+                        self._terminal_dead_phones.pop(phone, None)
                     except Exception:
                         pass
                     if role == 'monitor':
@@ -16362,6 +16586,13 @@ class Monitor:
                         phone, type(e).__name__, _rn_why, role=role)
                 except Exception:
                     pass
+                # [SESSION-GUARD v1.0] إنهاء الجلسة من إعدادات تيليجرام →
+                # طرد فوري من قناة الطلبات. AuthKeyDuplicatedError مستثنى
+                # عمدًا: الجلسة حيّة لدى حامل آخر (نشر متداخل على Render
+                # أثناء النشر) وليست إنهاءً من المستخدم — الطرد فيه قد
+                # يفصل كل المشتركين مع كل نشر.
+                if not isinstance(e, AuthKeyDuplicatedError):
+                    self._mark_session_dead(phone, type(e).__name__)
                 logging.error(
                     f"[ACCOUNT] {phone} error: {type(e).__name__}: {e} "
                     f"— cooldown 600s (no 5s retry spam; DB session "
