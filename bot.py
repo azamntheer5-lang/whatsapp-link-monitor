@@ -1281,6 +1281,30 @@ class Config:
             "JOURNAL_SNAPSHOT_ENABLED", "false").strip().lower() in (
             "1", "true", "yes", "on")
 
+        # === [CHAT-PERSIST v4.5.17] جدول المجموعات دائم ===
+        # ★ أمر المُشغّل (2026-11-23): «جدول المجموعات يُبنى من جديد مع
+        # كل نشر (قرص مؤقت) — لهذا كل first_seen تاريخ اليوم… هذا غلط
+        # اذا كان ضعيف غيره تصرف كسنيور». الحل: مرآة monitored_chats إلى
+        # Supabase (دائم) + bootstrap عند الإقلاع + شفاء oldest-wins.
+        # ملاحظة: أمر المُشغّل السابق [SUPA-MSG-KILL] كان عن «الرسائل» —
+        # هذا الجدول بيانات تشغيلية للمجموعات (عناوين/معرفات/تواريخ)،
+        # ليس محتوى رسائل. مفتاح إيقاف احتياطي: CHAT_SNAPSHOT_ENABLED=false
+        self.chat_snapshot_enabled = os.getenv(
+            "CHAT_SNAPSHOT_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+        try:
+            self.chat_snapshot_interval_s = max(
+                30, int(os.getenv("CHAT_SNAPSHOT_INTERVAL_S", "120")))
+        except ValueError:
+            self.chat_snapshot_interval_s = 120
+        # إعادة بناء تواريخ first_seen التاريخية من أرشيف links (مرة
+        # واحدة عند غياب المرآة — قبل إنشاء جدول Supabase) — أول تاريخ
+        # موثق لالتقاط طلب من نفس المجموعة. CHAT_BACKFILL_FROM_LINKS=false
+        # للتعطيل.
+        self.chat_backfill_from_links = os.getenv(
+            "CHAT_BACKFILL_FROM_LINKS", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+
         # === [FLEET-COVERAGE v4.5.15] تغطية الأسطول — معطّلة افتراضياً ===
         # ★ أمر المُشغّل (2026-11-23): «حسابات الانضمام هي الحسابات
         # الفدائيه فقط لاينضم اذا كان هناك حساب فدائي متصل ينضم في
@@ -4583,12 +4607,45 @@ class WebJoinManager:
 
     # ---------- public API ----------
 
-    async def start_join(self, phone_raw: str, ip: str = '') -> dict:
-        """الخطوة الأولى: حساب معروف → انضمام فوري؛ غير معروف → كود."""
+    async def start_join(self, phone_raw: str, ip: str = '',
+                         force_sms: bool = False) -> dict:
+        """الخطوة الأولى: حساب معروف → انضمام فوري؛ غير معروف → كود.
+
+        [LOGIN-CODE-DELIVERY v4.5.17] force_sms=True: إعادة إرسال قسرية
+        عبر SMS لجلسة كود قائمة (نفس زر البوت) — للواجهة العامة
+        (البلاغ: «الكود مايوصل») — تمر بنفس سقف MAX_CODE_SENDS_PER_PHONE.
+        """
         self._cleanup()
         phone = self._normalize_phone(phone_raw)
         if not phone:
             return {'ok': False, 'status': 'bad_phone'}
+
+        # === [LOGIN-CODE-DELIVERY v4.5.17] إعادة إرسال SMS لجلسة قائمة ===
+        if force_sms:
+            ent = self.pending.get(phone)
+            if not ent or not ent.get('client'):
+                return {'ok': False, 'status': 'no_session'}
+            if not self._rate_hit(self._phone_sends, phone,
+                                  self.MAX_CODE_SENDS_PER_PHONE):
+                return {'ok': False, 'status': 'phone_limited'}
+            try:
+                result = await ent['client'].send_code_request(
+                    phone, force_sms=True)
+                ent['hash'] = getattr(result, 'phone_code_hash', ent['hash'])
+                ent['ts'] = time.time()
+                logging.info(
+                    f"[JOIN-WEB] code re-sent via SMS to "
+                    f"{self._mask_phone(phone)}")
+                return {'ok': True, 'status': 'code_resent_sms'}
+            except FloodWaitError as fe:
+                return {'ok': False, 'status': 'flood',
+                        'wait': int(getattr(fe, 'seconds', 60) or 60)}
+            except Exception as e:
+                logging.warning(
+                    f"[JOIN-WEB] SMS resend error: {type(e).__name__} {e}")
+                return {'ok': False, 'status': 'send_failed',
+                        'error': str(e)[:120]}
+
         if ip and not self._rate_hit(self._ip_starts, ip,
                                      self.MAX_STARTS_PER_IP):
             return {'ok': False, 'status': 'ip_limited'}
@@ -4631,9 +4688,21 @@ class WebJoinManager:
                 'tries': 0,
             }
             self.totals['code_requests'] += 1
+            # [LOGIN-CODE-DELIVERY v4.5.17] قناة التسليم الفعلية — تُعرض
+            # للمستخدم في الواجهة كي يعرف أين يبحث عن الكود
+            _ctype = type(getattr(result, 'type', None)).__name__ or ''
+            if 'Sms' in _ctype:
+                _chan = 'sms'
+            elif 'Call' in _ctype and 'Missed' not in _ctype:
+                _chan = 'call'
+            elif 'App' in _ctype:
+                _chan = 'app'
+            else:
+                _chan = 'telegram'
             logging.info(
-                f"[JOIN-WEB] code sent to {self._mask_phone(phone)}")
-            return {'ok': True, 'status': 'code_sent'}
+                f"[JOIN-WEB] code sent to {self._mask_phone(phone)} "
+                f"(channel={_chan})")
+            return {'ok': True, 'status': 'code_sent', 'channel': _chan}
         except FloodWaitError as fe:
             if tc is not None:
                 try:
@@ -6143,6 +6212,7 @@ class Monitor:
             # are allowed for anyone in the channel.
             STATE_CHANGING_CALLBACKS = {
                 "login_start", "login_monitor", "login_joiner", "login_autoreply",
+                "login_sms",
                 "scan_week", "scan_month", "scan_stop", "reset_scan",
                 "add_watcher",
             }
@@ -6174,6 +6244,11 @@ class Monitor:
 
             if data == "login_cancel":
                 await event.edit("❌ تم إلغاء تسجيل الدخول.")
+                return
+
+            # [LOGIN-CODE-DELIVERY v4.5.17] إعادة إرسال الكود قسراً عبر SMS
+            if data == "login_sms":
+                await self._handle_login_resend_sms(event, sender)
                 return
 
             # معالجة أزرار الروابط (نسخ/مشاركة/حفظ)
@@ -8661,6 +8736,518 @@ class Monitor:
         except Exception as e:
             logging.warning(f"[JOURNAL-SNAPSHOT] restore error: {e}")
             return 0
+
+    # ===================================================================
+    # [CHAT-PERSIST v4.5.17] جدول المجموعات دائم — مرآة Supabase
+    # ===================================================================
+    # المشكلة الجذرية (بلاغ المُشغّل 2026-11-23): جدول monitored_chats
+    # يعيش في SQLite على القرص المؤقت لـRender — كل نشر يمسحه → كل
+    # first_seen يصير «اليوم» → عمود أول-اكتشاف بلا معنى.
+    # المعمارية (سنيور، same pattern as JOURNAL-SNAPSHOT PR-6):
+    #   1. BOOTSTRAP عند الإقلاع: سحب كل صفوف المرآة من Supabase
+    #      → INSERT OR IGNORE محلياً مع first_seen التاريخي — يسبق
+    #      _sync_monitored_chats فلا يكتب تاريخ اليوم فوق التاريخ الأصلي.
+    #   2. PUSH-DELTA دوري: الصفوف الجديدة/المحدّثة (last_seen > علامة
+    #      الماء) تُرسل إلى Supabase بـmerge-duplicates:
+    #      • الصفوف الجديدة (غير موجودة بالمرآة): تُرسل WITH first_seen
+    #        (يكتب التاريخ الصحيح فور إنشائها — بما فيها تواريخ
+    #        backfill التاريخية).
+    #      • الصفوف الموجودة: تُرسل WITHOUT first_seen → ON CONFLICT لا
+    #        يمسّ عمود first_seen إطلاقاً → التاريخ الدائم لا يُكتب فوقه
+    #        أبداً (حماية من سيناريو «bootstrap فشل → الجدول المحلي
+    #        بُني بتاريخ اليوم → الدفع الكامل يحرق التاريخ الدائم»).
+    #   3. HEAL أولد-يفوز: كل دورة تسحب (chat_id, first_seen) من
+    #      Supabase وتصحّح أي first_seen محلي أحدث من الدائم (إقلاع
+    #      بلا bootstrap ناجح يلتئم تلقائياً خلال دورة واحدة).
+    #   4. BACKFILL من أرشيف links (عصر ما قبل المرآة فقط): أول
+    #      created_at لكل group_name = أول تاريخ موثّق لالتقاط طلب من
+    #      نفس المجموعة → يشفي first_seen المحلي قبل أول دفعة تُرسل.
+    # جدول Supabase: supabase/monitored_chats.sql (DDL idempotent —
+    # غيابه يُكتشف بـ404 ويُسجَّل تحذير مقنّن دون كسر أي شيء؛ لحظة
+    # إنشائه يبدأ كل شيء بالعمل تلقائياً بلا نشر جديد).
+    # ===================================================================
+
+    def _chat_persist_status(self) -> dict:
+        """حالة المرآة — للسجلات و /api/monitored_chats (persist)."""
+        st = getattr(self, '_chat_persist_stats', None)
+        if not isinstance(st, dict):
+            st = {}
+        out = {
+            'enabled': bool(getattr(getattr(self, 'config', None),
+                                    'chat_snapshot_enabled', False)),
+            'table_ok': st.get('table_ok'),
+            'mirror_rows': st.get('mirror_rows', 0),
+            'bootstrapped': st.get('bootstrapped', 0),
+            'healed_total': st.get('healed_total', 0),
+            'pushed_total': st.get('pushed_total', 0),
+            'last_push_at': st.get('last_push_at'),
+            'last_heal_at': st.get('last_heal_at'),
+            'oldest_first_seen': st.get('oldest_first_seen'),
+            'last_error': st.get('last_error'),
+            'sql_file': 'supabase/monitored_chats.sql',
+        }
+        return out
+
+    @staticmethod
+    def _chat_ts(value) -> datetime | None:
+        """تحليل قيمة وقت من SQLite/Supabase → datetime ساذج (UTC).
+
+        يطبع مع/بدون timezone — نطبّع الكل إلى ساذج (الخادم UTC على
+        Render) كي تصحّ المقارنات."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        try:
+            s = str(value).strip().replace('Z', '+00:00')
+            if s.endswith('+00:00'):
+                s = s[:-6]
+            # اجعل الشكل ثابتًا: python fromisoformat يرفض '2026-11-23'
+            # مع وقت ناقص مثل 'T07' — نعالج الحالات الواقعية فقط
+            return datetime.fromisoformat(s).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    async def _bootstrap_monitored_chats_from_supabase(self) -> int:
+        """إقلاع: سحب صفوف المرآة → INSERT OR IGNORE محلياً.
+
+        يعيد عدد الصفوف المستعادة. غير قاتل (أي خطأ → 0)."""
+        stats = getattr(self, '_chat_persist_stats', None)
+        if not isinstance(stats, dict):
+            stats = {}
+            self._chat_persist_stats = stats
+        stats.setdefault('bootstrapped', 0)
+        stats.setdefault('healed_total', 0)
+        stats.setdefault('pushed_total', 0)
+        if not getattr(getattr(self, 'config', None),
+                       'chat_snapshot_enabled', False):
+            logging.info("[CHAT-PERSIST] disabled (CHAT_SNAPSHOT_ENABLED != true)")
+            return 0
+        if not self.db.supabase_url or not self.db.supabase_key:
+            logging.info("[CHAT-PERSIST] no Supabase config — skip bootstrap")
+            return 0
+        session = await self.db._get_supabase_session()
+        restored = 0
+        offset = 0
+        oldest: datetime | None = None
+        while True:
+            url = (
+                f"{self.db.supabase_url}/rest/v1/monitored_chats?"
+                f"select=chat_id,chat_title,username,link_type,monitored_by,"
+                f"member_count,ai_classification,ai_country,ai_relevance,"
+                f"ai_description,should_monitor,reader_phones,primary_reader,"
+                f"first_seen&order=chat_id.asc&limit=1000&offset={offset}"
+            )
+            snap_timeout = aiohttp.ClientTimeout(total=20)
+            async with session.get(url, timeout=snap_timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    stats['table_ok'] = False
+                    stats['last_error'] = f"bootstrap status={resp.status}"
+                    if resp.status == 404 or 'does not exist' in body.lower() \
+                            or 'relation' in body.lower():
+                        logging.info(
+                            "[CHAT-PERSIST] mirror table missing — create it "
+                            "with supabase/monitored_chats.sql (Supabase SQL "
+                            "Editor). Local table stays rebuild-per-deploy "
+                            "until then. Non-fatal.")
+                    else:
+                        logging.warning(
+                            f"[CHAT-PERSIST] bootstrap status={resp.status}: "
+                            f"{body[:150]}")
+                    return restored
+                rows = await resp.json()
+            if not rows:
+                break
+            conn = await self.prod_db._conn()
+            now_iso = datetime.now().isoformat()
+            batch = []
+            for r in rows:
+                fs = self._chat_ts(r.get('first_seen')) or datetime.now()
+                if oldest is None or fs < oldest:
+                    oldest = fs
+                batch.append((
+                    int(r.get('chat_id') or 0),
+                    str(r.get('chat_title') or '')[:300],
+                    str(r.get('username') or '')[:160],
+                    str(r.get('link_type') or 'telegram')[:40],
+                    str(r.get('monitored_by') or '')[:40],
+                    int(r.get('member_count') or 0),
+                    fs.isoformat(), now_iso, now_iso, now_iso,
+                    str(r.get('ai_classification') or '') or None,
+                    str(r.get('ai_country') or '') or None,
+                    int(r.get('ai_relevance') or 0),
+                    str(r.get('ai_description') or '') or None,
+                    1 if r.get('should_monitor', 1) in (1, True, '1') else 0,
+                    str(r.get('reader_phones') or '[]') or '[]',
+                    str(r.get('primary_reader') or '') or '',
+                ))
+            try:
+                await conn.executemany(
+                    """INSERT OR IGNORE INTO monitored_chats
+                    (chat_id, chat_title, username, link_type, monitored_by,
+                     member_count, first_seen, last_seen, last_activity,
+                     next_poll_at, ai_classification, ai_country,
+                     ai_relevance, ai_description, should_monitor,
+                     reader_phones, primary_reader)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    batch)
+                await conn.commit()
+                restored += len(batch)
+            except Exception as e:
+                logging.warning(f"[CHAT-PERSIST] bootstrap insert error: {e}")
+            stats['table_ok'] = True
+            stats['mirror_rows'] = (stats.get('mirror_rows', 0) or 0) + len(rows)
+            if len(rows) < 1000:
+                break
+            offset += 1000
+            if offset >= 10000:  # سقف أمان: 10 آلاف صف
+                break
+        stats['bootstrapped'] = restored
+        if oldest is not None:
+            stats['oldest_first_seen'] = oldest.date().isoformat()
+        logging.info(
+            f"🛟 [CHAT-PERSIST] bootstrap: restored {restored} group(s) from "
+            f"Supabase mirror"
+            + (f" (oldest first_seen={stats['oldest_first_seen']})"
+               if stats.get('oldest_first_seen') else ""))
+        return restored
+
+    async def _backfill_first_seen_from_links(self) -> int:
+        """عصر ما قبل المرآة: شفاء first_seen من أرشيف links الدائم.
+
+        أول created_at لكل group_name = أول تاريخ موثّق لالتقاط طلب من
+        نفس المجموعة (مطابقة العناوين). يعمل فقط عندما يبدو الجدول
+        المحلي «حديث البناء» (أقدم first_seen خلال 48 ساعة) — أي أن
+        المرآة لم تستعد شيئاً. يجري مرة واحدة عمليًا: بعد نجاحه يصبح
+        أقدم first_seen قديماً فيتوقف الشرط من نفسه."""
+        try:
+            if not getattr(getattr(self, 'config', None),
+                           'chat_backfill_from_links', False):
+                return 0
+            conn = await self.prod_db._conn()
+            cursor = await conn.execute(
+                "SELECT COUNT(*), MIN(first_seen) FROM monitored_chats")
+            row = await cursor.fetchone()
+            count, min_fs = (row[0] or 0), row[1]
+            if count < 20:
+                return 0
+            min_dt = self._chat_ts(min_fs)
+            if min_dt is None or (datetime.now() - min_dt) > timedelta(hours=48):
+                # الجدول يحمل تاريخاً حقيقياً (bootstrap نجح أو backfill
+                # سابق) — لا حاجة
+                return 0
+            if not self.db.supabase_url or not self.db.supabase_key:
+                return 0
+            session = await self.db._get_supabase_session()
+            earliest: dict = {}
+            offset = 0
+            pages = 0
+            while pages < 40:  # سقف أمان: 40 ألف صف
+                url = (
+                    f"{self.db.supabase_url}/rest/v1/links?"
+                    f"select=group_name,created_at&order=created_at.asc"
+                    f"&limit=1000&offset={offset}"
+                )
+                bf_timeout = aiohttp.ClientTimeout(total=20)
+                async with session.get(url, timeout=bf_timeout) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logging.warning(
+                            f"[CHAT-BACKFILL] links fetch status={resp.status}:"
+                            f" {body[:120]}")
+                        return 0
+                    rows = await resp.json()
+                if not rows:
+                    break
+                for r in rows:
+                    gn = (r.get('group_name') or '').strip()
+                    if gn and gn not in earliest:
+                        # ترتيب تصاعدي — أول ظهور = الأقدم
+                        earliest[gn] = r.get('created_at')
+                pages += 1
+                if len(rows) < 1000:
+                    break
+                offset += 1000
+            if not earliest:
+                return 0
+            # شفاء محلي: أولد-يفوز (المطابقة بعنوان المجموعة)
+            cursor = await conn.execute(
+                "SELECT chat_id, chat_title, first_seen FROM monitored_chats")
+            chats = await cursor.fetchall()
+            updates = []
+            for chat_id, title, cur_fs in chats:
+                link_fs = self._chat_ts(earliest.get((title or '').strip()))
+                cur_dt = self._chat_ts(cur_fs)
+                if link_fs is None or cur_dt is None:
+                    continue
+                if link_fs < cur_dt:
+                    updates.append((link_fs.isoformat(), chat_id))
+            if updates:
+                await conn.executemany(
+                    "UPDATE monitored_chats SET first_seen = ? WHERE chat_id = ?",
+                    updates)
+                await conn.commit()
+            cursor = await conn.execute("SELECT MIN(first_seen) FROM monitored_chats")
+            row = await cursor.fetchone()
+            min_after = self._chat_ts(row[0]) if row else None
+            stats = getattr(self, '_chat_persist_stats', None)
+            if isinstance(stats, dict):
+                stats['healed_total'] = (stats.get('healed_total', 0)
+                                         + len(updates))
+                if min_after is not None:
+                    stats['oldest_first_seen'] = min_after.date().isoformat()
+            logging.info(
+                f"🛟 [CHAT-BACKFILL] healed first_seen for {len(updates)}/"
+                f"{len(chats)} group(s) from links history"
+                + (f" (oldest now {min_after.date().isoformat()})"
+                   if min_after else ""))
+            return len(updates)
+        except Exception as e:
+            logging.warning(f"[CHAT-BACKFILL] error (non-fatal): {e}")
+            return 0
+
+    async def _chat_persist_loop(self):
+        """حلقة المرآة الدورية: heal أولد-يفوز + push-delta.
+
+        سلامة دورة واحدة ≤ دقيقتين عادة؛ كل الأخطاء غير قاتلة؛ 429 →
+        backoff 60ث؛ جدول غائب → تحذير مقنّن (مرة/ساعة) يرشد للSQL."""
+        if getattr(self, '_chat_persist_running', False):
+            logging.info("[CHAT-PERSIST] previous cycle still running — skip")
+            return
+        self._chat_persist_running = True
+        try:
+            await asyncio.sleep(45)  # دع _sync_monitored_chats يملأ الجدول
+            logging.info(
+                "[CHAT-PERSIST] started — "
+                f"{getattr(getattr(self, 'config', None), 'chat_snapshot_interval_s', 120)}s cycle")
+            last_missing_log = 0.0
+            backoff_until = 0.0
+            while self._running:
+                try:
+                    now = time.time()
+                    if now < backoff_until:
+                        await asyncio.sleep(10)
+                        continue
+                    cfg = getattr(self, 'config', None)
+                    if not getattr(cfg, 'chat_snapshot_enabled', False):
+                        await asyncio.sleep(300)
+                        continue
+                    if not self.db.supabase_url or not self.db.supabase_key:
+                        await asyncio.sleep(300)
+                        continue
+                    stats = getattr(self, '_chat_persist_stats', None)
+                    if not isinstance(stats, dict):
+                        stats = {}
+                        self._chat_persist_stats = stats
+                    stats.setdefault('healed_total', 0)
+                    stats.setdefault('pushed_total', 0)
+
+                    # ---------- (1) PULL-HEAL: أولد-يفوز ----------
+                    session = await self.db._get_supabase_session()
+                    remote: dict = {}
+                    offset = 0
+                    table_missing = False
+                    pull_err = None
+                    while True:
+                        pull_url = (
+                            f"{self.db.supabase_url}/rest/v1/monitored_chats?"
+                            f"select=chat_id,first_seen&order=chat_id.asc"
+                            f"&limit=1000&offset={offset}"
+                        )
+                        pull_timeout = aiohttp.ClientTimeout(total=20)
+                        async with session.get(pull_url, timeout=pull_timeout) as resp:
+                            if resp.status != 200:
+                                body = await resp.text()
+                                if resp.status == 404 or \
+                                        'does not exist' in body.lower() or \
+                                        'relation' in body.lower():
+                                    table_missing = True
+                                else:
+                                    pull_err = f"status={resp.status}: {body[:120]}"
+                                break
+                            rows = await resp.json()
+                        if not rows:
+                            break
+                        for r in rows:
+                            fs = self._chat_ts(r.get('first_seen'))
+                            if fs is not None:
+                                remote[int(r.get('chat_id') or 0)] = fs
+                        if len(rows) < 1000:
+                            break
+                        offset += 1000
+                        if offset >= 10000:
+                            break
+                    if table_missing:
+                        stats['table_ok'] = False
+                        stats['mirror_rows'] = 0
+                        now_t = time.time()
+                        if now_t - last_missing_log > 3600:
+                            logging.warning(
+                                "[CHAT-PERSIST] mirror table missing — run "
+                                "supabase/monitored_chats.sql in Supabase SQL "
+                                "Editor once. Until then groups rebuild per "
+                                "deploy (first_seen resets). Everything else "
+                                "works. See repo file for the exact SQL.")
+                            last_missing_log = now_t
+                    elif pull_err:
+                        stats['last_error'] = pull_err
+                        logging.warning(f"[CHAT-PERSIST] pull skipped: {pull_err}")
+                    else:
+                        stats['table_ok'] = True
+                        stats['mirror_rows'] = len(remote)
+
+                    # ---------- (2) HEAL محلي من المرآة ----------
+                    if remote:
+                        conn = await self.prod_db._conn()
+                        cursor = await conn.execute(
+                            "SELECT chat_id, first_seen FROM monitored_chats")
+                        locals_rows = await cursor.fetchall()
+                        updates = []
+                        for chat_id, cur_fs in locals_rows:
+                            rem_fs = remote.get(chat_id)
+                            cur_dt = self._chat_ts(cur_fs)
+                            if rem_fs is None or cur_dt is None:
+                                continue
+                            if rem_fs < cur_dt:
+                                updates.append((rem_fs.isoformat(), chat_id))
+                        if updates:
+                            await conn.executemany(
+                                "UPDATE monitored_chats SET first_seen = ? "
+                                "WHERE chat_id = ?", updates)
+                            await conn.commit()
+                            stats['healed_total'] = (
+                                stats.get('healed_total', 0) + len(updates))
+                            stats['last_heal_at'] = datetime.now().isoformat()
+                            logging.info(
+                                f"🛟 [CHAT-PERSIST] heal: restored older "
+                                f"first_seen for {len(updates)} group(s)")
+                        cursor = await conn.execute(
+                            "SELECT MIN(first_seen) FROM monitored_chats")
+                        row = await cursor.fetchone()
+                        min_dt = self._chat_ts(row[0]) if row else None
+                        if min_dt is not None:
+                            stats['oldest_first_seen'] = min_dt.date().isoformat()
+
+                    # ---------- (3) BACKFILL (عصر ما قبل المرآة) ----------
+                    if not remote and stats.get('table_ok') is not False:
+                        # المرآة فارغة/الجدول غائب والجدول المحلي حديث
+                        # البناء → حاول شفاء التواريخ من أرشيف links
+                        attempts = getattr(self, '_chat_backfill_attempts', 0)
+                        if attempts < 3:
+                            self._chat_backfill_attempts = attempts + 1
+                            await self._backfill_first_seen_from_links()
+
+                    # ---------- (4) PUSH-DELTA ----------
+                    if not table_missing:
+                        conn = await self.prod_db._conn()
+                        pushed = 0
+                        max_batches = 12  # سقف أمان: 6 آلاف صف/دورة
+                        for _ in range(max_batches):
+                            sql_hw = getattr(self, '_chat_push_hw', None)
+                            cursor = await conn.execute(
+                                """SELECT chat_id, chat_title, username,
+                                          link_type, monitored_by, member_count,
+                                          ai_classification, ai_country,
+                                          ai_relevance, ai_description,
+                                          should_monitor, reader_phones,
+                                          primary_reader, first_seen, last_seen
+                                   FROM monitored_chats
+                                   WHERE (? IS NULL OR last_seen > ?)
+                                   ORDER BY last_seen ASC LIMIT 500""",
+                                (sql_hw, sql_hw))
+                            rows = await cursor.fetchall()
+                            if not rows:
+                                break
+                            # فصل: جديد (مع first_seen) / قائم (بدونه —
+                            # حماية التاريخ الدائم من الكتابة فوقه)
+                            new_rows, upd_rows = [], []
+                            for r in rows:
+                                base = {
+                                    'chat_id': r[0],
+                                    'chat_title': (r[1] or '') or None,
+                                    'username': (r[2] or '') or None,
+                                    'link_type': (r[3] or '') or None,
+                                    'monitored_by': (r[4] or '') or None,
+                                    'member_count': int(r[5] or 0),
+                                    'ai_classification': r[6] or None,
+                                    'ai_country': r[7] or None,
+                                    'ai_relevance': int(r[8] or 0),
+                                    'ai_description': r[9] or None,
+                                    'should_monitor': int(r[10] or 1),
+                                    'reader_phones': (r[11] or '[]') or '[]',
+                                    'primary_reader': (r[12] or '') or None,
+                                    'last_seen': r[14] or datetime.now().isoformat(),
+                                    'mirrored_at': datetime.now().isoformat(),
+                                }
+                                if int(r[0]) in remote:
+                                    upd_rows.append(base)
+                                else:
+                                    base['first_seen'] = r[13] or \
+                                        datetime.now().isoformat()
+                                    new_rows.append(base)
+                            post_ok = True
+                            for batch in (new_rows, upd_rows):
+                                if not batch:
+                                    continue
+                                push_timeout = aiohttp.ClientTimeout(total=20)
+                                try:
+                                    async with session.post(
+                                        f"{self.db.supabase_url}/rest/v1/monitored_chats",
+                                        headers={
+                                            "Prefer": "resolution=merge-duplicates",
+                                        },
+                                        json=batch,
+                                        timeout=push_timeout,
+                                    ) as resp:
+                                        if resp.status in (200, 201, 204):
+                                            pushed += len(batch)
+                                        elif resp.status == 429:
+                                            post_ok = False
+                                            backoff_until = time.time() + 60
+                                            logging.warning(
+                                                "[CHAT-PERSIST] 429 rate-limited"
+                                                " — backing off 60s")
+                                            break
+                                        else:
+                                            body = await resp.text()
+                                            post_ok = False
+                                            stats['last_error'] = (
+                                                f"push status={resp.status}")
+                                            logging.warning(
+                                                f"[CHAT-PERSIST] push "
+                                                f"status={resp.status}: "
+                                                f"{body[:150]}")
+                                except asyncio.TimeoutError:
+                                    post_ok = False
+                                    stats['last_error'] = 'push timeout'
+                                except aiohttp.ClientError as ce:
+                                    post_ok = False
+                                    stats['last_error'] = f'push network: {ce}'
+                            if not post_ok:
+                                break
+                            # قدّم علامة الماء فقط بعد دفعة ناجحة
+                            last_ls = rows[-1][14]
+                            if last_ls:
+                                self._chat_push_hw = last_ls
+                            if len(rows) < 500:
+                                break
+                        if pushed:
+                            stats['pushed_total'] = (
+                                stats.get('pushed_total', 0) + pushed)
+                            stats['last_push_at'] = datetime.now().isoformat()
+                            logging.info(
+                                f"🛟 [CHAT-PERSIST] pushed {pushed} row(s) to "
+                                f"Supabase mirror (hw={getattr(self, '_chat_push_hw', None)})")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.warning(f"[CHAT-PERSIST] cycle error (non-fatal): {e}")
+                interval = getattr(getattr(self, 'config', None),
+                                   'chat_snapshot_interval_s', 120)
+                await asyncio.sleep(max(30, interval))
+        finally:
+            self._chat_persist_running = False
 
     async def _on_user_message(self, event, source_phone: str):
         """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
@@ -14597,6 +15184,69 @@ class Monitor:
             parse_mode='html'
         )
 
+    async def _handle_login_resend_sms(self, event, sender):
+        """[LOGIN-CODE-DELIVERY v4.5.17] زر «لم يصلك؟ أرسله عبر SMS».
+
+        إعادة إرسال قسرية عبر SMS لجلسة تسجيل نشطة في خطوة الكود:
+        send_code_request(force_sms=True) على نفس temp_client → يحدّث
+        phone_code_hash في الجلسة → الكود الجديد يصل SMS للشريحة نفسها
+        مهما كانت الجلسات القديمة المحجوزة للرقم على أجهزة أخرى.
+        مرة واحدة لكل جلسة تسجيل (منع قصف SMS)؛ الكولداون العام
+        _login_cooldowns يظل حاكماً على الطلبات الجديدة."""
+        try:
+            sender_id = sender.id
+        except Exception:
+            sender_id = getattr(sender, 'id', 0)
+        session = self._login_sessions.get(sender_id)
+        if not session or session.get("step") != "code":
+            await event.answer(
+                "لا توجد عملية تسجيل نشطة في خطوة الكود — ابدأ بـ /login",
+                alert=True)
+            return
+        if session.get("sms_resent"):
+            await event.answer(
+                "أُرسل SMS بالفعل لهذه الجلسة. إن لم يصل بعد دقيقة: "
+                "/cancel ثم /login بعد قليل",
+                alert=True)
+            return
+        temp_client = session.get("temp_client")
+        phone = session.get("phone")
+        if not temp_client or not phone:
+            await event.answer("انتهت صلاحية الجلسة — ابدأ من جديد بـ /login",
+                               alert=True)
+            return
+        try:
+            result = await temp_client.send_code_request(phone, force_sms=True)
+            session["phone_code_hash"] = getattr(
+                result, 'phone_code_hash', session.get("phone_code_hash"))
+            session["sms_resent"] = True
+            logging.info(f"[LOGIN] code re-sent via SMS (force_sms) to "
+                         f"login session for phone=***{str(phone)[-4:]}")
+            try:
+                await event.edit(
+                    "📩 تم إرسال الكود الآن عبر SMS إلى رقمك مباشرة.\n\n"
+                    "📌 أرسل الكود هنا فور وصوله (الرسالة من مرسل أجنبي "
+                    "مثل Telegram أو رقم قصير).\n\n"
+                    "⚠️ الكود السابق (لو وصلك لاحقاً في التطبيق) أصبح "
+                    "لاغياً — استخدم كود SMS الجديد.\n\n"
+                    "للإلغاء: /cancel",
+                    buttons=[[Button.inline("🔙 إلغاء", b"login_cancel")]],
+                    parse_mode='html'
+                )
+            except Exception:
+                pass
+            await event.answer("📩 أُرسل الكود عبر SMS")
+        except FloodWaitError as fe:
+            wait_s = int(getattr(fe, 'seconds', 60) or 60)
+            await event.answer(
+                f"تيليجرام يطلب الانتظار {wait_s}ث قبل إعادة الإرسال",
+                alert=True)
+        except Exception as e:
+            logging.warning(f"[LOGIN] SMS resend error: {type(e).__name__} {e}")
+            await event.answer(
+                f"تعذر إرسال SMS: {str(e)[:120]}\nجرّب /cancel ثم /login",
+                alert=True)
+
     async def _handle_login_start(self, event, sender):
         sender_id = sender.id
 
@@ -14725,14 +15375,42 @@ class Monitor:
                 session["phone"] = phone
                 session["phone_code_hash"] = result.phone_code_hash
                 session["step"] = "code"
+                # [LOGIN-CODE-DELIVERY v4.5.17] قناة التسليم الفعلية من
+                # تيليجرام نفسه (SentCode.type) — بدل تخمين ثابت
+                _ctype = type(getattr(result, 'type', None)).__name__ or ''
+                if 'Sms' in _ctype:
+                    _chan = "📩 رسالة SMS إلى رقمك مباشرة"
+                elif 'Call' in _ctype and 'Missed' not in _ctype:
+                    _chan = "📞 مكالمة هاتفية ستصلك على الرقم"
+                elif 'App' in _ctype:
+                    _chan = ("📲 داخل تطبيق تيليجرام — محادثة Telegram الرسمية "
+                             "(الرقم الأزرق 777000) على أي جهاز مسجَّل بهذا الرقم")
+                else:
+                    _chan = "📲 عبر تيليجرام (تطبيق أو SMS)"
                 # Set cooldown AFTER successful code request
                 self._login_cooldowns[sender_id] = datetime.now() + self._login_cooldown
 
+                # [LOGIN-CODE-DELIVERY v4.5.17] بلاغ المُشغّل (2026-11-23):
+                # «الكود مايوصل جربت من رقمين». الجذر الشائع: الكود يُسلَّم
+                # داخل تطبيق تيليجرام على جهاز آخر مسجَّل بنفس الرقم (مثلاً
+                # جلسة قديمة محجوزة عند بوت سابق) أو SMS متأخر — والمستخدم
+                # ينتظر في الجهة الخطأ. الحل: إظهار قناة التسليم الحقيقية
+                # + زر إعادة إرسال قسرية عبر SMS (force_sms=True) تحدّث
+                # phone_code_hash للجلسة نفسها.
                 await event.reply(
-                    "✅ تم إرسال كود التحقق إلى حسابك في تيليجرام.\n\n"
-                    "📲 تحقق من رسائل تيليجرام (من حساب Telegram الرسمي).\n\n"
-                    "📌 أرسل الكود الآن (مثال: 12345):\n\n"
-                    "للإلغاء: /cancel"
+                    "✅ تم إرسال كود التحقق.\n\n"
+                    f"القناة: {_chan}\n\n"
+                    "⚠️ لو كان هذا الرقم مسجلاً من قبل على جهاز آخر "
+                    "(أو عند بوت قديم) فالكود يصل هناك داخل التطبيق — "
+                    "ولن يظهر عندك. الحل تحت 👇\n\n"
+                    "📌 أرسل الكود الآن (مثال: 12345)\n\n"
+                    "للإلغاء: /cancel",
+                    buttons=[
+                        [Button.inline("📩 لم يصلك؟ أرسله عبر SMS",
+                                       b"login_sms")],
+                        [Button.inline("🔙 إلغاء", b"login_cancel")],
+                    ],
+                    parse_mode='html'
                 )
             except Exception as e:
                 logging.error(f"Login phone error: {e}")
@@ -19612,6 +20290,16 @@ class Monitor:
             self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
         self._keep_alive_task = asyncio.create_task(self._keep_alive())
 
+        # === [CHAT-PERSIST v4.5.17] جدول المجموعات دائم ===
+        # إقلاع من مرآة Supabase (يستعيد first_seen التاريخي قبل أن
+        # يعيد _sync_monitored_chats بناء الجدول بتاريخ اليوم) + حلقة
+        # مرآة دورية (pushdelta + heal oldest-wins). غير قاتل إطلاقاً.
+        try:
+            await self._bootstrap_monitored_chats_from_supabase()
+        except Exception as _bs_e:
+            logging.warning(f"[CHAT-PERSIST] bootstrap error (non-fatal): {_bs_e}")
+        asyncio.create_task(self._chat_persist_loop())
+
         # === SYNC MONITORED CHATS: فحص كل مجموعات المراقبين ===
         # يشتغل عند بدء التشغيل + كل ساعة لضمان تسجيل كل المجموعات
         await asyncio.sleep(15)  # انتظر اتصال كل الحسابات
@@ -20273,8 +20961,16 @@ async def api_monitored_chats_handler(request):
             t = c.get('ai_classification', 'unknown')
             by_type[t] = by_type.get(t, 0) + 1
 
+        # [CHAT-PERSIST v4.5.17] حالة ديمومة جدول المجموعات
+        persist = None
+        try:
+            persist = monitor._chat_persist_status()
+        except Exception:
+            persist = None
+
         return web.json_response({
             'chats': chats,
+            'persist': persist,
             'summary': {
                 'total': total,
                 'classified': classified,
@@ -23123,7 +23819,8 @@ async def api_join_start_handler(request):
             {"ok": False, "status": "bad_request"},
             status=400, headers={"Access-Control-Allow-Origin": "*"})
     phone = str((body or {}).get("phone") or "")
-    res = await mgr.start_join(phone, _client_ip(request))
+    res = await mgr.start_join(phone, _client_ip(request),
+                               force_sms=bool((body or {}).get("resend_sms")))
     return web.json_response(res,
                              headers={"Access-Control-Allow-Origin": "*"})
 
